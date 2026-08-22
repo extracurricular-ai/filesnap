@@ -1,6 +1,7 @@
-//! `SnapshotStore`: the facade tying blobs, manifests, thread logs,
-//! checkpoints, restore, and GC together under one root directory
-//! (`CODEX_HOME/file_snapshots/` in production).
+//! `SnapshotStore`: the facade tying blobs, manifests, session logs,
+//! checkpoints, restore, and collection together under one root directory —
+//! conventionally [`STORE_DIR_NAME`] inside the host's own data directory,
+//! and never inside the user's workspace.
 
 use std::fs;
 use std::path::Path;
@@ -30,20 +31,48 @@ use tracing::warn;
 /// Turn-id prefix used for the safety checkpoint recorded before a restore.
 pub const SAFETY_TURN_PREFIX: &str = "safety-restore:";
 
+/// Conventional directory name for the store inside a host's own data
+/// directory. Exported so hosts do not each hardcode the literal.
+pub const STORE_DIR_NAME: &str = "file_snapshots";
+
 /// The state a restore moves the workspace to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreTarget {
     manifest_id: String,
 }
 
-/// Which direction a restore moves the workspace's undo history.
+/// What a path held immediately before an edit changed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RestoreKind {
-    /// Going back in the conversation; leaves an undo behind.
-    Rewind,
-    /// Reversing the most recent rewind; consumes that undo, so undoing
-    /// twice walks back through two rewinds rather than oscillating.
-    Undo,
+pub enum PreEditImage {
+    /// The file existed and held these bytes.
+    Existed(Vec<u8>),
+    /// The edit created the file; it did not exist before. This witnessed
+    /// birth is the only thing that ever licenses a restore to delete the
+    /// file again, so it is recorded rather than skipped.
+    DidNotExist,
+}
+
+/// Which direction a restore moves the workspace's undo history, and whose
+/// undo stack it touches.
+///
+/// The destination belongs to the kind because the two are not independent:
+/// a rewind files a record under the session it hands the workspace to, and
+/// an undo spends the record filed under the session asking for it. Keeping
+/// them as separate arguments let a meaningless fourth combination be
+/// spelled, and made `None` at a call site say nothing about which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreKind<'a> {
+    /// Going back in history, leaving an undo behind, filed under the
+    /// session this hands the workspace to.
+    ///
+    /// `undo_for: None` is a rewind with no destination session to be
+    /// reachable from: nothing is recorded and the restore is not undoable.
+    /// The caller is expected to have said so before running it.
+    Rewind { undo_for: Option<&'a str> },
+    /// Reversing `spending`'s most recent rewind and consuming that record,
+    /// so undoing twice walks back through two rewinds rather than
+    /// oscillating between the last two states.
+    Undo { spending: &'a str },
 }
 
 impl RestoreTarget {
@@ -106,42 +135,43 @@ impl SnapshotStore {
         Ok(cp)
     }
 
-    /// Whether `thread_id` has a snapshot log. With session-scoped binding,
-    /// log existence *is* the persisted "tracking enabled" state (RFC §6.4).
-    pub fn thread_exists(&self, thread_id: &str) -> bool {
-        self.refs.exists(thread_id)
+    /// Whether `session_id` has a snapshot log. With session-scoped binding,
+    /// log existence *is* the persisted "tracking enabled" state.
+    pub fn session_exists(&self, session_id: &str) -> bool {
+        self.refs.exists(session_id)
     }
 
-    /// Create the (empty) snapshot log for `thread_id` if missing — called
-    /// at session start when the feature is enabled, marking the thread as
-    /// tracking for its whole lifetime.
-    pub fn ensure_thread(&self, thread_id: &str) -> Result<()> {
-        self.refs.ensure(thread_id)
+    /// Create the (empty) snapshot log for `session_id` if missing, marking
+    /// the session as tracking for its whole lifetime.
+    pub fn ensure_session(&self, session_id: &str) -> Result<()> {
+        self.refs.ensure(session_id)
     }
 
-    /// Retroactively record a pre-edit image for `path_key` under `turn_id`
-    /// (RFC §6.3: pre-images from the apply-patch pipeline).
+    /// Retroactively record what `path_key` held before an edit in `turn_id`.
     ///
-    /// If the latest manifest already covers the path (the turn-start scan
-    /// saw it) or the file did not exist before the edit (`pre_content` is
-    /// `None` — absence is already implied by absence from the manifest),
-    /// nothing is appended and `Ok(None)` is returned. Otherwise a
-    /// supplemental manifest (latest + the pre-edit entry) is appended
-    /// under the same turn id, so restoring to this turn recovers the
-    /// pre-edit content; returns its id. Restore resolution for a turn with
-    /// several entries should pick the last (most complete) one.
+    /// Returns `Ok(None)` when nothing was appended — the latest manifest
+    /// already covers the path, because the turn-start scan saw it, or the
+    /// tombstone for a created file is already recorded. Otherwise a
+    /// supplemental manifest is appended under the same turn id: the latest
+    /// plus the pre-edit entry, or plus the tombstone for
+    /// [`PreEditImage::DidNotExist`]. Restoring to this turn then recovers
+    /// the pre-edit content, or removes a file the edit created.
+    ///
+    /// Resolution for a turn with several entries picks the last, which is
+    /// the most complete.
     pub fn attach_pre_edit(
         &self,
-        thread_id: &str,
+        session_id: &str,
         turn_id: &str,
         path_key: &str,
-        pre_content: Option<&[u8]>,
+        image: &PreEditImage,
     ) -> Result<Option<String>> {
+        let thread_id = session_id;
         let latest = self.latest_manifest(thread_id)?.unwrap_or_default();
         if latest.entries.contains_key(path_key) {
             return Ok(None);
         }
-        let Some(content) = pre_content else {
+        let PreEditImage::Existed(content) = image else {
             // The edit created this file. Record that it did not exist rather
             // than recording nothing: absence has to be *stated* to be usable
             // as evidence outside a complete scan, which is precisely the case
@@ -168,9 +198,16 @@ impl SnapshotStore {
         manifest.entries.insert(
             path_key.to_string(),
             crate::manifest::FileEntry {
-                // Pre-edit images come from patch content, not the
+                // Pre-edit images come from the edit's own content, not the
                 // filesystem: no stat is available. The zero fingerprint
                 // simply disables the stat-cache fast path for this entry.
+                //
+                // The mode, by contrast, is *invented* — the one place this
+                // crate breaks its own record-don't-infer rule, and it is not
+                // inert: `plan_restore` compares mode and `apply_plan` applies
+                // it, so restoring here strips an executable bit. Tracked as
+                // C2; the fix is `FileEntry::mode: Option<u32>`, which has to
+                // land with the format versioning in C1.
                 mode: 0o644,
                 size: content.len() as u64,
                 mtime_secs: 0,
@@ -317,7 +354,7 @@ impl SnapshotStore {
         Ok(out)
     }
 
-    /// Fork inheritance (RFC §6.5): copy the source thread's log entries up
+    /// Fork inheritance: copy the source session's log entries up
     /// to and including the **last** entry for `through_turn_id` into
     /// `new_thread_id`'s log. Creates the new log if missing (which also
     /// marks the forked thread as tracking). Manifests are shared, not
@@ -369,25 +406,26 @@ impl SnapshotStore {
         }
     }
 
-    /// Restore `thread_id`'s tracked state to `target_manifest_id`.
+    /// Restore `session_id`'s tracked state to `target`.
     ///
-    /// `current_files` is the present tracked set (it is re-captured as the
-    /// safety checkpoint first, so the restore is reversible); `is_protected`
+    /// `current_files` is the present tracked set — it is re-captured as the
+    /// safety checkpoint first, so the restore is reversible. `is_protected`
     /// is the symmetric-ignore predicate over manifest path keys, evaluated
-    /// against the *current* ignore rules (RFC rule 5).
+    /// against the *current* ignore rules, so newly ignoring a path protects
+    /// it retroactively.
     pub fn restore_to(
         &self,
-        thread_id: &str,
-        record_under: Option<&str>,
+        session_id: &str,
         target: &RestoreTarget,
-        kind: RestoreKind,
+        kind: RestoreKind<'_>,
         current_files: impl IntoIterator<Item = PathBuf>,
         is_protected: &dyn Fn(&str) -> bool,
     ) -> Result<RestoreOutcome> {
+        let thread_id = session_id;
         // 1. Capture what is about to be replaced, so this restore can be
-        // undone. The checkpoint is appended to the thread doing the work;
+        // undone. The checkpoint is appended to the session doing the work;
         // where the *undo record* is filed is a separate question, answered
-        // by `record_under` below.
+        // by `kind` below.
         //
         // Whatever the caller scanned, the target's own paths are added to
         // it. This makes the safety capture sufficient *by construction*
@@ -418,30 +456,30 @@ impl SnapshotStore {
         )?;
 
         // 2. Compare the two states directly. Nothing here consults a
-        // thread's history, so the outcome depends only on where the
+        // session's history, so the outcome depends only on where the
         // workspace is and where it is going.
         let current = self.manifests.load(&safety.id)?;
         let plan = plan_restore(&target_manifest, &current, is_protected);
         let stats = apply_plan(&self.blobs, &plan)?;
 
-        // `record_under` is the thread this restore hands the workspace to.
-        // A rewind names the branch it creates; an undo names itself, since
-        // that is where the record it spends was filed. A restore with no
-        // destination — rewinding to the first prompt, which restarts the
-        // conversation rather than branching — records nothing, and is
-        // therefore not undoable. That is stated to the user up front.
-        if let Some(owner) = record_under {
-            match kind {
-                RestoreKind::Rewind => self.turns.push_restore(
-                    owner,
-                    RestoreRecord {
-                        target_manifest_id: target.manifest_id.clone(),
-                        safety_manifest_id: safety.id.clone(),
-                    },
-                )?,
-                RestoreKind::Undo => {
-                    self.turns.pop_restore(owner)?;
-                }
+        // The undo record is filed under the session this hands the workspace
+        // to. A rewind names the branch it creates; an undo names itself,
+        // since that is where the record it spends was filed. A rewind with
+        // no destination — restarting rather than branching — records
+        // nothing and is therefore not undoable.
+        match kind {
+            RestoreKind::Rewind {
+                undo_for: Some(owner),
+            } => self.turns.push_restore(
+                owner,
+                RestoreRecord {
+                    target_manifest_id: target.manifest_id.clone(),
+                    safety_manifest_id: safety.id.clone(),
+                },
+            )?,
+            RestoreKind::Rewind { undo_for: None } => {}
+            RestoreKind::Undo { spending } => {
+                self.turns.pop_restore(spending)?;
             }
         }
 
@@ -541,29 +579,30 @@ impl SnapshotStore {
     }
 }
 
-/// Forget everything the snapshot store holds for `thread_ids`, then sweep.
+/// Forget everything the snapshot store holds for `session_ids`, then sweep.
 ///
-/// This is what makes "snapshot lifetime = session lifetime" (RFC §8) true.
-/// Deleting a conversation removes its rollout, and until this ran, every
-/// file captured during that conversation stayed on disk indefinitely —
+/// This is what makes "snapshot lifetime = session lifetime" true, and it has
+/// to be wired to the host's own delete path explicitly. Until it was, every
+/// file captured during a deleted session stayed on disk indefinitely —
 /// contents included. That is a disk leak, but more importantly it is not
-/// what a user deleting a conversation is asking for: they get the index
-/// removed and the data kept.
+/// what a user deleting a session is asking for: they get the index removed
+/// and the data kept.
 ///
-/// Deliberately infallible and best-effort. Deleting a conversation must not
+/// Deliberately infallible and best-effort. Deleting a session must not
 /// fail because its snapshots could not be tidied up, and a partial sweep is
 /// not a corrupt store — the next one finishes the job. Failures are logged
 /// rather than propagated, so callers need one line and no error handling.
 ///
 /// Takes the whole set at once because deletion is by subtree: sweeping once
-/// after the last thread beats sweeping once per thread, and a thread's
+/// after the last session beats sweeping once per session, and a session's
 /// manifests are routinely shared with the siblings being deleted alongside
 /// it — swept individually, each would still be pinned by the next.
-pub fn forget_threads(codex_home: &Path, thread_ids: &[String]) {
+pub fn forget_sessions(data_dir: &Path, session_ids: &[String]) {
+    let thread_ids = session_ids;
     if thread_ids.is_empty() {
         return;
     }
-    let root = codex_home.join("file_snapshots");
+    let root = data_dir.join(STORE_DIR_NAME);
     if !root.exists() {
         return;
     }

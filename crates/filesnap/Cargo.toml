@@ -1,9 +1,13 @@
 [package]
-name = "codex-file-snapshots"
+name = "filesnap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "README.md"
+description = "Git-free file snapshots and rewind: a content-addressed store that puts a directory back the way it was, without a repository and without touching the user's version control."
+repository = "https://github.com/extracurricular-ai/filesnap"
+keywords = ["snapshot", "rewind", "undo", "checkpoint", "restore"]
+categories = ["filesystem", "development-tools"]
 
 [lints]
 workspace = true

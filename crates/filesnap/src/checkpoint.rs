@@ -2,9 +2,9 @@
 //!
 //! For every tracked file the previous manifest's `(size, mtime)`
 //! fingerprint is consulted first; on a match the recorded hash is reused
-//! without reading the file (the "persistent stat cache" from RFC §6.1 —
-//! the mechanism that makes `git status` fast, owned by the snapshot
-//! subsystem instead of a git index). Only changed or new files are read,
+//! without reading the file — the persistent stat cache, which is the
+//! mechanism that makes `git status` fast, owned here instead of by a git
+//! index. Only changed or new files are read,
 //! hashed, and stored.
 
 use std::fs;

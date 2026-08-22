@@ -1,4 +1,4 @@
-//! Per-thread snapshot logs and garbage collection (RFC §8).
+//! Per-session snapshot logs and garbage collection.
 //!
 //! Each thread has an append-only log of `(turn_id, manifest_id)` refs.
 //! Snapshot lifetime is tied to thread lifetime: removing a thread drops
@@ -60,7 +60,7 @@ impl RefStore {
     }
 
     /// Create an empty log for `thread_id` if none exists — the durable
-    /// marker that this thread is tracking (RFC §6.4).
+    /// marker that this session is tracking.
     pub fn ensure(&self, thread_id: &str) -> Result<()> {
         let path = self.log_path(thread_id);
         if path.exists() {
@@ -197,23 +197,6 @@ impl TurnIndex {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
-    }
-
-    /// Every thread's restore history, for GC marking.
-    pub fn restore_logs(&self) -> Result<Vec<RestoreLog>> {
-        let mut out = Vec::new();
-        let entries = fs::read_dir(&self.restores_root)
-            .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let bytes = fs::read(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
-            out.push(serde_json::from_slice(&bytes)?);
-        }
-        Ok(out)
     }
 
     pub fn all_manifest_ids(&self) -> Result<BTreeSet<String>> {

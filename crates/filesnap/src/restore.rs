@@ -1,4 +1,4 @@
-//! Restore planning and application (RFC §6.5, §7).
+//! Restore planning and application.
 //!
 //! Restores are planned as a diff between the target manifest and the
 //! **safety checkpoint** — a capture of the current state taken
@@ -112,9 +112,12 @@ pub fn apply_plan(blobs: &BlobStore, plan: &RestorePlan) -> Result<ApplyStats> {
     Ok(stats)
 }
 
+/// Sibling name a restore writes to before renaming into place. It lands in
+/// the user's own directory, so it is named after this tool rather than
+/// after whatever host embeds it.
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".codex-restore-tmp");
+    name.push(".filesnap-restore-tmp");
     path.with_file_name(name)
 }
 

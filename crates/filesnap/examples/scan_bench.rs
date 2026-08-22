@@ -1,17 +1,16 @@
 //! Compare the tracking partitions against a plain subtree walk.
 //!
-//! Reproduces the figures quoted in the RFC (§6.2). The claim that tracking is
-//! bounded by the project rather than by the tree is the load-bearing one in
-//! that section, and it is worth being checkable on someone else's repository
-//! rather than only on ours:
+//! "Cost is bounded by the project, not by the tree" is the load-bearing
+//! claim behind the scope design, so it is worth being checkable on someone
+//! else's repository rather than only on ours:
 //!
 //! ```text
-//! cargo run -p codex-file-snapshots --example scan_bench -- /path/to/repo
+//! cargo run -p filesnap --example scan_bench -- /path/to/repo
 //! ```
 fn main() {
     for root in std::env::args().skip(1) {
         let p = std::path::Path::new(&root);
-        let ignore = codex_file_snapshots::load_ignore(p);
+        let ignore = filesnap::load_ignore(p);
 
         let report = |label: &str, files: &[std::path::PathBuf], elapsed: std::time::Duration| {
             let bytes: u64 = files
@@ -32,7 +31,7 @@ fn main() {
         report("subtree walk", &all, t.elapsed());
 
         let t = std::time::Instant::now();
-        let git = codex_file_snapshots::git_tracked_files(p, &ignore);
+        let git = filesnap::git_tracked_files(p, &ignore);
         report("git-tracked", &git, t.elapsed());
 
         // The residue partition is told what git already covers, so its budget
@@ -40,13 +39,13 @@ fn main() {
         // what the exclusion is worth on this tree.
         let covered: std::collections::BTreeSet<_> = git.iter().cloned().collect();
         let t = std::time::Instant::now();
-        let recent = codex_file_snapshots::recent_files(p, &ignore, false, &covered);
+        let recent = filesnap::recent_files(p, &ignore, filesnap::HiddenFiles::Skip, &covered);
         report("recent (residue)", &recent, t.elapsed());
 
-        let blind = codex_file_snapshots::recent_files(
+        let blind = filesnap::recent_files(
             p,
             &ignore,
-            false,
+            filesnap::HiddenFiles::Skip,
             &std::collections::BTreeSet::new(),
         );
         let wasted = blind.iter().filter(|f| covered.contains(*f)).count();

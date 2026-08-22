@@ -7,12 +7,14 @@
 use std::fs;
 use std::path::Path;
 
-use codex_file_snapshots::RestoreKind;
-use codex_file_snapshots::SNAPSHOT_IGNORE_FILENAME;
-use codex_file_snapshots::SnapshotStore;
-use codex_file_snapshots::is_ignored;
-use codex_file_snapshots::load_ignore;
-use codex_file_snapshots::tracked_files;
+use filesnap::HiddenFiles;
+use filesnap::PreEditImage;
+use filesnap::RestoreKind;
+use filesnap::SNAPSHOT_IGNORE_FILENAME;
+use filesnap::SnapshotStore;
+use filesnap::is_ignored;
+use filesnap::load_ignore;
+use filesnap::tracked_files;
 use pretty_assertions::assert_eq;
 
 const THREAD: &str = "thread-1";
@@ -89,7 +91,7 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             "turn-1",
             &ws.join("c.txt").to_string_lossy(),
-            /*pre_content*/ None,
+            &PreEditImage::DidNotExist,
         )
         .unwrap()
         .expect("creating a file records that it did not exist");
@@ -131,9 +133,10 @@ fn full_rewind_redo_gc_scenario() {
     let outcome = store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             current(),
             &protect,
         )
@@ -169,9 +172,8 @@ fn full_rewind_redo_gc_scenario() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &outcome.safety,
-            RestoreKind::Undo,
+            RestoreKind::Undo { spending: BRANCH },
             current(),
             &protect2,
         )
@@ -188,13 +190,13 @@ fn full_rewind_redo_gc_scenario() {
 
     // Session lifetime GC: with the undo spent, deleting the conversations
     // leaves nothing reachable and the store empties. This goes through
-    // `forget_threads` rather than `gc` because that is what deletion
+    // `forget_sessions` rather than `gc` because that is what deletion
     // actually calls, and it is the path that reclaims immediately — the
     // general sweep deliberately spares anything written in the last few
     // minutes, which in a test is everything.
     assert!(store.disk_usage().unwrap() > 0);
-    codex_file_snapshots::forget_threads(dir.path(), &[THREAD.to_string(), BRANCH.to_string()]);
-    assert!(!store.thread_exists(THREAD));
+    filesnap::forget_sessions(dir.path(), &[THREAD.to_string(), BRANCH.to_string()]);
+    assert!(!store.session_exists(THREAD));
     assert_eq!(
         store.gc().unwrap().manifests_kept,
         0,
@@ -225,9 +227,10 @@ fn restore_preserves_permissions() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             all_files(&ws),
             &|_| false,
         )
@@ -246,10 +249,10 @@ fn thread_marker_and_pre_edit_attach() {
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
 
     // Log existence is the session-scoped "tracking on" marker.
-    assert!(!store.thread_exists(THREAD));
-    store.ensure_thread(THREAD).unwrap();
-    assert!(store.thread_exists(THREAD));
-    store.ensure_thread(THREAD).unwrap(); // idempotent
+    assert!(!store.session_exists(THREAD));
+    store.ensure_session(THREAD).unwrap();
+    assert!(store.session_exists(THREAD));
+    store.ensure_session(THREAD).unwrap(); // idempotent
 
     // Turn-start scan sees only a.txt.
     fs::write(ws.join("a.txt"), "alpha").unwrap();
@@ -263,7 +266,7 @@ fn thread_marker_and_pre_edit_attach() {
             THREAD,
             "turn-1",
             &outside.to_string_lossy(),
-            Some(b"pre-edit state"),
+            &PreEditImage::Existed(b"pre-edit state".to_vec()),
         )
         .unwrap()
         .expect("new path should attach");
@@ -276,7 +279,7 @@ fn thread_marker_and_pre_edit_attach() {
                 THREAD,
                 "turn-1",
                 &ws.join("a.txt").to_string_lossy(),
-                Some(b"x")
+                &PreEditImage::Existed(b"x".to_vec())
             )
             .unwrap()
             .is_none()
@@ -286,7 +289,12 @@ fn thread_marker_and_pre_edit_attach() {
     // order to remove the file, and outside a complete scan nothing else
     // supplies it.
     let tombstoned = store
-        .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            "/brand/new.txt",
+            &PreEditImage::DidNotExist,
+        )
         .unwrap()
         .expect("a created path is recorded as absent");
     assert!(
@@ -299,7 +307,12 @@ fn thread_marker_and_pre_edit_attach() {
     // Recording it twice adds nothing.
     assert!(
         store
-            .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
+            .attach_pre_edit(
+                THREAD,
+                "turn-1",
+                "/brand/new.txt",
+                &PreEditImage::DidNotExist
+            )
             .unwrap()
             .is_none()
     );
@@ -330,9 +343,10 @@ fn thread_marker_and_pre_edit_attach() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             all_files(&ws).into_iter().chain([outside.clone()]),
             &|_| false,
         )
@@ -352,7 +366,12 @@ fn turn_resolution_and_fork_inheritance() {
     // Supplemental attach under the same turn: resolution must pick it.
     let outside = dir.path().join("ext.cfg");
     let supplemental = store
-        .attach_pre_edit(THREAD, "turn-1", &outside.to_string_lossy(), Some(b"pre"))
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &outside.to_string_lossy(),
+            &PreEditImage::Existed(b"pre".to_vec()),
+        )
         .unwrap()
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
@@ -376,14 +395,14 @@ fn turn_resolution_and_fork_inheritance() {
     // Fork inherits entries through turn-1 (scan + supplemental), not turn-2.
     let inherited = store.inherit_log(THREAD, "fork-1", "turn-1").unwrap();
     assert_eq!(inherited, 2);
-    assert!(store.thread_exists("fork-1"));
+    assert!(store.session_exists("fork-1"));
     let fork_history = store.thread_history("fork-1").unwrap();
     assert_eq!(fork_history.len(), 2);
     assert_eq!(fork_history.last().unwrap().0.manifest_id, supplemental);
 
     // Unknown turn: log created (tracking marker) but nothing inherited.
     assert_eq!(store.inherit_log(THREAD, "fork-2", "nope").unwrap(), 0);
-    assert!(store.thread_exists("fork-2"));
+    assert!(store.session_exists("fork-2"));
 
     // Shared manifests survive GC while either thread references them.
     store.remove_thread(THREAD).unwrap();
@@ -412,9 +431,10 @@ fn rewinding_twice_still_restores() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &turn1_target,
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             scan(),
             &|_| false,
         )
@@ -426,9 +446,8 @@ fn rewinding_twice_still_restores() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &safety,
-            RestoreKind::Undo,
+            RestoreKind::Undo { spending: BRANCH },
             scan(),
             &|_| false,
         )
@@ -445,9 +464,10 @@ fn rewinding_twice_still_restores() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &turn1_target,
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             scan(),
             &|_| false,
         )
@@ -480,9 +500,10 @@ fn an_undo_reports_what_moved_since_the_rewind() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             scan(),
             &|_| false,
         )
@@ -530,9 +551,8 @@ fn a_restore_with_no_destination_leaves_no_undo() {
     store
         .restore_to(
             THREAD,
-            /*record_under*/ None,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind { undo_for: None },
             scan(),
             &|_| false,
         )
@@ -564,9 +584,10 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     store
         .restore_to(
             "session-a",
-            Some("branch-a"),
             &store.target_for_turn("a-turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some("branch-a"),
+            },
             scan(),
             &|_| false,
         )
@@ -576,9 +597,10 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     store
         .restore_to(
             "session-b",
-            Some("branch-b"),
             &store.target_for_turn("b-turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some("branch-b"),
+            },
             scan(),
             &|_| false,
         )
@@ -594,9 +616,10 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     store
         .restore_to(
             "branch-b",
-            Some("branch-b"),
             &b.unwrap(),
-            RestoreKind::Undo,
+            RestoreKind::Undo {
+                spending: "branch-b",
+            },
             scan(),
             &|_| false,
         )
@@ -632,9 +655,10 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
         store
             .restore_to(
                 THREAD,
-                Some(BRANCH),
                 &target,
-                RestoreKind::Rewind,
+                RestoreKind::Rewind {
+                    undo_for: Some(BRANCH),
+                },
                 scan(),
                 &|_| false,
             )
@@ -645,9 +669,8 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
         store
             .restore_to(
                 THREAD,
-                Some(BRANCH),
                 &target,
-                RestoreKind::Undo,
+                RestoreKind::Undo { spending: BRANCH },
                 scan(),
                 &|_| false,
             )
@@ -692,7 +715,7 @@ fn a_capture_covers_every_configured_root() {
 
     let roots = vec![a.clone(), b.clone()];
     let scan = || {
-        tracked_files(&roots, [], /*include_hidden*/ false)
+        tracked_files(&roots, [], HiddenFiles::Skip)
             .into_iter()
             .collect::<Vec<_>>()
     };
@@ -704,16 +727,22 @@ fn a_capture_covers_every_configured_root() {
     fs::write(b.join("main.rs"), "fn b() { changed }").unwrap();
     let born = b.join("extra.rs");
     store
-        .attach_pre_edit(THREAD, "turn-1", &born.to_string_lossy(), None)
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &born.to_string_lossy(),
+            &PreEditImage::DidNotExist,
+        )
         .unwrap()
         .expect("creating a file records that it did not exist");
     fs::write(&born, "born").unwrap();
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             scan(),
             &|_| false,
         )
@@ -755,7 +784,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             THREAD,
             "turn-1",
             &created.to_string_lossy(),
-            /*pre_content*/ None,
+            &PreEditImage::DidNotExist,
         )
         .unwrap()
         .expect("creating a file records that it did not exist");
@@ -774,9 +803,10 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
     let outcome = store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             current,
             &|_| false,
         )
@@ -811,9 +841,10 @@ fn undo_walks_back_through_successive_rewinds() {
         store
             .restore_to(
                 THREAD,
-                Some(BRANCH),
                 &target,
-                RestoreKind::Rewind,
+                RestoreKind::Rewind {
+                    undo_for: Some(BRANCH),
+                },
                 scan(),
                 &|_| false,
             )
@@ -824,9 +855,8 @@ fn undo_walks_back_through_successive_rewinds() {
         store
             .restore_to(
                 THREAD,
-                Some(BRANCH),
                 &target,
-                RestoreKind::Undo,
+                RestoreKind::Undo { spending: BRANCH },
                 scan(),
                 &|_| false,
             )
@@ -877,9 +907,10 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             scan(),
             &|_| false,
         )
@@ -907,9 +938,9 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
     assert!(count(&blobs) > 0, "the file's content is on disk");
 
     // Delete both threads, the way deleting a conversation deletes its subtree.
-    codex_file_snapshots::forget_threads(home, &[THREAD.to_string(), BRANCH.to_string()]);
+    filesnap::forget_sessions(home, &[THREAD.to_string(), BRANCH.to_string()]);
 
-    assert!(!store.thread_exists(THREAD));
+    assert!(!store.session_exists(THREAD));
     assert!(
         store.last_restore_target(BRANCH).unwrap().is_none(),
         "the undo record goes too — it is a GC root, and left behind it would \
@@ -924,8 +955,8 @@ fn forgetting_threads_is_best_effort() {
     // missing, unreadable, or never used. Callers get one line and no error
     // handling, so this cannot be allowed to panic or propagate.
     let dir = tempfile::tempdir().unwrap();
-    codex_file_snapshots::forget_threads(dir.path(), &["never-tracked".to_string()]);
-    codex_file_snapshots::forget_threads(dir.path(), &[]);
+    filesnap::forget_sessions(dir.path(), &["never-tracked".to_string()]);
+    filesnap::forget_sessions(dir.path(), &[]);
 }
 
 #[test]
@@ -953,7 +984,12 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     fs::write(&script, "old").unwrap();
     store.checkpoint(THREAD, "turn-2", scan()).unwrap();
     store
-        .attach_pre_edit(THREAD, "turn-2", &script.to_string_lossy(), Some(b"old"))
+        .attach_pre_edit(
+            THREAD,
+            "turn-2",
+            &script.to_string_lossy(),
+            &PreEditImage::Existed(b"old".to_vec()),
+        )
         .unwrap()
         .expect("the pre-image of a file about to be deleted is recorded");
     fs::remove_file(&script).unwrap();
@@ -975,9 +1011,10 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     let outcome = store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("fork-here").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             source_scope,
             &|_| false,
         )
@@ -992,9 +1029,8 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     store
         .restore_to(
             BRANCH,
-            Some(BRANCH),
             &outcome.safety,
-            RestoreKind::Undo,
+            RestoreKind::Undo { spending: BRANCH },
             all_files(&ws),
             &|_| false,
         )
@@ -1028,7 +1064,12 @@ fn a_turn_reports_what_it_cannot_put_back() {
     fs::write(&script, "old").unwrap();
     store.checkpoint(THREAD, "late", scan()).unwrap();
     store
-        .attach_pre_edit(THREAD, "late", &script.to_string_lossy(), Some(b"old"))
+        .attach_pre_edit(
+            THREAD,
+            "late",
+            &script.to_string_lossy(),
+            &PreEditImage::Existed(b"old".to_vec()),
+        )
         .unwrap()
         .unwrap();
 
@@ -1069,14 +1110,20 @@ fn the_undo_warning_covers_what_it_will_delete() {
     // records it as absent while the rewind target never mentions it.
     let scratch = ws.join("scratch.txt");
     store
-        .attach_pre_edit(THREAD, "turn-1", &scratch.to_string_lossy(), None)
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &scratch.to_string_lossy(),
+            &PreEditImage::DidNotExist,
+        )
         .unwrap();
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             all_files(&ws),
             &|_| false,
         )
@@ -1123,9 +1170,10 @@ fn the_undo_warning_covers_files_the_rewind_never_touched() {
     store
         .restore_to(
             THREAD,
-            Some(BRANCH),
             &store.target_for_turn("fork-here").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
             all_files(&ws),
             &|_| false,
         )

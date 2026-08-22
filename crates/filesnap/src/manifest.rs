@@ -3,7 +3,7 @@
 //! A manifest maps file paths to `(mode, size, mtime, content hash)`.
 //! The `(size, mtime)` pair doubles as the persistent stat cache: a later
 //! checkpoint reuses the recorded hash for any file whose stat fingerprint
-//! is unchanged, so unchanged files are never re-read (RFC §6.1).
+//! is unchanged, so unchanged files are never re-read.
 //!
 //! Manifests are themselves content-addressed: the manifest id is the
 //! SHA-256 of the canonical JSON serialization (`BTreeMap` keys give a

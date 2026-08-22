@@ -1,4 +1,4 @@
-//! Tracking scope: which files a checkpoint observes (RFC §6.2).
+//! Tracking scope: which files a checkpoint observes.
 //!
 //! Three partitions, unioned. Each answers a different question, and each is
 //! bounded by something other than the size of the directory tree — which is
@@ -35,9 +35,23 @@ use ignore::WalkBuilder;
 use ignore::gitignore::Gitignore;
 use ignore::gitignore::GitignoreBuilder;
 
-/// Name of the dedicated snapshot ignore file (provisional; the final
-/// name is an open question in the RFC).
-pub const SNAPSHOT_IGNORE_FILENAME: &str = ".codexsnapignore";
+/// Name of the dedicated snapshot ignore file, in gitignore syntax.
+///
+/// This is a name the user types, so it carries no vendor prefix.
+pub const SNAPSHOT_IGNORE_FILENAME: &str = ".filesnapignore";
+
+/// Whether a scan descends into dot-files and dot-directories.
+///
+/// `.git` is excluded either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenFiles {
+    /// Hidden entries are invisible to scans — the default, and what keeps
+    /// `.env` and credential files out of the store. Work product that
+    /// happens to be hidden still enters through the edit hook.
+    Skip,
+    /// Hidden entries are scanned like any other file.
+    Track,
+}
 
 /// Git-style marker walk-up: return the nearest ancestor of `start`
 /// (inclusive) containing one of `markers`.
@@ -165,7 +179,7 @@ const RECENT_SKIP_DIRS: &[&str] = &[
 pub fn tracked_files(
     roots: &[PathBuf],
     already_known: impl IntoIterator<Item = PathBuf>,
-    include_hidden: bool,
+    hidden: HiddenFiles,
 ) -> BTreeSet<PathBuf> {
     let ignores: Vec<Gitignore> = roots.iter().map(|root| load_ignore(root)).collect();
 
@@ -174,7 +188,7 @@ pub fn tracked_files(
         files.extend(git_tracked_files(root, ignore));
     }
     for (root, ignore) in roots.iter().zip(&ignores) {
-        let picked = recent_files(root, ignore, include_hidden, &files);
+        let picked = recent_files(root, ignore, hidden, &files);
         files.extend(picked);
     }
     files
@@ -278,12 +292,12 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
 pub fn recent_files(
     dir: &Path,
     ignore: &Gitignore,
-    include_hidden: bool,
+    hidden: HiddenFiles,
     covered: &BTreeSet<PathBuf>,
 ) -> Vec<PathBuf> {
     let walker = WalkBuilder::new(dir)
         .standard_filters(false)
-        .hidden(!include_hidden)
+        .hidden(hidden == HiddenFiles::Skip)
         .follow_links(false)
         .filter_entry(|entry| {
             let name = entry.file_name();
@@ -372,9 +386,9 @@ mod tests {
         let root = dir.path().join("proj");
         let deep = root.join("a/b/c");
         fs::create_dir_all(&deep).unwrap();
-        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::create_dir_all(root.join(".marker")).unwrap();
 
-        let markers = vec![".codex".to_string()];
+        let markers = vec![".marker".to_string()];
         assert_eq!(
             find_workspace_root(&deep, &markers),
             Some(root),
@@ -401,18 +415,17 @@ mod tests {
         touch(&root.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n");
 
         let ignore = load_ignore(root);
-        let names = |include_hidden: bool| -> Vec<String> {
-            let mut out: Vec<String> =
-                recent_files(root, &ignore, include_hidden, &BTreeSet::new())
-                    .iter()
-                    .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
-                    .collect();
+        let names = |hidden: HiddenFiles| -> Vec<String> {
+            let mut out: Vec<String> = recent_files(root, &ignore, hidden, &BTreeSet::new())
+                .iter()
+                .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                .collect();
             out.sort();
             out
         };
 
         assert_eq!(
-            names(/*include_hidden*/ false),
+            names(HiddenFiles::Skip),
             vec!["keep.txt".to_string(), "sub/keep2.txt".to_string()],
             "logs ignored; .git and other dot-entries skipped — including the \
              ignore file itself, which follows the same rule as any other \
@@ -420,7 +433,7 @@ mod tests {
         );
 
         // Opting in reaches hidden entries, but never `.git`.
-        let with_hidden = names(/*include_hidden*/ true);
+        let with_hidden = names(HiddenFiles::Track);
         assert!(with_hidden.contains(&SNAPSHOT_IGNORE_FILENAME.to_string()));
         assert!(
             with_hidden.iter().all(|name| !name.starts_with(".git/")),
@@ -449,12 +462,7 @@ mod tests {
         .unwrap();
 
         let ignore = load_ignore(root);
-        let picked = recent_files(
-            root,
-            &ignore,
-            /*include_hidden*/ false,
-            &BTreeSet::new(),
-        );
+        let picked = recent_files(root, &ignore, HiddenFiles::Skip, &BTreeSet::new());
 
         assert_eq!(picked.len(), RECENT_LIMIT, "count is capped");
         assert!(
@@ -488,7 +496,7 @@ mod tests {
         let covered: BTreeSet<PathBuf> = (0..(RECENT_LIMIT + 5))
             .map(|i| root.join(format!("known{i}.rs")))
             .collect();
-        let picked = recent_files(root, &ignore, /*include_hidden*/ false, &covered);
+        let picked = recent_files(root, &ignore, HiddenFiles::Skip, &covered);
 
         assert_eq!(
             picked,

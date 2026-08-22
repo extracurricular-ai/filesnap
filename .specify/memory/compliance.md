@@ -8,7 +8,8 @@ The constitution's rules are obligations. An entry here means an obligation is
 unmet — never that the rule is softer than it reads. Entries may be deferred; they
 may not be forgotten. **No release ships with a `blocking` entry open.**
 
-All line numbers are against `crates/file-snapshots/` as copied in `39e5efe`.
+Line numbers are against `crates/file-snapshots/` as copied in `39e5efe`, and
+have shifted since the rename; the cited symbol is the durable reference.
 Every entry below was inherited with that copy; none was introduced here.
 
 ---
@@ -52,22 +53,16 @@ whose content already matches.
 from the comparison and leaves permissions untouched on restore. Interacts with
 C1 — changing the field re-identifies every manifest (VII.3).
 
-### C3 · The host is named in the API and in the user's directories — VI.1
+### ~~C3 · The host is named in the API and in the user's directories~~ — VI.1
 
-- `pub const SNAPSHOT_IGNORE_FILENAME = ".codexsnapignore"` (scope.rs:40) — a
-  filename the user has to type.
-- `FileSnapshotsController::maybe_new(codex_home, …)` (controller.rs:61) and
-  `forget_threads(codex_home, …)` (store.rs:562).
-- `apply_plan` writes `<name>.codex-restore-tmp` **into the user's working tree**
-  (restore.rs:117).
-- The crate is named `codex-file-snapshots`; doc comments reference
-  `CODEX_HOME/file_snapshots/` (store.rs:3).
+**CLOSED** by the rename and API pass. The crate is `filesnap`, the ignore
+file is `.filesnapignore`, the restore temp suffix is
+`.filesnap-restore-tmp`, the `codex_home` parameters are `data_dir`, and no
+occurrence of the string `codex` remains anywhere under `crates/`.
 
-**Failure:** the engine is being published as host-neutral. A user of a
-non-Codex integration is told to create a `.codexsnapignore`, and finds
-`.codex-restore-tmp` files in their project.
-
-*Closed by the rename and API pass planned as the next commit.*
+*Was:* a filename the user had to type (`.codexsnapignore`), vendor-named
+temporary files created in the user's own working tree during every restore,
+and a vendor prefix on every `use` a consumer would write.
 
 ---
 
@@ -170,12 +165,14 @@ is the claim, and it matters because II.1's deletion rule is read off the strong
 version — an auditor checking the stated property verifies something the code does
 not promise.
 
-### C11 · `collect_garbage` is exported but uncallable
+### ~~C11 · `collect_garbage` is exported but uncallable~~
 
-`lib.rs:36` re-exports `refs::collect_garbage`, whose signature names `&TurnIndex`
-(refs.rs:461) — a type that is not exported, from a private module. The only
-usable entry point is `SnapshotStore::gc()` (store.rs:465). Dead public surface,
-and the Quality Gates rule says nothing is exported that a consumer cannot call.
+**CLOSED** by the API pass. The re-export is gone, along with the dead
+`TurnIndex::restore_logs` it kept alive; `SnapshotStore::gc()` is the entry
+point, as it always was in practice.
+
+*Was:* a re-export whose signature named `&TurnIndex`, a type not exported
+from a private module — public surface no consumer could ever call.
 
 ---
 
@@ -224,4 +221,5 @@ Recorded so they are not re-litigated.
 
 ---
 
-**Last reviewed:** 2026-08-22 against `39e5efe`.
+**Last reviewed:** 2026-08-22. Opened against `39e5efe`; C3 and C11 closed by
+the rename and API pass.
