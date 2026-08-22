@@ -1,0 +1,65 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+# Track the edition for all workspace crates in one place.
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
+ignore = "0.4.23"
+pretty_assertions = "1.4.1"
+serde = { version = "1", features = ["rc"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tracing = "0.1.44"
+
+[workspace.lints]
+rust = {}
+
+[workspace.lints.clippy]
+await_holding_invalid_type = "deny"
+await_holding_lock = "deny"
+disallowed_methods = "deny"
+expect_used = "deny"
+identity_op = "deny"
+manual_clamp = "deny"
+manual_filter = "deny"
+manual_find = "deny"
+manual_flatten = "deny"
+manual_map = "deny"
+manual_memcpy = "deny"
+manual_non_exhaustive = "deny"
+manual_ok_or = "deny"
+manual_range_contains = "deny"
+manual_retain = "deny"
+manual_strip = "deny"
+manual_try_fold = "deny"
+manual_unwrap_or = "deny"
+needless_borrow = "deny"
+needless_borrowed_reference = "deny"
+needless_collect = "deny"
+needless_late_init = "deny"
+needless_option_as_deref = "deny"
+needless_question_mark = "deny"
+needless_update = "deny"
+redundant_clone = "deny"
+redundant_closure = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_static_lifetimes = "deny"
+trivially_copy_pass_by_ref = "deny"
+uninlined_format_args = "deny"
+unnecessary_filter_map = "deny"
+unnecessary_lazy_evaluations = "deny"
+unnecessary_sort_by = "deny"
+unnecessary_to_owned = "deny"
+unwrap_used = "deny"
+
+[profile.dev]
+# Keep line tables/backtraces while avoiding expensive full variable debug info.
+debug = "limited"

@@ -1,0 +1,10 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules/
+.pnpm-store/
+
+# OS
+.DS_Store
