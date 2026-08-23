@@ -53,9 +53,9 @@ then.
 Every invocation is a new process. All state that must survive between
 invocations lives on disk.
 
-**Consequence, not yet resolved:** the edit-touched partition is held in memory
-by `SnapshotTracker` and is lost when the process exits, so a sidecar sees it
-empty on every call. See O1.
+**Consequence:** the edit-touched partition is held in memory by
+`SnapshotTracker` and is lost when the process exits, so a sidecar would see it
+empty on every call. Resolved by D25 — it is persisted.
 
 ## D4 · A session is bound to one working directory, permanently
 
@@ -564,27 +564,85 @@ tolerance, C6's fallback) are independent of the format and can follow. The CLI
 follows the format rather than preceding it, so it is written against the layout
 it will ship on.
 
+## D25 · The declared set accumulates, bounded by a rolling window of turns
+
+Paths declared through the edit API accumulate for the session, persisted so a
+new process picks them up — and a path drops out of the *tracked set* once it has
+not been declared for the last N turns (N = 100, matching Claude Code's own cap).
+
+**The window governs observation, never restorability.** Every manifest still
+restores exactly what it recorded; a path that has aged out of tracking is still
+restored by every manifest that already holds it. What ends is the engine
+continuing to watch it in *new* captures. This is why the window does not
+conflict with VIII.1's ban on age-based behaviour: that rule is about
+reclamation, and nothing here reclaims anything.
+
+**Why accumulate at all** — Claude Code, verified from its own pre-minification
+source, accumulates and never removes: `trackedFiles` is a `Set<string>` whose
+only incremental mutation in the entire tree is `.add()`, and each per-turn
+snapshot walks the whole accumulated set, re-statting every file ever edited. Its
+change detection is stat-and-content based and tool-agnostic, which produces the
+asymmetry worth copying: **a shell command that modifies an already-tracked file
+is caught; one that touches a file the edit tools never saw is invisible.**
+Accumulation is what makes the first half of that true.
+
+**Why bound it** — Claude Code pays for accumulation with a snapshot cost that
+grows with session length, and it carries no second and third partition on top.
+The window keeps the same coverage for the span anyone actually rewinds across
+while stopping the set from growing without limit.
+
+**Claude Code's own rebuild trick is not available here.** It reconstructs
+`trackedFiles` from the union of its snapshots' backup-map keys, which works
+because its snapshots contain *only* edit-tracked files. A filesnap manifest
+mixes all three partitions, and VII.3 forbids recording which partition supplied
+a path in a content-addressed record. Hence a separate file rather than a
+derivation.
+
+**Implementation notes:** entries are stored as `(turn ordinal, path)` so the
+window is applied on read, which means this depends on D6's ordering mechanism
+existing. The file is per-session and therefore bounded. Deleting a session must
+drop it (D22), and it is a GC root while it lives.
+
+*Available later, not taken now:* declaring only out-of-workspace paths would
+shrink the set further, since in-workspace paths are already covered by the git
+and recency partitions — anything modified in the workspace moves its mtime and
+the recency partition sees it. Worth doing if the stat cost ever shows up; not
+worth the special case before then.
+
+Settles O1.
+
+## D26 · `RestoreKind` keeps `undo_for` and `spending`
+
+They are not vestigial, and the argument that they were rested on a confusion
+between two different things.
+
+**Restore resolution is fork-agnostic already.** A target resolves through
+`turns/<turn_id>`, keyed on the turn alone and independent of any session, so
+whether the host forked makes no difference to *what state a point resolves to*.
+Codex preserves turn ids verbatim across a fork precisely so this holds.
+
+**These fields are about something else: where the undo record is filed.** That
+genuinely does depend on the host's history model. In a forking host the user
+ends up in the new thread, so the record has to be filed there or it is
+unreachable from where they are standing. Removing the parameter would bake
+filesnap's own linear ordering into an engine that VI.1 says must know no host —
+D6 fixes the ordering *this project* offers for "go back N steps", not what
+shapes of history a consumer may have.
+
+**One caveat to state rather than leave implicit:** `restore_to` writes to the
+restore log of the session named by `undo_for`, while holding the performing
+session's lock (D18). For a forking host the destination is a session that has
+just been created and that nothing else is using, so the race is theoretical —
+but it is a real gap in the lock's coverage and belongs in the documentation
+rather than in someone's memory.
+
 ---
 
 ## Open
 
-- **O1 · How the edit-touched partition survives a process boundary.**
-  *Deferred to its own discussion.* The proposal on the table is that the set is
-  **per-turn rather than accumulated**: past turns are already durable in their
-  own manifests, and the current turn's edits are supplied by the caller — for
-  instance through an API that both writes the file and records it, so using it
-  *is* the registration.
-
-  One correction to carry into that discussion: the accumulated set was never
-  there to protect past turns. Their pre-images are on disk either way. It is
-  there to keep *observing* those paths in later turns — so that a file the
-  agent edited at turn 3 and something else changes at turn 40 is still captured
-  at turn 40. Dropping accumulation narrows the engine to "what the caller
-  declared this turn", and the gap is a path that has left the git index, is
-  outside the recency budget, and is changed by something that does not go
-  through the declaring API. How wide that gap is depends entirely on whether
-  every writer really goes through the API, which is a CLI question, not an
-  engine one.
+- ~~**O1 · How the edit-touched partition survives a process boundary.**~~
+  Settled by D25: it accumulates, persisted, bounded by a rolling window of
+  turns.
 
 - ~~**O6 · The scope of the lock D18 requires.**~~ Settled by D18 itself: the
   lock is per session and covers only a session racing itself. Nothing wider is
