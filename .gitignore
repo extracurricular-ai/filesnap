@@ -8,6 +8,3 @@ node_modules/
 
 # OS
 .DS_Store
-
-# Working notes, deliberately not committed
-*.tmp.md
