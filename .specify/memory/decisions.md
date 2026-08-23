@@ -326,23 +326,94 @@ products that share no code path. The door is open exactly once.
 
 Settles C1's shape. C1 stays open until it is implemented.
 
+## D16 · `FileEntry::mode` becomes `Option<u32>`
+
+`None` means the mode was never observed. The planner leaves it out of the
+comparison and a restore does not touch permissions for such an entry.
+
+Two sites produce `None` today: `attach_pre_edit`, whose content arrives from an
+edit with no stat behind it, and `mode_of` on a non-unix host, which has no
+permission bits to report. Both currently invent `0o644`, and the invention is
+not inert — `plan_restore` compares mode and `apply_plan` chmods, so restoring a
+pre-edit image of an executable script strips its `+x`, and a file whose content
+already matches is rewritten anyway because the invented mode never equals the
+real one.
+
+This is V.2 applied literally: what was not observed must be representable as
+absent rather than filled in with a plausible default. Settles C2's shape; lands
+with C1/D15 in one manifest change (O4).
+
+## D17 · Names are `filesnap` everywhere, with the binary crate suffixed
+
+| | |
+|---|---|
+| crates.io | `filesnap` (engine), `filesnap-cli` (binary crate) |
+| the command | `filesnap` |
+| npm | `filesnap` |
+| dsh plugin | `dsh-filesnap`, in its own repository (D2) |
+
+All of these were free on both registries as of 2026-08-23. The binary crate
+carrying a `-cli` suffix while producing a command without one is the ordinary
+Rust arrangement — `ripgrep` produces `rg` the same way.
+
+**Internal naming follows at the same moment as D15.** The tracing prefix already
+says `filesnap:`; `STORE_DIR_NAME` becomes `filesnap` when the store path gains
+its version segment, so the layout is `<data_dir>/filesnap/v1/`. Doing it then
+costs nothing, because that change is already moving the store root.
+
+## D18 · Every mutating operation serializes on a lock
+
+Capture, restore, delete, and collection all take a lock. Concurrency was never
+recommended or supported, so serializing is the honest implementation of what the
+design already assumed rather than a new restriction.
+
+This is a deliberate departure from the reasoning in VIII.2, which declined a
+lock on the capture path and answered the sweep-versus-publish race with a grace
+window instead, git-style. Under a lock that race cannot occur at all, and
+several confirmed defects lose their root cause rather than needing individual
+fixes: C5's dedup race, C12's turn-index race, and C13's mid-sweep interference
+all require two processes mutating at once.
+
+**The grace window stays regardless.** A lock serializes live processes; it does
+nothing about a process killed mid-publish, whose residue the window and the
+whitelisting (D9) still have to handle. Locks and windows answer different
+questions and neither replaces the other.
+
+**Scope is unresolved — see O6.** A workspace-scoped lock is not sufficient here,
+because the store is *global*: every session under one `data_dir` shares one
+`blobs/` and one `manifests/`, whatever workspace it belongs to. So two sessions
+in unrelated directories still collide in the store, which is exactly where C5's
+race lives.
+
 ---
 
 ## Open
 
-- **O1 · How the edit-touched partition survives a process boundary.** Three
-  candidates: persist it as its own append-only file; rehydrate the whole key
-  set from the latest manifest (imprecise — carries the git and recency
-  partitions too, so tracking then only grows, at up to 100 paths per
-  invocation); or diff manifests per turn (exact but reads two manifests per
-  turn). The first is preferred: of the three partitions only the edit-touched
-  one is *history* — the other two are recomputed every capture, and storing
-  them would resurrect stale data rather than remember anything.
-- **O2 · Serializing concurrent restores.** The capture path deliberately takes
-  no lock. A library inside one long-lived process serialized restores by
-  construction; a CLI does not. Either the interface prevents two concurrent
-  restores into one directory or it takes a real lock with owner identity and
-  stale recovery. Named as unsettled in the constitution.
+- **O1 · How the edit-touched partition survives a process boundary.**
+  *Deferred to its own discussion.* The proposal on the table is that the set is
+  **per-turn rather than accumulated**: past turns are already durable in their
+  own manifests, and the current turn's edits are supplied by the caller — for
+  instance through an API that both writes the file and records it, so using it
+  *is* the registration.
+
+  One correction to carry into that discussion: the accumulated set was never
+  there to protect past turns. Their pre-images are on disk either way. It is
+  there to keep *observing* those paths in later turns — so that a file the
+  agent edited at turn 3 and something else changes at turn 40 is still captured
+  at turn 40. Dropping accumulation narrows the engine to "what the caller
+  declared this turn", and the gap is a path that has left the git index, is
+  outside the recency budget, and is changed by something that does not go
+  through the declaring API. How wide that gap is depends entirely on whether
+  every writer really goes through the API, which is a CLI question, not an
+  engine one.
+
+- **O6 · The scope of the lock D18 requires.** A workspace-scoped lock does not
+  cover the store, which is global: all sessions under one `data_dir` share one
+  `blobs/` and one `manifests/`. The candidates are a store-scoped lock, which
+  serializes every filesnap process on the machine; partitioning the store per
+  workspace as anionex does, which makes a workspace lock sufficient but gives
+  up cross-workspace dedup; or a workspace lock plus keeping the grace window
+  for the cross-workspace case.
 - **O3 · The CLI command surface and the sidecar protocol.**
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
   re-identifies every record on disk, so they are one change or none. C1's shape
