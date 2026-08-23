@@ -748,16 +748,30 @@ timestamp is for display — `filesnap log` showing when, not just what — and 
 no part in any decision, so it does not touch VIII.1, which bans reclamation by
 age rather than the display of time.
 
-The chain is **speculative and recorded as such**: no threat model on the table
-asks for it today. It is taken because the cost is small and the value is
-unclear rather than because a failure was named — which is the opposite of how
-every other decision here was made, and the exception is deliberate.
+**The chain has to go in now, and not because the cost is small.** A hash chain
+only means anything if it begins at the first entry. Added later, every existing
+log is permanently unchained before the cut, and the verification policy has to
+special-case that gap forever — "this is broken" and "this predates the chain"
+become indistinguishable. That is unlike an ordinary field: the timestamp really
+could be added at any time behind `#[serde(default)]`, and a chain cannot.
+
+An earlier note here called the chain speculative and said the cost-of-delay
+argument did not apply to `ThreadLog` because it is not content-addressed. The
+first half of that reasoning was sound and the conclusion drawn from it was
+wrong — id churn is what closes the *manifest* door, and a chain has a door of
+its own that closes for a different reason.
+
+No threat model on the table asks for tamper-evidence today, so the *value*
+remains unproven. The *timing* does not: today, with nothing published, nothing
+tested, and no obligation to read anything codex-rewind wrote (D1), is when it is
+free.
 
 **One thing the chain forces, which must be answered before it is written:** what
 a reader does when the chain does not verify. A field nobody validates is exactly
 the defect VII.4 names; a field that is validated commits the project to a
 failure mode, and refusing to read a log whose chain is broken can make a
-recoverable situation unrecoverable. See O8.
+recoverable situation unrecoverable. Starting every chain at entry zero at least
+narrows it — a break can only mean corruption, never a legacy gap. See O8.
 
 ## D32 · Output is JSON Lines, one event per line
 
@@ -784,8 +798,9 @@ contract, and `jq` covers the rest.
   log, and a corrupted chain costs the user every snapshot behind it — turning a
   detection mechanism into a second failure. Warn and continue, and the field is
   decoration nothing enforces, which VII.4 calls a defect. Refuse only the
-  entries after the break, and the answer depends on what a break means, which
-  nobody has had to define yet.
+  entries after the break, which is the most promising and needs "a break"
+  defined. Because every chain starts at entry zero (D31), a break can only mean
+  corruption — there is no legacy gap to tell it apart from.
 
 - **O3 · The CLI command surface and the sidecar protocol.**
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
