@@ -240,6 +240,92 @@ held are reclaimed. Never "the bytes are gone" — deduplication means a blob a
 live session also holds stays, and no amount of synchronous work changes that.
 VIII.3 was rewritten to constrain reachability rather than bytes.
 
+## D12 · The protection predicate becomes the ignore rules themselves
+
+`restore_to` and `undo_conflicts` stop taking `is_protected: &dyn Fn(&str) -> bool`
+and take the ignore rules directly.
+
+**Why the obvious objection is wrong:** a closure looked more expressive, but
+`GitignoreBuilder::add_line` (ignore-0.4.33, gitignore.rs:460) lets a caller read
+the file and append rules **in memory**, so nothing is lost:
+
+```rust
+let mut b = GitignoreBuilder::new(root);
+b.add(root.join(SNAPSHOT_IGNORE_FILENAME));
+b.add_line(None, "/secret/**")?;   // temporary, never touches the user's file
+let rules = b.build()?;
+```
+
+**What is gained:** the protection rule becomes *data* rather than code. It can
+be logged, shown to the user ("these four paths were protected and not written"),
+and it is the same concept as the ignore file rather than a second one.
+
+**What is lost, and accepted:** predicates that are not path-shaped — "protect
+everything over N bytes", "protect what root owns". Not worth a closure.
+
+**Never express a temporary rule by editing `.filesnapignore` on disk.** It is
+the user's file and it is versioned. In-memory is the only correct half of that.
+
+## D13 · `ignore` is a public dependency, deliberately
+
+`Gitignore` stays in the public signatures. `ignore` is part of ripgrep and has
+been 0.4.x for years, so the coupling is cheap in practice, and D12 makes the
+type more central rather than less.
+
+**Correction recorded:** Rust has no "forward multi-version compatibility". When
+a public dependency bumps its major version the standard answer is a coordinated
+breaking release of ours — not supporting both at once. (Two dependency entries
+behind feature flags is technically possible and effectively nobody does it.)
+The accepted cost is one coordinated major bump on the day `ignore` goes 0.5.
+
+**Cheap mitigation, taken:** `pub use ignore::gitignore::Gitignore;` so consumers
+can name the type without adding their own dependency on `ignore`. With D12 this
+is close to mandatory.
+
+## D14 · Scan limits are a library parameter with a correct default, never a user setting
+
+`recent_files` and `tracked_files` take `ScanLimits { max_files, max_file_bytes }`,
+whose `Default` is exactly today's constants — 100 files, 16 MB per file. An
+embedder may override it. The CLI does not expose it, and the documentation says
+plainly that overriding it is usually the wrong move.
+
+**This does not amend IV.4.** That rule forbids a bound being *a knob a user must
+find*, and requires the engine to be correct and affordable where nothing is
+configured. A parameter with a correct default is neither a user knob nor a
+tuning requirement — the bound is still a property of the mechanism; the
+mechanism is simply parameterised for whoever embeds it.
+
+**Side effect:** `RECENT_LIMIT` and `RECENT_MAX_FILE_BYTES` are currently `pub`
+inside a private module and therefore unreachable — dead surface of the same
+class as the closed C11. They stop being a problem by becoming the default,
+rather than by being re-exported as constants a caller has to interpret.
+
+**Not solved by this:** C8. Being able to *set* the limit is a different thing
+from being told which file the limit dropped, and IV.3 asks for the second.
+
+## D15 · Format version goes in both the store path and every record
+
+```
+<data_dir>/file_snapshots/v1/{blobs,manifests,refs,turns,restores}/
+```
+
+plus a `version` field on `Manifest`, `ThreadLog`, and `RestoreLog`. A reader
+that meets a version it does not understand fails loudly. **No optimistic
+reading of version-less data.**
+
+The path carries the coarse answer — a v2 binary does not look inside `v1/` at
+all, so an incompatible format cannot be misread and migration is explicit. The
+record field catches the finer case a path alone cannot: a store interrupted
+mid-migration, whose root says v2 while some records are still v1.
+
+**Why the cost is zero right now.** Adding a field to `Manifest` re-identifies
+every manifest on disk, because the id is the SHA-256 of its own JSON. That is a
+migration after publication and a no-op before it: nothing is deployed, and there
+is no compatibility obligation toward codex — D1 already established they are two
+products that share no code path. The door is open exactly once.
+
+Settles C1's shape. C1 stays open until it is implemented.
+
 ---
 
 ## Open
@@ -259,7 +345,10 @@ VIII.3 was rewritten to constrain reachability rather than bytes.
   stale recovery. Named as unsettled in the constitution.
 - **O3 · The CLI command surface and the sidecar protocol.**
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
-  re-identifies every record on disk, so they are one change or none.
+  re-identifies every record on disk, so they are one change or none. C1's shape
+  is settled by D15; C2's proposed shape is `FileEntry::mode: Option<u32>` —
+  `None` means "not observed", the planner ignores it, and a restore leaves
+  permissions untouched. Not yet confirmed.
 - **O5 · Whether the crate keeps the name `filesnap`.** Free on crates.io and
   npm; the counter-argument is that the code spells `file_snapshots` everywhere.
   Nearly free to change until the first publish.

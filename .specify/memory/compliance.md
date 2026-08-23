@@ -315,6 +315,49 @@ only interruption point, a session that simply never rewound — which is legal
 and indistinguishable from the ordinary case. Ordering is the whole fix; no
 journal, no lock, no marker file.
 
+### C17 · II.3's enforcement point is handed to the caller with no supported form — II.3
+
+`restore_to` and `undo_conflicts` take `is_protected: &dyn Fn(&str) -> bool`, and
+the crate exports nothing that builds one. Both call sites in the test suite
+hand-write the same closure:
+
+```rust
+let ignore = load_ignore(&ws);
+let protect = move |path: &str| is_ignored(&ignore, Path::new(path));
+```
+
+**Failure:** symmetric ignore is the rule that keeps a restore from writing over
+or deleting a path the user excluded, and the only thing standing behind it is a
+closure every consumer writes from scratch. A wrong one does not fail — it
+silently stops protecting. The keys are manifest path *strings* while
+`is_ignored` takes a `Path`, so the conversion is a step a consumer can plausibly
+get wrong without noticing.
+
+**Resolved by D12**: the parameter becomes the ignore rules themselves, so there
+is no predicate to build.
+
+### C18 · `ignore` is an undeclared public dependency
+
+`Gitignore` appears in `load_ignore`, `is_ignored`, `recent_files`, and
+`git_tracked_files`, and the crate does not re-export it.
+
+**Failure:** a consumer who stores the value in a struct must add `ignore` to
+their own `Cargo.toml` and keep its version in step with ours, with nothing
+saying so. The coupling itself is accepted (D13); the defect is that it is
+accidental rather than declared.
+
+**Resolved by D13**: `pub use ignore::gitignore::Gitignore;` plus a documented
+statement that this is a public dependency.
+
+### C19 · `RECENT_LIMIT` and `RECENT_MAX_FILE_BYTES` are unreachable public constants
+
+Both are `pub const` in `scope.rs` (:94, :97), which is a private module, and
+neither is re-exported from `lib.rs`. Dead surface of the same class as the
+closed C11.
+
+**Resolved by D14**: they become the `Default` of a `ScanLimits` parameter rather
+than exported constants, so nothing needs to read them.
+
 ## Rules with no test
 
 Quality Gates require every rule to be pinned. These are not.
@@ -364,5 +407,7 @@ Recorded so they are not re-litigated.
 the rename and API pass. C12–C15 added, and C4/C5 sharpened, by the delete/gc
 boundary audit — C4's consequence turned out to be a broken deletion promise
 rather than a disk leak, and C5's stated fix was wrong twice over. C16 added
-with D11. **No code has changed since the API pass; every open entry is still
-open.**
+with D11. C17–C19 added from the API walkthrough — three defects I had named in
+conversation, said I would record, and then did not; they sat unrecorded for
+several rounds while the delete/gc work went on. **No code has changed since the
+API pass; every open entry is still open.**
