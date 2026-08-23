@@ -155,13 +155,8 @@ impl WorkspaceStore {
     ) -> Result<Checkpoint> {
         let prev = self.latest_manifest(thread_id)?;
         let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref())?;
-        self.refs.append(
-            thread_id,
-            SnapshotRef {
-                turn_id: turn_id.to_string(),
-                manifest_id: cp.id.clone(),
-            },
-        )?;
+        self.refs
+            .append(thread_id, turn_id.to_string(), cp.id.clone())?;
         // Turn ids survive forking, so this index is what lets a rewind
         // resolve the same state from any branch.
         self.turns.set_turn(turn_id, &cp.id)?;
@@ -215,13 +210,8 @@ impl WorkspaceStore {
             let mut manifest = latest;
             manifest.absent.insert(path_key.to_string());
             let id = self.manifests.save(&manifest)?;
-            self.refs.append(
-                thread_id,
-                SnapshotRef {
-                    turn_id: turn_id.to_string(),
-                    manifest_id: id.clone(),
-                },
-            )?;
+            self.refs
+                .append(thread_id, turn_id.to_string(), id.clone())?;
             self.turns.set_turn(turn_id, &id)?;
             return Ok(Some(id));
         };
@@ -232,16 +222,12 @@ impl WorkspaceStore {
             path_key.to_string(),
             crate::manifest::FileEntry {
                 // Pre-edit images come from the edit's own content, not the
-                // filesystem: no stat is available. The zero fingerprint
-                // simply disables the stat-cache fast path for this entry.
-                //
-                // The mode, by contrast, is *invented* — the one place this
-                // crate breaks its own record-don't-infer rule, and it is not
-                // inert: `plan_restore` compares mode and `apply_plan` applies
-                // it, so restoring here strips an executable bit. Tracked as
-                // C2; the fix is `FileEntry::mode: Option<u32>`, which has to
-                // land with the format versioning in C1.
-                mode: 0o644,
+                // filesystem: there is no stat behind them, so neither the
+                // fingerprint nor the mode was ever observed. Both say so.
+                // The zero fingerprint disables the stat-cache fast path;
+                // `None` keeps a restore from applying permissions nobody
+                // ever saw.
+                mode: None,
                 size: content.len() as u64,
                 mtime_secs: 0,
                 mtime_nanos: 0,
@@ -249,13 +235,8 @@ impl WorkspaceStore {
             },
         );
         let id = self.manifests.save(&manifest)?;
-        self.refs.append(
-            thread_id,
-            SnapshotRef {
-                turn_id: turn_id.to_string(),
-                manifest_id: id.clone(),
-            },
-        )?;
+        self.refs
+            .append(thread_id, turn_id.to_string(), id.clone())?;
         // A supplemental attach extends this turn's capture, so it becomes
         // the state the turn resolves to.
         self.turns.set_turn(turn_id, &id)?;
@@ -409,8 +390,15 @@ impl WorkspaceStore {
             return Ok(0);
         };
         self.refs.ensure(new_thread_id)?;
+        // Re-chained rather than copied verbatim: the inherited entries are
+        // new entries in a new log, and a chain that carried its parent's
+        // links would describe a history this log does not have.
         for entry in &log.entries[..=cut] {
-            self.refs.append(new_thread_id, entry.clone())?;
+            self.refs.append(
+                new_thread_id,
+                entry.turn_id.clone(),
+                entry.manifest_id.clone(),
+            )?;
         }
         Ok(cut + 1)
     }

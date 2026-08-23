@@ -384,6 +384,6 @@ mod tests {
         let cp2 = capture(&f.blobs, &f.manifests, vec![a.clone()], Some(&cp1.manifest)).unwrap();
 
         let key = a.to_string_lossy().into_owned();
-        assert_eq!(cp2.manifest.entries[&key].mode, 0o755);
+        assert_eq!(cp2.manifest.entries[&key].mode, Some(0o755));
     }
 }

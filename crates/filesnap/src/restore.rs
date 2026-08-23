@@ -24,7 +24,8 @@ use crate::manifest::Manifest;
 pub struct WriteAction {
     pub path: String,
     pub hash: String,
-    pub mode: u32,
+    /// Permissions to set, or `None` to leave whatever is there.
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,10 +55,13 @@ pub fn plan_restore(
         if is_protected(path) {
             continue;
         }
-        let differs = current
-            .entries
-            .get(path)
-            .is_none_or(|cur| cur.hash != entry.hash || cur.mode != entry.mode);
+        // Mode counts only when both sides observed one. An entry whose
+        // permissions were never seen has no opinion about them, and treating
+        // its `None` as a difference would rewrite files whose content
+        // already matches and then set them to permissions nobody recorded.
+        let differs = current.entries.get(path).is_none_or(|cur| {
+            cur.hash != entry.hash || matches!((cur.mode, entry.mode), (Some(a), Some(b)) if a != b)
+        });
         if differs {
             plan.writes.push(WriteAction {
                 path: path.clone(),
@@ -97,7 +101,12 @@ pub fn apply_plan(blobs: &BlobStore, plan: &RestorePlan) -> Result<ApplyStats> {
         }
         let tmp = tmp_path(&path);
         fs::write(&tmp, &content).map_err(|e| SnapshotError::io(&tmp, e))?;
-        set_mode(&tmp, write.mode)?;
+        // A write is a replace, so "leave the permissions alone" has to mean
+        // carrying the existing ones onto the replacement. Doing nothing
+        // would hand the file whatever the temporary got from the umask,
+        // which is a change made by omission — the same executable bit lost
+        // by a different route.
+        set_mode(&tmp, write.mode.or_else(|| current_mode(&path)))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
         stats.written += 1;
     }
@@ -121,7 +130,18 @@ fn tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<()> {
+/// What `path` is set to right now, if it exists and the platform says.
+fn current_mode(path: &Path) -> Option<u32> {
+    crate::manifest::mode_of(&fs::metadata(path).ok()?)
+}
+
+/// Apply permissions. `None` means there are none to apply — neither the
+/// record nor the file on disk offered any — so whatever the newly written
+/// file has is what it keeps.
+fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
+    let Some(mode) = mode else {
+        return Ok(());
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -149,7 +169,7 @@ mod tests {
             m.entries.insert(
                 (*path).to_string(),
                 FileEntry {
-                    mode: 0o644,
+                    mode: Some(0o644),
                     size: hash.len() as u64,
                     mtime_secs: 0,
                     mtime_nanos: 0,

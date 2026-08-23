@@ -24,8 +24,21 @@ use crate::error::SnapshotError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
-    /// Unix permission bits (`mode & 0o7777`); `0o644` on non-unix hosts.
-    pub mode: u32,
+    /// Unix permission bits (`mode & 0o7777`), or `None` when they were never
+    /// observed.
+    ///
+    /// `None` is not "default permissions" — it is the absence of an
+    /// observation, and a restore leaves such a file's permissions exactly as
+    /// it finds them. Two things produce it: content that arrived from an
+    /// edit rather than from the filesystem, which has no stat behind it at
+    /// all, and a platform with no permission bits to report.
+    ///
+    /// It was `u32` with an invented `0o644` in both cases, which was not
+    /// inert: the planner compares mode and the applier chmods, so restoring
+    /// a pre-edit image of an executable script stripped its `+x`, and a file
+    /// whose content already matched was rewritten anyway because an invented
+    /// mode never equals a real one.
+    pub mode: Option<u32>,
     pub size: u64,
     pub mtime_secs: i64,
     pub mtime_nanos: u32,
@@ -59,22 +72,34 @@ pub fn mtime_parts(meta: &fs::Metadata) -> (i64, u32) {
         .map_or((0, 0), |d| (d.as_secs() as i64, d.subsec_nanos()))
 }
 
-/// Permission bits to record for a file (`mode & 0o7777`; `0o644` off-unix).
-pub fn mode_of(meta: &fs::Metadata) -> u32 {
+/// Permission bits to record for a file (`mode & 0o7777`), or `None` where
+/// the platform has none to report.
+///
+/// `None` off-unix rather than a plausible `0o644`: inventing one would make
+/// a restore chmod every file it wrote on Windows to permissions nothing ever
+/// observed.
+pub fn mode_of(meta: &fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o7777
+        Some(meta.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
     {
         let _ = meta;
-        0o644
+        None
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Format version of this record.
+    ///
+    /// The store's own directory carries a version too, and this is the finer
+    /// half of the same guarantee: the path catches a store a different build
+    /// wrote, and this catches a record that build left inside one of ours —
+    /// which is what a migration interrupted halfway looks like.
+    pub version: u32,
     /// Path → entry. Paths are stored as strings (lossy UTF-8) so
     /// manifests serialize portably; keys are absolute paths.
     pub entries: BTreeMap<String, FileEntry>,
@@ -92,8 +117,23 @@ pub struct Manifest {
     /// Every path the capture was asked about either has an entry or appears
     /// here, whether it came from the index, from recency, or from an edit
     /// that created a file where none was.
+    /// `default` is safe here only because `version` is checked first. An
+    /// empty set is omitted from the JSON, so reading has to tolerate the key
+    /// being absent — and without the version guard that same tolerance would
+    /// silently read a record from a build that predated tombstones as "this
+    /// capture looked for nothing", voiding every deletion it licensed.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub absent: BTreeSet<String>,
+}
+
+impl Default for Manifest {
+    fn default() -> Self {
+        Self {
+            version: crate::workspace::FORMAT_VERSION,
+            entries: BTreeMap::new(),
+            absent: BTreeSet::new(),
+        }
+    }
 }
 
 impl Manifest {
@@ -137,7 +177,19 @@ impl ManifestStore {
                 SnapshotError::io(&path, e)
             }
         })?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
+        // Refuse rather than guess. A record this build does not understand
+        // may mean anything at all, and the one thing it must not do is look
+        // like a record that means something else.
+        if manifest.version != crate::workspace::FORMAT_VERSION {
+            return Err(SnapshotError::UnknownRecordVersion {
+                kind: "manifest",
+                id: id.to_string(),
+                found: manifest.version,
+                supported: crate::workspace::FORMAT_VERSION,
+            });
+        }
+        Ok(manifest)
     }
 
     /// Where `id` lives, so the sweep can ask how old it is.
@@ -182,7 +234,7 @@ mod tests {
 
     fn entry(hash: &str) -> FileEntry {
         FileEntry {
-            mode: 0o644,
+            mode: Some(0o644),
             size: 1,
             mtime_secs: 10,
             mtime_nanos: 0,
@@ -247,5 +299,65 @@ mod tests {
         fs::write(&file, b"abc").unwrap();
         let meta2 = fs::metadata(&file).unwrap();
         assert!(!e.stat_matches(&meta2));
+    }
+
+    /// A record this build does not understand is refused, not guessed at.
+    /// Reading it anyway is the failure versioning exists to prevent: the
+    /// same bytes can mean different things in different formats, and the
+    /// one thing an unknown record must not do is look like a known one.
+    #[test]
+    fn a_manifest_from_an_unknown_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ManifestStore::open(dir.path()).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.entries.insert("/a".into(), entry("h"));
+        let id = store.save(&manifest).unwrap();
+        assert_eq!(store.load(&id).unwrap(), manifest);
+
+        // Rewrite it as a record from a build that does not exist yet.
+        let raw = fs::read(dir.path().join(format!("{id}.json"))).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        value["version"] = serde_json::json!(crate::workspace::FORMAT_VERSION + 1);
+        fs::write(
+            dir.path().join(format!("{id}.json")),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        let err = store.load(&id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SnapshotError::UnknownRecordVersion {
+                    kind: "manifest",
+                    ..
+                }
+            ),
+            "expected a refusal naming the record, got {err:?}"
+        );
+    }
+
+    /// The tombstone set is omitted from the JSON when empty, so reading has
+    /// to tolerate the key being absent — and that tolerance is only safe
+    /// because the version is checked first. Without it, a record from a
+    /// build that predated tombstones would read as "this capture looked for
+    /// nothing" and quietly void every deletion it had licensed.
+    #[test]
+    fn an_empty_tombstone_set_round_trips_without_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ManifestStore::open(dir.path()).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.entries.insert("/a".into(), entry("h"));
+        let id = store.save(&manifest).unwrap();
+
+        let raw = fs::read(dir.path().join(format!("{id}.json"))).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            value.get("absent").is_none(),
+            "an empty set is not written at all"
+        );
+        assert_eq!(store.load(&id).unwrap().absent, BTreeSet::new());
     }
 }

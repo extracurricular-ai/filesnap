@@ -24,11 +24,71 @@ use crate::manifest::ManifestStore;
 pub struct SnapshotRef {
     pub turn_id: String,
     pub manifest_id: String,
+    /// When this entry was appended, in unix seconds.
+    ///
+    /// For display — a listing that shows only a sequence number and an
+    /// external conversation id gives a person nothing to recognise. It takes
+    /// part in no decision, so VIII.1's ban on age-based *behaviour* is
+    /// untouched: that rule is about reclamation, not about showing a clock.
+    pub at: u64,
+    /// Hash of the preceding entry, or `None` for the first.
+    ///
+    /// **Written and never read.** No threat model on the table asks for
+    /// tamper-evidence, so what a reader should do with a broken chain is not
+    /// yet decided — and deciding it wrongly is worse than deferring, since
+    /// refusing a log whose chain is broken can make a recoverable situation
+    /// unrecoverable.
+    ///
+    /// It is written now because a chain only means anything if it starts at
+    /// the first entry. Added later, every existing log stays permanently
+    /// unchained before the cut, and "this is broken" becomes impossible to
+    /// tell from "this predates the chain". Starting at entry zero keeps that
+    /// distinction available for whenever it is wanted.
+    ///
+    /// This is not the defect VII.4 names. That rule is about a property
+    /// *claimed* and not enforced; nothing here claims tamper-evidence, and
+    /// unused data is not a false promise.
+    pub prev_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadLog {
+    /// Format version of this record — see [`crate::manifest::Manifest`].
+    pub version: u32,
     pub entries: Vec<SnapshotRef>,
+}
+
+impl Default for ThreadLog {
+    fn default() -> Self {
+        Self {
+            version: crate::workspace::FORMAT_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl SnapshotRef {
+    /// Build an entry that chains onto `previous`.
+    pub(crate) fn chained(turn_id: String, manifest_id: String, previous: Option<&Self>) -> Self {
+        Self {
+            turn_id,
+            manifest_id,
+            at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            prev_hash: previous.map(Self::digest),
+        }
+    }
+
+    /// This entry's identity for the chain: the hash of its canonical JSON,
+    /// which already includes its own `prev_hash` and so covers everything
+    /// before it.
+    fn digest(entry: &Self) -> String {
+        serde_json::to_vec(entry).map_or_else(
+            |_| String::new(),
+            |bytes| crate::blob::BlobStore::hash_bytes(&bytes),
+        )
+    }
 }
 
 pub struct RefStore {
@@ -42,8 +102,16 @@ impl RefStore {
         Ok(Self { root })
     }
 
-    pub fn append(&self, thread_id: &str, entry: SnapshotRef) -> Result<()> {
+    /// Append a `(turn_id, manifest_id)` pair, chained onto whatever is
+    /// already there.
+    ///
+    /// Read-modify-write, which is why a session takes a lock against itself:
+    /// two concurrent appends for one session would otherwise lose an entry,
+    /// silently. A long-lived library could not hit that; a CLI invoked twice
+    /// can.
+    pub fn append(&self, thread_id: &str, turn_id: String, manifest_id: String) -> Result<()> {
         let mut log = self.load(thread_id)?;
+        let entry = SnapshotRef::chained(turn_id, manifest_id, log.entries.last());
         log.entries.push(entry);
         let path = self.log_path(thread_id);
         let tmp = path.with_extension("tmp");
@@ -529,22 +597,8 @@ mod tests {
         let refs = RefStore::open(dir.path().join("refs")).unwrap();
 
         assert_eq!(refs.load("t1").unwrap(), ThreadLog::default());
-        refs.append(
-            "t1",
-            SnapshotRef {
-                turn_id: "turn-1".into(),
-                manifest_id: "m1".into(),
-            },
-        )
-        .unwrap();
-        refs.append(
-            "t1",
-            SnapshotRef {
-                turn_id: "turn-2".into(),
-                manifest_id: "m2".into(),
-            },
-        )
-        .unwrap();
+        refs.append("t1", "turn-1".into(), "m1".into()).unwrap();
+        refs.append("t1", "turn-2".into(), "m2".into()).unwrap();
 
         let log = refs.load("t1").unwrap();
         assert_eq!(log.entries.len(), 2);
@@ -566,7 +620,7 @@ mod tests {
         live.entries.insert(
             "/f".into(),
             crate::manifest::FileEntry {
-                mode: 0o644,
+                mode: Some(0o644),
                 size: 4,
                 mtime_secs: 1,
                 mtime_nanos: 0,
@@ -579,14 +633,7 @@ mod tests {
         dead.entries.get_mut("/f").unwrap().hash = dead_hash.clone();
         let dead_id = manifests.save(&dead).unwrap();
 
-        refs.append(
-            "t1",
-            SnapshotRef {
-                turn_id: "turn".into(),
-                manifest_id: live_id.clone(),
-            },
-        )
-        .unwrap();
+        refs.append("t1", "turn".into(), live_id.clone()).unwrap();
 
         // Everything written a moment ago is inside the grace window, so a
         // sweep right now must take nothing at all — the point being that a
@@ -624,5 +671,77 @@ mod tests {
         assert_eq!(stats.blobs_removed, 1);
         assert_eq!(manifests.ids().unwrap().len(), 0);
         assert_eq!(blobs.hashes().unwrap().len(), 0);
+    }
+
+    /// The chain runs unbroken from the first entry.
+    ///
+    /// That is the whole reason it is written now rather than when something
+    /// needs it: a chain begun partway leaves everything before the cut
+    /// permanently unlinked, and "this is broken" stops being distinguishable
+    /// from "this predates the chain". Nothing reads it yet, so what is under
+    /// test is that the data will be there and complete when something does.
+    #[test]
+    fn the_chain_starts_at_the_first_entry_and_never_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = RefStore::open(dir.path()).unwrap();
+
+        for i in 0..4 {
+            refs.append("t1", format!("turn-{i}"), format!("manifest-{i}"))
+                .unwrap();
+        }
+
+        let log = refs.load("t1").unwrap();
+        assert_eq!(log.entries.len(), 4);
+        assert_eq!(
+            log.entries[0].prev_hash, None,
+            "the first entry has nothing behind it"
+        );
+        for pair in log.entries.windows(2) {
+            assert_eq!(
+                pair[1].prev_hash.as_deref(),
+                Some(SnapshotRef::digest(&pair[0]).as_str()),
+                "each entry names the one before it"
+            );
+        }
+    }
+
+    /// A timestamp for display, and nothing decides anything by it.
+    #[test]
+    fn entries_carry_the_time_they_were_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = RefStore::open(dir.path()).unwrap();
+        let before = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        refs.append("t1", "turn-1".into(), "m1".into()).unwrap();
+
+        let at = refs.load("t1").unwrap().entries[0].at;
+        assert!(at >= before, "recorded at least when we started");
+    }
+
+    /// An inherited log is re-chained rather than copied, because the entries
+    /// are new entries in a new log: a chain carrying its parent's links
+    /// would describe a history this log does not have.
+    #[test]
+    fn inherited_entries_are_rechained() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = RefStore::open(dir.path()).unwrap();
+        refs.append("src", "turn-1".into(), "m1".into()).unwrap();
+        refs.append("src", "turn-2".into(), "m2".into()).unwrap();
+
+        let source = refs.load("src").unwrap();
+        for entry in &source.entries {
+            refs.append("fork", entry.turn_id.clone(), entry.manifest_id.clone())
+                .unwrap();
+        }
+
+        let fork = refs.load("fork").unwrap();
+        assert_eq!(fork.entries[0].prev_hash, None);
+        assert_eq!(
+            fork.entries[1].prev_hash.as_deref(),
+            Some(SnapshotRef::digest(&fork.entries[0]).as_str())
+        );
     }
 }
