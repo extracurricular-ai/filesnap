@@ -783,6 +783,55 @@ than at the end.
 prose therefore belongs on **stderr**, where it cannot be mistaken for the
 contract, and `jq` covers the rest.
 
+## D33 · The chain is written and not read
+
+Every log entry carries the preceding entry's hash from entry zero onward.
+**Nothing verifies it, and no code path depends on it.**
+
+This is what makes D31 coherent rather than premature. The chain has to start at
+the beginning or it never means anything, so writing it is a now-or-never
+decision; *verifying* it is not, and no threat model has asked for it. Writing
+without reading takes the irreversible half now and leaves the reversible half
+until there is a reason.
+
+**Why this is not the defect VII.4 names.** That rule is about a property
+*claimed* and not enforced. Nothing here claims tamper-evidence: the field is
+documented as recorded and unverified, and a reader who wants to know whether the
+log is trustworthy is told plainly that it is not checked. Unused data is not a
+false promise; an unbacked claim is.
+
+**When it is taken up**, O8's question — refuse the log, refuse the entries after
+a break, or warn and continue — is easier than it looks today, because every
+chain will run unbroken from entry zero, so a mismatch can only mean corruption.
+There will be no legacy gap to tell it apart from.
+
+## D34 · `filesnap status` is the dashboard, and it is read-only
+
+One command answers "what is the state of this here", the way `git status` does:
+
+- files the scan saw and did not store, with reasons — D23's complete list
+- disk used, split the way D19 splits the store: this workspace's records, and
+  the shared blob store
+- the sessions in this workspace and how far back each can go
+
+It has **no side effects**. `doctor` is the one that changes things (D21's residue
+sweep), and keeping the reading and the writing in different commands means a
+plugin can ask without risking a write, and a person can look before deciding.
+
+## D35 · `restore` addresses a point only by turn id
+
+No `--steps-back N`, no relative addressing of any kind.
+
+**Because the cost of hitting the wrong point is high and asymmetric.** A restore
+overwrites the user's files; an off-by-one in a relative index is easy to make,
+easy to miss, and lands on a state nobody intended. A turn id names exactly one
+thing, and naming the wrong one requires naming it.
+
+The convenience is not lost, it moves: `filesnap log` lists the points, and the
+integration that would have wanted "go back three" is already rendering that list
+to let the user pick. Whoever counts, counts against a list they are looking at
+rather than against an index they assumed.
+
 ---
 
 ## Open
@@ -794,15 +843,30 @@ contract, and `jq` covers the rest.
 - ~~**O6 · The scope of the lock D18 requires.**~~ Settled by D18 itself: the
   lock is per session and covers only a session racing itself. Nothing wider is
   locked, so the partition layout does not have to carry the lock's weight.
-- **O8 · What a reader does when D31's hash chain does not verify.** Refuse the
-  log, and a corrupted chain costs the user every snapshot behind it — turning a
-  detection mechanism into a second failure. Warn and continue, and the field is
-  decoration nothing enforces, which VII.4 calls a defect. Refuse only the
-  entries after the break, which is the most promising and needs "a break"
-  defined. Because every chain starts at entry zero (D31), a break can only mean
-  corruption — there is no legacy gap to tell it apart from.
+- ~~**O8 · What a reader does when D31's hash chain does not verify.**~~
+  *Deferred by D33, not answered:* nothing reads the chain, so nothing has to
+  decide yet. Whenever it is taken up, the three candidates are refuse the log,
+  refuse the entries after the break, or warn and continue — and because every
+  chain runs unbroken from entry zero, a mismatch can only mean corruption,
+  which is what makes the middle one tractable.
 
-- **O3 · The CLI command surface and the sidecar protocol.**
+- ~~**O3 · The CLI command surface and the sidecar protocol.**~~ Settled across
+  D29–D35. There is no protocol, because there is no sidecar. The surface:
+
+  ```
+  filesnap capture  --session S --turn T [--cwd D] [--root R...]
+  filesnap declare  --session S --turn T --path P...    # before the edit
+  filesnap log      --session S [--limit N]
+  filesnap restore  --session S --turn T [--undo-for S2]
+  filesnap undo     --session S
+  filesnap delete   --session S...
+  filesnap gc
+  filesnap status   [--cwd D]                           # read-only dashboard
+  filesnap doctor   [--workdir D]                       # the one that writes
+  ```
+
+  No `rewind` (D27). No scan limits (D14). JSONL on stdout, prose on stderr
+  (D32).
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
   re-identifies every record on disk, so they are one change or none. C1's shape
   is settled by D15; C2's proposed shape is `FileEntry::mode: Option<u32>` —
