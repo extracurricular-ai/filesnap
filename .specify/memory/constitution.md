@@ -15,6 +15,9 @@ one, that is a defect with a name and a line number, recorded in
 sub-numbered so a violation can be cited exactly: "this breaks V.2" is answerable
 in a way "this breaks V" is not.
 
+Choices made *under* these principles — and the alternatives they rule out —
+are recorded in [decisions.md](decisions.md).
+
 ## Core Principles
 
 ### I. The user's version control is not ours to touch (NON-NEGOTIABLE)
