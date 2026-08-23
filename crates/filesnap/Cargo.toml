@@ -9,6 +9,11 @@ repository = "https://github.com/extracurricular-ai/filesnap"
 keywords = ["snapshot", "rewind", "undo", "checkpoint", "restore"]
 categories = ["filesystem", "development-tools"]
 
+[features]
+# Test fixtures, shared between this crate's own tests and its integration
+# tests so there is one place to build a realistic store (D36).
+test-support = ["dep:tempfile"]
+
 [lints]
 workspace = true
 
@@ -20,10 +25,12 @@ ignore = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+filesnap = { path = ".", features = ["test-support"] }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 

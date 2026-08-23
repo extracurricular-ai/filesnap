@@ -11,7 +11,7 @@ use filesnap::HiddenFiles;
 use filesnap::PreEditImage;
 use filesnap::RestoreKind;
 use filesnap::SNAPSHOT_IGNORE_FILENAME;
-use filesnap::SnapshotStore;
+use filesnap::WorkspaceStore;
 use filesnap::is_ignored;
 use filesnap::load_ignore;
 use filesnap::tracked_files;
@@ -65,7 +65,7 @@ fn full_rewind_redo_gc_scenario() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     // Workspace: two files, one ignored log, the (versioned) ignore file.
     fs::write(ws.join("a.txt"), "alpha v1").unwrap();
@@ -188,20 +188,37 @@ fn full_rewind_redo_gc_scenario() {
         "the undo consumed the rewind it reversed, so there is nothing left to undo"
     );
 
-    // Session lifetime GC: with the undo spent, deleting the conversations
-    // leaves nothing reachable and the store empties. This goes through
-    // `forget_sessions` rather than `gc` because that is what deletion
-    // actually calls, and it is the path that reclaims immediately — the
-    // general sweep deliberately spares anything written in the last few
-    // minutes, which in a test is everything.
-    assert!(store.disk_usage().unwrap() > 0);
-    filesnap::forget_sessions(dir.path(), &[THREAD.to_string(), BRANCH.to_string()]);
-    assert!(!store.session_exists(THREAD));
-    assert_eq!(
-        store.gc().unwrap().manifests_kept,
-        0,
-        "nothing survives the conversations that produced it"
+    // Session lifetime: with the undo spent, deleting the sessions leaves
+    // nothing reachable. Delete reclaims *records* — the content they named
+    // is shared with every other workspace, so only a whole-store collection
+    // can decide whether any of it is still wanted.
+    assert!(store.records_disk_usage().unwrap() > 0);
+    let outcome = store.delete_sessions(&[THREAD.to_string(), BRANCH.to_string()]);
+    assert!(
+        outcome.refused.is_empty(),
+        "nothing to refuse here: {:?}",
+        outcome.refused
     );
+    assert!(
+        !store.session_exists(THREAD),
+        "unreachable is what delete promises, and it promises it now"
+    );
+    assert!(
+        store.target_for_turn("turn-1").unwrap().is_none(),
+        "and nothing resolves through the turn index either"
+    );
+
+    // Reclamation is the separate half. Everything here was written seconds
+    // ago, and a sweep spares what it cannot yet age — a capture publishes
+    // its content before the manifest naming it, so recent bytes may belong
+    // to a manifest that has not landed. Age the store and it goes.
+    filesnap::fixture::age_store(dir.path());
+    let swept = filesnap::collect_garbage(dir.path()).unwrap();
+    assert_eq!(
+        swept.manifests_kept, 0,
+        "no manifest survives the sessions that produced it"
+    );
+    assert!(swept.blobs_removed > 0, "and their contents go with them");
 }
 
 #[cfg(unix)]
@@ -212,7 +229,7 @@ fn restore_preserves_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     let script = ws.join("run.sh");
     fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
@@ -246,7 +263,7 @@ fn thread_marker_and_pre_edit_attach() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     // Log existence is the session-scoped "tracking on" marker.
     assert!(!store.session_exists(THREAD));
@@ -359,7 +376,7 @@ fn turn_resolution_and_fork_inheritance() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
@@ -404,10 +421,12 @@ fn turn_resolution_and_fork_inheritance() {
     assert_eq!(store.inherit_log(THREAD, "fork-2", "nope").unwrap(), 0);
     assert!(store.session_exists("fork-2"));
 
-    // Shared manifests survive GC while either thread references them.
-    store.remove_thread(THREAD).unwrap();
-    let gc = store.gc().unwrap();
-    assert!(gc.manifests_kept >= 2, "fork-1 still references manifests");
+    // Shared manifests survive a sweep while either session references them.
+    let outcome = store.delete_sessions(&[THREAD.to_string()]);
+    assert!(
+        outcome.reclaimed.manifests_kept >= 2,
+        "fork-1 still references manifests"
+    );
 }
 
 #[test]
@@ -417,7 +436,7 @@ fn rewinding_twice_still_restores() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
@@ -488,7 +507,7 @@ fn an_undo_reports_what_moved_since_the_rewind() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     fs::write(ws.join("kept.txt"), "v1").unwrap();
@@ -541,7 +560,7 @@ fn a_restore_with_no_destination_leaves_no_undo() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
@@ -572,7 +591,7 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
@@ -641,7 +660,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2")] {
@@ -711,7 +730,9 @@ fn a_capture_covers_every_configured_root() {
     fs::create_dir_all(&b).unwrap();
     fs::write(a.join("main.rs"), "fn a() {}").unwrap();
     fs::write(b.join("main.rs"), "fn b() {}").unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    // Several roots are scanned per turn, but the session is bound to one
+    // directory (D4) — here the parent that holds both services.
+    let store = WorkspaceStore::open(dir.path(), dir.path()).unwrap();
 
     let roots = vec![a.clone(), b.clone()];
     let scan = || {
@@ -771,7 +792,10 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
     let outer = dir.path().join("project");
     let cwd = outer.join("inner");
     fs::create_dir_all(&cwd).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    // The session belongs to the project; the scan for this turn covers only
+    // `inner/`, which is what makes the file created in `outer/` invisible to
+    // it and the tombstone the only evidence there is.
+    let store = WorkspaceStore::open(dir.path(), &outer).unwrap();
 
     // Turn 1 starts with an empty scope: `inner/` holds nothing.
     let cp1 = store.checkpoint(THREAD, "turn-1", all_files(&cwd)).unwrap();
@@ -828,7 +852,7 @@ fn undo_walks_back_through_successive_rewinds() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2"), ("turn-3", "v3")] {
@@ -896,7 +920,7 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
     let home = dir.path();
     let ws = home.join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(home.join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(home, &ws).unwrap();
 
     fs::write(ws.join("secret.txt"), "sensitive").unwrap();
     let scan = || all_files(&ws);
@@ -917,28 +941,11 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
         .unwrap();
     assert!(store.last_restore_target(BRANCH).unwrap().is_some());
 
-    let blobs = home.join("file_snapshots").join("blobs");
-    let count = |root: &Path| -> usize {
-        fn walk(path: &Path, seen: &mut usize) {
-            let Ok(entries) = fs::read_dir(path) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    walk(&entry.path(), seen);
-                } else {
-                    *seen += 1;
-                }
-            }
-        }
-        let mut seen = 0;
-        walk(root, &mut seen);
-        seen
-    };
-    assert!(count(&blobs) > 0, "the file's content is on disk");
+    let count = || filesnap::fixture::blob_count(home);
+    assert!(count() > 0, "the file's content is on disk");
 
-    // Delete both threads, the way deleting a conversation deletes its subtree.
-    filesnap::forget_sessions(home, &[THREAD.to_string(), BRANCH.to_string()]);
+    // Delete both sessions, the way deleting a conversation does.
+    store.delete_sessions(&[THREAD.to_string(), BRANCH.to_string()]);
 
     assert!(!store.session_exists(THREAD));
     assert!(
@@ -946,17 +953,47 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
         "the undo record goes too — it is a GC root, and left behind it would \
          pin the manifests it names for good"
     );
-    assert_eq!(count(&blobs), 0, "and the captured contents are gone");
+
+    // The content is now unreachable but still on disk: delete makes a
+    // session unreachable, and reclaiming what only it held is a separate,
+    // idempotent activity that no delete waits on. A collection is what frees
+    // it — and it spares anything written recently, so the store has to be
+    // aged before one will act.
+    assert!(count() > 0, "delete does not reclaim content");
+    filesnap::collect_garbage(home).unwrap();
+    assert!(
+        count() > 0,
+        "and a collection still spares content written moments ago"
+    );
+
+    filesnap::fixture::age_store(home);
+    let stats = filesnap::collect_garbage(home).unwrap();
+    assert!(stats.blobs_removed > 0);
+    assert_eq!(count(), 0, "once it can be aged, the contents are gone");
 }
 
 #[test]
-fn forgetting_threads_is_best_effort() {
-    // Deleting a conversation must never fail because the snapshot store was
-    // missing, unreadable, or never used. Callers get one line and no error
-    // handling, so this cannot be allowed to panic or propagate.
+fn deleting_what_was_never_tracked_is_not_an_error() {
+    // Deleting must not fail because the store was never used, and a session
+    // that captured nothing is not a session that failed — removing files
+    // that are already absent is success, not an error to report.
     let dir = tempfile::tempdir().unwrap();
-    filesnap::forget_sessions(dir.path(), &["never-tracked".to_string()]);
-    filesnap::forget_sessions(dir.path(), &[]);
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
+
+    let outcome = store.delete_sessions(&["never-tracked".to_string()]);
+    assert!(
+        outcome.refused.is_empty(),
+        "a session with nothing to delete is not refused: {:?}",
+        outcome.refused
+    );
+    assert_eq!(outcome.reclaimed.manifests_removed, 0);
+
+    // An empty batch does nothing at all, including no sweep.
+    let empty = store.delete_sessions(&[]);
+    assert!(empty.refused.is_empty());
+    assert_eq!(empty.reclaimed, filesnap::GcStats::default());
 }
 
 #[test]
@@ -972,7 +1009,7 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     let outside = dir.path().join("elsewhere");
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(&outside).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
@@ -1054,7 +1091,7 @@ fn a_turn_reports_what_it_cannot_put_back() {
     let outside = dir.path().join("elsewhere");
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(&outside).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
@@ -1101,7 +1138,7 @@ fn the_undo_warning_covers_what_it_will_delete() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     fs::write(ws.join("kept.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
@@ -1155,7 +1192,7 @@ fn the_undo_warning_covers_files_the_rewind_never_touched() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
-    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store

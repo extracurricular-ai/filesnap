@@ -1,7 +1,8 @@
-//! `SnapshotStore`: the facade tying blobs, manifests, session logs,
-//! checkpoints, restore, and collection together under one root directory —
-//! conventionally [`STORE_DIR_NAME`] inside the host's own data directory,
-//! and never inside the user's workspace.
+//! [`WorkspaceStore`]: the facade tying blobs, manifests, session logs,
+//! checkpoints and restore together for one workspace.
+//!
+//! The store lives inside the host's own data directory and never inside the
+//! user's workspace; [`crate::workspace`] owns the layout underneath it.
 
 use std::fs;
 use std::path::Path;
@@ -19,21 +20,17 @@ use crate::refs::RefStore;
 use crate::refs::RestoreRecord;
 use crate::refs::SnapshotRef;
 use crate::refs::TurnIndex;
-use crate::refs::collect_garbage;
 use crate::refs::collect_garbage_for;
+use crate::refs::collect_partition;
 use crate::restore::ApplyStats;
 use crate::restore::RestorePlan;
 use crate::restore::apply_plan;
 use crate::restore::plan_restore;
-use tracing::info;
-use tracing::warn;
+use crate::workspace;
+use crate::workspace::WorkspaceKey;
 
 /// Turn-id prefix used for the safety checkpoint recorded before a restore.
 pub const SAFETY_TURN_PREFIX: &str = "safety-restore:";
-
-/// Conventional directory name for the store inside a host's own data
-/// directory. Exported so hosts do not each hardcode the literal.
-pub const STORE_DIR_NAME: &str = "file_snapshots";
 
 /// The state a restore moves the workspace to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,12 +78,21 @@ impl RestoreTarget {
     }
 }
 
-pub struct SnapshotStore {
+/// One workspace's records, plus the content store they share with every
+/// other workspace.
+///
+/// Named for its scope rather than its contents, because the question a
+/// reader has here is whether an operation reaches the whole store or one
+/// slice of it. Everything on this type is one slice; what spans the store
+/// is a free function ([`crate::collect_garbage`]) and therefore cannot be
+/// reached by mistake from an instance.
+pub struct WorkspaceStore {
     blobs: BlobStore,
     manifests: ManifestStore,
     refs: RefStore,
     turns: TurnIndex,
-    root: PathBuf,
+    key: WorkspaceKey,
+    partition: PathBuf,
 }
 
 #[derive(Debug)]
@@ -97,16 +103,43 @@ pub struct RestoreOutcome {
     pub stats: ApplyStats,
 }
 
-impl SnapshotStore {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
+impl WorkspaceStore {
+    /// Open the partition for `workspace`, creating it if absent.
+    ///
+    /// The caller passes its own data directory, not a store root: the layout
+    /// and the format version underneath are the engine's, because a reader
+    /// that must refuse a version it does not understand cannot refuse what
+    /// it was handed.
+    ///
+    /// `workspace` is canonicalized and must exist. For a workspace that has
+    /// been removed but whose snapshots have not, see [`Self::open_at`].
+    pub fn open(data_dir: &Path, workspace: &Path) -> Result<Self> {
+        Self::open_at(data_dir, &WorkspaceKey::of(workspace)?)
+    }
+
+    /// Open a partition by the key [`Self::open`] would have derived.
+    ///
+    /// The escape hatch for operations that must still work when the
+    /// directory is gone — deleting a finished project's snapshots, or
+    /// listing what is left of one.
+    pub fn open_at(data_dir: &Path, key: &WorkspaceKey) -> Result<Self> {
+        let root = workspace::store_root(data_dir)?;
+        let partition = workspace::partition_dir(&root, key);
         Ok(Self {
-            blobs: BlobStore::open(root.join("blobs"))?,
-            manifests: ManifestStore::open(root.join("manifests"))?,
-            refs: RefStore::open(root.join("refs"))?,
-            turns: TurnIndex::open(&root)?,
-            root,
+            // Content is shared across every workspace, so this one root is
+            // outside the partition.
+            blobs: BlobStore::open(workspace::blobs_dir(&root))?,
+            manifests: ManifestStore::open(partition.join("manifests"))?,
+            refs: RefStore::open(partition.join("refs"))?,
+            turns: TurnIndex::open(&partition)?,
+            key: key.clone(),
+            partition,
         })
+    }
+
+    /// Which workspace's records this reaches.
+    pub fn key(&self) -> &WorkspaceKey {
+        &self.key
     }
 
     /// Capture a checkpoint of `files` for `thread_id` and append it to
@@ -497,11 +530,14 @@ impl SnapshotStore {
         self.refs.remove(thread_id)
     }
 
-    /// Mark-and-sweep unreferenced manifests and blobs. Roots are the thread
-    /// logs plus everything the turn index and workspace restore logs still
-    /// point at.
-    pub fn gc(&self) -> Result<GcStats> {
-        collect_garbage(&self.refs, &self.turns, &self.manifests, &self.blobs)
+    /// Mark-and-sweep the manifests **this partition** no longer references.
+    ///
+    /// Content is deliberately not touched: whether a blob is still
+    /// referenced is a question about every workspace, so only
+    /// [`crate::collect_garbage`] can answer it. Delete reclaims records; the
+    /// collector reclaims content.
+    pub(crate) fn sweep_records(&self) -> Result<GcStats> {
+        collect_partition(&self.refs, &self.turns, &self.manifests, &self.blobs)
     }
 
     /// Paths this thread has observed that `target` has no opinion about and
@@ -560,86 +596,101 @@ impl SnapshotStore {
         self.turns.remove_restores(thread_id)
     }
 
-    /// Total bytes on disk under the store root (for `/status` display).
-    pub fn disk_usage(&self) -> Result<u64> {
-        fn dir_size(path: &Path) -> std::io::Result<u64> {
-            let mut total = 0;
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                let meta = entry.metadata()?;
-                if meta.is_dir() {
-                    total += dir_size(&entry.path())?;
-                } else {
-                    total += meta.len();
-                }
-            }
-            Ok(total)
-        }
-        dir_size(&self.root).map_err(|e| SnapshotError::io(&self.root, e))
+    /// Bytes this workspace's **records** occupy.
+    ///
+    /// Not the content they name: blobs are shared with every other
+    /// workspace, so attributing them to one would double-count the same
+    /// bytes as many times as they are referenced. A dashboard reports the
+    /// two separately for the same reason (D34).
+    pub fn records_disk_usage(&self) -> Result<u64> {
+        dir_size(&self.partition).map_err(|e| SnapshotError::io(&self.partition, e))
     }
 }
 
-/// Forget everything the snapshot store holds for `session_ids`, then sweep.
-///
-/// This is what makes "snapshot lifetime = session lifetime" true, and it has
-/// to be wired to the host's own delete path explicitly. Until it was, every
-/// file captured during a deleted session stayed on disk indefinitely —
-/// contents included. That is a disk leak, but more importantly it is not
-/// what a user deleting a session is asking for: they get the index removed
-/// and the data kept.
-///
-/// Deliberately infallible and best-effort. Deleting a session must not
-/// fail because its snapshots could not be tidied up, and a partial sweep is
-/// not a corrupt store — the next one finishes the job. Failures are logged
-/// rather than propagated, so callers need one line and no error handling.
-///
-/// Takes the whole set at once because deletion is by subtree: sweeping once
-/// after the last session beats sweeping once per session, and a session's
-/// manifests are routinely shared with the siblings being deleted alongside
-/// it — swept individually, each would still be pinned by the next.
-pub fn forget_sessions(data_dir: &Path, session_ids: &[String]) {
-    let thread_ids = session_ids;
-    if thread_ids.is_empty() {
-        return;
-    }
-    let root = data_dir.join(STORE_DIR_NAME);
-    if !root.exists() {
-        return;
-    }
-    let store = match SnapshotStore::open(&root) {
-        Ok(store) => store,
-        Err(err) => {
-            warn!("could not open the snapshot store to forget deleted threads: {err}");
-            return;
-        }
+fn dir_size(path: &Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
     };
-
-    // Read what these threads named *before* dropping their logs, so the
-    // sweep afterwards has an exact candidate set instead of having to
-    // re-derive one by elimination.
-    let mut doomed = std::collections::BTreeSet::new();
-    for thread_id in thread_ids {
-        if let Ok(log) = store.refs.load(thread_id) {
-            doomed.extend(log.entries.into_iter().map(|entry| entry.manifest_id));
-        }
-        if let Ok(records) = store.turns.all_restores_for(thread_id) {
-            doomed.extend(records);
-        }
-        if let Err(err) = store.remove_thread(thread_id) {
-            warn!("could not drop the snapshot log for {thread_id}: {err}");
-        }
-        if let Err(err) = store.remove_restores(thread_id) {
-            warn!("could not drop the undo records for {thread_id}: {err}");
+    for entry in entries {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else {
+            total += meta.len();
         }
     }
+    Ok(total)
+}
 
-    match store.gc_for(&doomed) {
-        Ok(stats) => info!(
-            "swept snapshots for {} deleted thread(s): {} manifests, {} blobs",
-            thread_ids.len(),
-            stats.manifests_removed,
-            stats.blobs_removed
-        ),
-        Err(err) => warn!("could not sweep snapshots after deleting threads: {err}"),
+/// What a delete did, and what it declined to touch.
+#[derive(Debug, Default)]
+pub struct DeleteOutcome {
+    /// Records reclaimed. Content is not counted here because delete does
+    /// not reclaim content — see [`WorkspaceStore::delete_sessions`].
+    pub reclaimed: GcStats,
+    /// Sessions left **exactly as they were**, with why. Their records are
+    /// intact and the call can be retried once the cause is addressed.
+    pub refused: Vec<(String, SnapshotError)>,
+}
+
+impl WorkspaceStore {
+    /// Delete these sessions from this workspace, and reclaim the records
+    /// nothing references any more.
+    ///
+    /// **What this promises:** afterwards the session is unreachable and its
+    /// records are gone. **What it does not:** free the bytes its captures
+    /// held. Content is deduplicated across every workspace, so "is anyone
+    /// else still using this blob" is a question only a whole-store sweep can
+    /// answer — [`crate::collect_garbage`] reclaims content, this reclaims
+    /// records, and neither waits on the other.
+    ///
+    /// **A session whose log cannot be read is refused, not half-deleted.**
+    /// Swallowing that read and deleting the log anyway destroys the only
+    /// record of what the session held, so nothing can be reclaimed and
+    /// nothing can be retried — a delete that reports success having done
+    /// neither. One unreadable session does not block the rest.
+    ///
+    /// Takes the whole set at once because a session's manifests are
+    /// routinely shared with the siblings being deleted alongside it: swept
+    /// one at a time, each would still be pinned by the next.
+    pub fn delete_sessions(&self, session_ids: &[String]) -> DeleteOutcome {
+        let mut outcome = DeleteOutcome::default();
+        if session_ids.is_empty() {
+            return outcome;
+        }
+
+        for session_id in session_ids {
+            // Read before removing anything: a session that cannot be read is
+            // left whole rather than emptied of the evidence needed to retry.
+            if let Err(err) = self.refs.load(session_id) {
+                outcome.refused.push((session_id.clone(), err));
+                continue;
+            }
+
+            // Undo records first, then the log. Interrupted between the two,
+            // this leaves a session that simply never rewound — a state the
+            // system reaches on its own and cannot tell apart from the
+            // ordinary case. The other order leaves an undo record for a
+            // session with no log, which nothing produces and which pins its
+            // manifests as a root for good.
+            if let Err(err) = self.remove_restores(session_id) {
+                outcome.refused.push((session_id.clone(), err));
+                continue;
+            }
+            if let Err(err) = self.remove_thread(session_id) {
+                outcome.refused.push((session_id.clone(), err));
+                continue;
+            }
+        }
+
+        match self.sweep_records() {
+            Ok(stats) => outcome.reclaimed = stats,
+            Err(err) => outcome.refused.push(("<sweep>".to_string(), err)),
+        }
+        outcome
     }
 }

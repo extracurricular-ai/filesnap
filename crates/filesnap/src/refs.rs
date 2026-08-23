@@ -249,17 +249,6 @@ impl TurnIndex {
         Ok(popped)
     }
 
-    /// The manifests a thread's undo records name, for a sweep to consider
-    /// once those records are dropped.
-    pub fn all_restores_for(&self, thread_id: &str) -> Result<Vec<String>> {
-        let log = self.restore_log(thread_id)?;
-        Ok(log
-            .entries
-            .into_iter()
-            .flat_map(|record| [record.target_manifest_id, record.safety_manifest_id])
-            .collect())
-    }
-
     /// Drop a thread's undo records outright, for when the conversation they
     /// belong to is deleted.
     ///
@@ -355,6 +344,18 @@ pub struct GcStats {
     pub blobs_removed: usize,
 }
 
+impl GcStats {
+    /// Combine two sweeps, for a collection that walks several partitions.
+    pub(crate) fn plus(self, other: Self) -> Self {
+        Self {
+            manifests_kept: self.manifests_kept + other.manifests_kept,
+            manifests_removed: self.manifests_removed + other.manifests_removed,
+            blobs_kept: self.blobs_kept + other.blobs_kept,
+            blobs_removed: self.blobs_removed + other.blobs_removed,
+        }
+    }
+}
+
 /// How new a file has to be for the sweep to leave it alone regardless.
 ///
 /// A capture publishes in three steps — blobs, then the manifest, then the
@@ -370,6 +371,22 @@ pub struct GcStats {
 /// garbage is among them waits for the next sweep. Reclamation is delayed;
 /// nothing is lost.
 const GC_GRACE: Duration = Duration::from_secs(300);
+
+/// Whether `path` is old enough that its absence from the live set can be
+/// trusted.
+///
+/// Unreadable or undatable files count as **young**: a sweep declines to
+/// delete anything it cannot age, because the cost of waiting is retained
+/// bytes and the cost of guessing is a snapshot a live session believes it
+/// holds.
+pub(crate) fn settled(path: &Path) -> bool {
+    let cutoff = SystemTime::now()
+        .checked_sub(GC_GRACE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|written| written <= cutoff)
+}
 
 /// Sweep only `doomed` — manifests that belonged to threads just deleted.
 ///
@@ -441,22 +458,12 @@ fn live_manifest_ids(refs: &RefStore, turns: &TurnIndex) -> Result<BTreeSet<Stri
 /// Mark-and-sweep: manifests referenced by any thread log are live; blobs
 /// referenced by any live manifest are live; everything else is removed —
 /// unless it was written within `GC_GRACE`, which is never touched.
-pub fn collect_garbage(
+pub fn collect_partition(
     refs: &RefStore,
     turns: &TurnIndex,
     manifests: &ManifestStore,
     blobs: &BlobStore,
 ) -> Result<GcStats> {
-    let cutoff = SystemTime::now()
-        .checked_sub(GC_GRACE)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    // Unreadable or undatable files count as young: the sweep declines to
-    // delete anything it cannot age.
-    let settled = |path: &Path| -> bool {
-        fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .is_ok_and(|written| written <= cutoff)
-    };
     let mut live_manifests = BTreeSet::new();
     let mut live_turn_ids = BTreeSet::new();
     for log in refs.thread_logs()? {
@@ -585,7 +592,7 @@ mod tests {
         // sweep right now must take nothing at all — the point being that a
         // concurrent capture's not-yet-referenced manifest is indistinguishable
         // from garbage, and guessing wrong destroys a live session's snapshot.
-        let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
+        let stats = collect_partition(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(
             (stats.manifests_removed, stats.blobs_removed),
             (0, 0),
@@ -598,7 +605,7 @@ mod tests {
         age_out(&blobs.path_for(&dead_hash));
         age_out(&blobs.path_for(&live_hash));
 
-        let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
+        let stats = collect_partition(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(stats.manifests_kept, 1);
         assert_eq!(stats.manifests_removed, 1);
         assert_eq!(stats.blobs_kept, 1);
@@ -612,7 +619,7 @@ mod tests {
         refs.remove("t1").unwrap();
         age_out(&manifests.path_for(&live_id));
         age_out(&blobs.path_for(&live_hash));
-        let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
+        let stats = collect_partition(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(stats.manifests_removed, 1);
         assert_eq!(stats.blobs_removed, 1);
         assert_eq!(manifests.ids().unwrap().len(), 0);

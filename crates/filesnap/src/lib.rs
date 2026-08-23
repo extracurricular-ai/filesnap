@@ -15,8 +15,11 @@
 
 mod blob;
 mod checkpoint;
+mod collect;
 mod controller;
 mod error;
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixture;
 mod manifest;
 mod refs;
 mod restore;
@@ -28,6 +31,7 @@ pub use blob::BlobStore;
 pub use checkpoint::Checkpoint;
 pub use checkpoint::CheckpointStats;
 pub use checkpoint::capture;
+pub use collect::collect_garbage;
 pub use controller::SessionStart;
 pub use controller::SnapshotTracker;
 pub use error::Result;
@@ -54,13 +58,12 @@ pub use scope::is_ignored;
 pub use scope::load_ignore;
 pub use scope::recent_files;
 pub use scope::tracked_files;
+pub use store::DeleteOutcome;
 pub use store::PreEditImage;
 pub use store::RestoreKind;
 pub use store::RestoreOutcome;
 pub use store::RestoreTarget;
 pub use store::SAFETY_TURN_PREFIX;
-pub use store::STORE_DIR_NAME;
-pub use store::SnapshotStore;
-pub use store::forget_sessions;
+pub use store::WorkspaceStore;
 pub use workspace::FORMAT_VERSION;
 pub use workspace::WorkspaceKey;

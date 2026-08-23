@@ -25,8 +25,7 @@ use crate::scope::is_ignored;
 use crate::scope::load_ignore;
 use crate::scope::tracked_files;
 use crate::store::PreEditImage;
-use crate::store::STORE_DIR_NAME;
-use crate::store::SnapshotStore;
+use crate::store::WorkspaceStore;
 use tracing::info;
 use tracing::warn;
 
@@ -45,7 +44,7 @@ pub enum SessionStart {
 }
 
 pub struct SnapshotTracker {
-    store: SnapshotStore,
+    store: WorkspaceStore,
     session_id: String,
     hidden: HiddenFiles,
     state: Mutex<TrackState>,
@@ -65,15 +64,21 @@ struct TrackState {
 }
 
 impl SnapshotTracker {
-    /// Build a tracker if this session should track (see module doc), with
-    /// the store living in `STORE_DIR_NAME` under `data_dir`.
+    /// Build a tracker if this session should track (see module doc).
+    ///
+    /// `workspace` is the directory this session is bound to, and the binding
+    /// is permanent: its records live in that workspace's partition, so the
+    /// same id used against a different directory addresses a *different*
+    /// session rather than reaching this one's data. That is structural here
+    /// rather than a rule the caller has to keep.
     pub fn maybe_new(
         data_dir: &Path,
+        workspace: &Path,
         session_id: String,
         start: SessionStart,
         hidden: HiddenFiles,
     ) -> Option<Arc<Self>> {
-        let store = match SnapshotStore::open(data_dir.join(STORE_DIR_NAME)) {
+        let store = match WorkspaceStore::open(data_dir, workspace) {
             Ok(store) => store,
             Err(err) => {
                 warn!("filesnap: failed to open store, tracking disabled: {err}");
@@ -215,82 +220,116 @@ mod tests {
 
     use super::*;
 
+    /// A data directory and a workspace, both real on disk.
+    ///
+    /// The workspace has to exist before a tracker can be built now: a
+    /// session's records live in its workspace's partition, so there is no
+    /// tracker without a workspace to key it on.
+    fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    fn tracker(
+        home: &tempfile::TempDir,
+        ws: &tempfile::TempDir,
+        id: &str,
+        start: SessionStart,
+    ) -> Option<Arc<SnapshotTracker>> {
+        SnapshotTracker::maybe_new(home.path(), ws.path(), id.into(), start, HiddenFiles::Skip)
+    }
+
+    fn tracking(
+        home: &tempfile::TempDir,
+        ws: &tempfile::TempDir,
+        id: &str,
+    ) -> Arc<SnapshotTracker> {
+        tracker(
+            home,
+            ws,
+            id,
+            SessionStart::New {
+                tracking_enabled: true,
+            },
+        )
+        .expect("tracking on for a new session")
+    }
+
     #[test]
     fn session_scoped_binding() {
-        let home = tempfile::tempdir().unwrap();
+        let (home, ws) = dirs();
+        // The marker is the log's existence, so ask the store rather than a
+        // path: where records live is the layout's business, not this test's.
+        let marker = |id: &str| {
+            WorkspaceStore::open(home.path(), ws.path())
+                .unwrap()
+                .session_exists(id)
+        };
 
         // New session, tracking off → inactive, no marker.
         assert!(
-            SnapshotTracker::maybe_new(
-                home.path(),
-                "t1".into(),
+            tracker(
+                &home,
+                &ws,
+                "t1",
                 SessionStart::New {
                     tracking_enabled: false
-                },
-                HiddenFiles::Skip,
+                }
             )
             .is_none()
         );
         // New session, tracking on → active. The marker is not written yet:
         // a session that never captures anything must leave nothing behind.
-        let controller = SnapshotTracker::maybe_new(
-            home.path(),
-            "t1".into(),
-            SessionStart::New {
-                tracking_enabled: true,
-            },
-            HiddenFiles::Skip,
-        )
-        .expect("tracking on for a new session");
-        assert!(
-            !home.path().join("file_snapshots/refs/t1.json").exists(),
-            "no snapshots yet, so no marker"
-        );
+        let controller = tracking(&home, &ws, "t1");
+        assert!(!marker("t1"), "no snapshots yet, so no marker");
 
         // Capturing one writes it.
-        let ws = home.path().join("ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("a.txt"), "x").unwrap();
-        controller.checkpoint_turn_start("turn-1", &ws, &[]);
-        assert!(home.path().join("file_snapshots/refs/t1.json").exists());
+        std::fs::write(ws.path().join("a.txt"), "x").unwrap();
+        controller.checkpoint_turn_start("turn-1", ws.path(), &[]);
+        assert!(marker("t1"));
 
         // Resume with tracking now OFF → marker wins, still tracking.
-        assert!(
-            SnapshotTracker::maybe_new(
-                home.path(),
-                "t1".into(),
-                SessionStart::Resumed,
-                HiddenFiles::Skip,
-            )
-            .is_some()
-        );
+        assert!(tracker(&home, &ws, "t1", SessionStart::Resumed).is_some());
         // Resume of a session that never tracked → stays off, whatever the
         // host's setting now says.
+        assert!(tracker(&home, &ws, "t2", SessionStart::Resumed).is_none());
+    }
+
+    /// A session id is scoped to the workspace it was bound to. Used against
+    /// a different directory it addresses a *different* session rather than
+    /// reaching the first one's data — which is D4 made structural: manifest
+    /// keys are absolute paths, so a session resolved across workspaces would
+    /// silently operate on the original directory while the user stood in
+    /// another.
+    #[test]
+    fn a_session_id_does_not_reach_across_workspaces() {
+        let (home, ws) = dirs();
+        let other = tempfile::tempdir().unwrap();
+
+        std::fs::write(ws.path().join("a.txt"), "x").unwrap();
+        tracking(&home, &ws, "shared-id").checkpoint_turn_start("turn-1", ws.path(), &[]);
+
         assert!(
-            SnapshotTracker::maybe_new(
-                home.path(),
-                "t2".into(),
-                SessionStart::Resumed,
-                HiddenFiles::Skip,
-            )
-            .is_none()
+            WorkspaceStore::open(home.path(), ws.path())
+                .unwrap()
+                .session_exists("shared-id")
+        );
+        assert!(
+            !WorkspaceStore::open(home.path(), other.path())
+                .unwrap()
+                .session_exists("shared-id"),
+            "the same id in another workspace is another session, not this one"
+        );
+        assert!(
+            tracker(&home, &other, "shared-id", SessionStart::Resumed).is_none(),
+            "and resuming it there finds nothing to resume"
         );
     }
 
     #[test]
     fn hidden_entries_are_skipped_unless_edited() {
-        let home = tempfile::tempdir().unwrap();
-        let ctl = SnapshotTracker::maybe_new(
-            home.path(),
-            "t1".into(),
-            SessionStart::New {
-                tracking_enabled: true,
-            },
-            HiddenFiles::Skip,
-        )
-        .unwrap();
+        let (home, ws) = dirs();
+        let ctl = tracking(&home, &ws, "t1");
 
-        let ws = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(ws.path().join(".git")).unwrap();
         std::fs::write(ws.path().join(".env"), "SECRET=1").unwrap();
         std::fs::create_dir_all(ws.path().join(".github/workflows")).unwrap();
@@ -330,18 +369,9 @@ mod tests {
         // The property a plain subtree walk lacked. Without a bound, a capture
         // costs whatever happens to be on disk — on a real repository that was
         // 57k files and 100 GB, nearly all of it build output.
-        let home = tempfile::tempdir().unwrap();
-        let ctl = SnapshotTracker::maybe_new(
-            home.path(),
-            "t1".into(),
-            SessionStart::New {
-                tracking_enabled: true,
-            },
-            HiddenFiles::Skip,
-        )
-        .unwrap();
+        let (home, loose) = dirs();
+        let ctl = tracking(&home, &loose, "t1");
 
-        let loose = tempfile::tempdir().unwrap();
         for i in 0..(crate::scope::RECENT_LIMIT + 50) {
             std::fs::write(loose.path().join(format!("f{i}.txt")), "x").unwrap();
         }
@@ -357,18 +387,9 @@ mod tests {
 
     #[test]
     fn ignored_paths_are_not_captured_through_the_edit_hook() {
-        let home = tempfile::tempdir().unwrap();
-        let ctl = SnapshotTracker::maybe_new(
-            home.path(),
-            "t1".into(),
-            SessionStart::New {
-                tracking_enabled: true,
-            },
-            HiddenFiles::Skip,
-        )
-        .unwrap();
+        let (home, ws) = dirs();
+        let ctl = tracking(&home, &ws, "t1");
 
-        let ws = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(ws.path().join(".git")).unwrap();
         std::fs::write(
             ws.path().join(crate::scope::SNAPSHOT_IGNORE_FILENAME),
@@ -403,18 +424,9 @@ mod tests {
 
     #[test]
     fn checkpoint_workspace_and_fallback_modes() {
-        let home = tempfile::tempdir().unwrap();
-        let ctl = SnapshotTracker::maybe_new(
-            home.path(),
-            "t1".into(),
-            SessionStart::New {
-                tracking_enabled: true,
-            },
-            HiddenFiles::Skip,
-        )
-        .unwrap();
+        let (home, ws) = dirs();
+        let ctl = tracking(&home, &ws, "t1");
 
-        let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("a.txt"), "alpha").unwrap();
         ctl.checkpoint_turn_start("turn-1", ws.path(), &[]);
 
@@ -426,15 +438,7 @@ mod tests {
         // checkpoints, wherever they live.
         let loose = tempfile::tempdir().unwrap();
         std::fs::write(loose.path().join("note.md"), "n1").unwrap();
-        let ctl2 = SnapshotTracker::maybe_new(
-            home.path(),
-            "t2".into(),
-            SessionStart::New {
-                tracking_enabled: true,
-            },
-            HiddenFiles::Skip,
-        )
-        .unwrap();
+        let ctl2 = tracking(&home, &loose, "t2");
         ctl2.checkpoint_turn_start("turn-1", loose.path(), &[]);
         let outside = home.path().join("elsewhere.cfg");
         ctl2.attach_pre_edits(
