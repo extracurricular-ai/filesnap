@@ -14,6 +14,29 @@ pub enum SnapshotError {
     MissingBlob(String),
     #[error("manifest {0} not found in store")]
     MissingManifest(String),
+    /// The store holds a format this build does not understand. Reading it
+    /// anyway would mean guessing at a layout, which is the failure
+    /// versioning exists to prevent.
+    #[error(
+        "the snapshot store at {path} was written by a newer filesnap \
+         (format v{found}; this build supports v{supported})"
+    )]
+    UnknownStoreVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+    /// A durable record declares a version this build cannot read. Distinct
+    /// from `UnknownStoreVersion`: the store said one thing and a record
+    /// inside it says another, which is what a migration interrupted halfway
+    /// looks like.
+    #[error("{kind} {id} declares format v{found}, which this build (v{supported}) cannot read")]
+    UnknownRecordVersion {
+        kind: &'static str,
+        id: String,
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl SnapshotError {

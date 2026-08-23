@@ -22,6 +22,7 @@ mod refs;
 mod restore;
 mod scope;
 mod store;
+mod workspace;
 
 pub use blob::BlobStore;
 pub use checkpoint::Checkpoint;
@@ -61,3 +62,5 @@ pub use store::SAFETY_TURN_PREFIX;
 pub use store::STORE_DIR_NAME;
 pub use store::SnapshotStore;
 pub use store::forget_sessions;
+pub use workspace::FORMAT_VERSION;
+pub use workspace::WorkspaceKey;
