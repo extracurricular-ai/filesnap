@@ -361,6 +361,29 @@ closed C11.
 **Resolved by D14**: they become the `Default` of a `ScanLimits` parameter rather
 than exported constants, so nothing needs to read them.
 
+### C20 · A failed restore does not hand back the point it could be reversed to — III.1
+
+`apply_plan` (restore.rs:90-112) propagates the first error with `?`, at any of
+four points per file: loading the blob, creating the parent, writing the temp,
+setting the mode, renaming into place. Deletes do the same.
+
+So one file with the wrong permissions stops a 500-file restore at the 37th, and
+the caller gets `SnapshotError::Io { path, source }` — which says which file
+failed and nothing else. Not how many were applied. Not the safety target, since
+`RestoreOutcome` is only constructed after a successful apply, and the restore
+record is pushed later still.
+
+**Failure:** the workspace is partially restored and the caller cannot describe
+its state or reverse it. III.1 makes every restore reversible before it begins,
+and the safety checkpoint really is on disk — findable by walking the thread log
+for the `SAFETY_TURN_PREFIX` entry — but the API does not offer it at the one
+moment it is needed. Reversibility that a caller has to go digging for is not
+what the rule promises.
+
+**Resolved by D28**: per-file failures are collected into `ApplyStats.failed`
+rather than aborting, so the call returns, the outcome carries the safety target,
+and the caller decides whether to reverse.
+
 ## Rules with no test
 
 Quality Gates require every rule to be pinned. These are not.

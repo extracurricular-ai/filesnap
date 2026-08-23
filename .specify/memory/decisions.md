@@ -636,6 +636,69 @@ just been created and that nothing else is using, so the race is theoretical —
 but it is a real gap in the lock's coverage and belongs in the documentation
 rather than in someone's memory.
 
+## D27 · No hooks in the engine, and no conversation-shaped command in the CLI
+
+The engine exposes no callback, event, or hook. The only closure in its public
+surface is `is_protected`, which answers a question and causes nothing.
+
+**Why not a callback** for the host's own restore logic — swapping a
+conversation, forking a thread — even though that is the obvious convenience:
+
+- **It does not buy atomicity, it only moves the seam.** Fire it before the
+  apply and the conversation moves while the files do not; fire it after and the
+  reverse. There is no transaction spanning two subsystems, and a callback
+  cannot invent one.
+- **Reentrancy.** It would run while holding the session lock (D18), mid
+  operation. A host that touches filesnap from inside it — even to read —
+  deadlocks.
+- **VI.1.** A hook whose purpose is "do your conversation thing here" is the
+  engine assuming there is a conversation.
+
+**And no `filesnap rewind` subcommand either.** The CLI is a thin shell over the
+library and has no conversation to rewind; a command by that name would promise
+the combined operation and deliver half of it. The host integration sequences the
+two halves, because it is the only layer that holds both.
+
+**Naming consequence:** the files-only command is `restore`. *Rewind* stays the
+user-facing word for the combined operation a plugin performs.
+
+This is already the shape the API forces: `undo_for` needs the destination
+session id, so the host's fork must happen before the call. The engine is already
+downstream of the host's decision, and this decision keeps it there.
+
+## D28 · A restore reports per-file failures instead of stopping
+
+```rust
+pub struct ApplyStats {
+    pub written: usize,
+    pub deleted: usize,
+    /// Each file fails on its own without stopping the rest. Empty on a
+    /// clean apply.
+    pub failed: Vec<(PathBuf, SnapshotError)>,
+}
+```
+
+Today `apply_plan` propagates the first error with `?`, so one unwritable file
+strands the other 499 — and the caller receives a bare `SnapshotError::Io` with
+no record of how far it got and no way to reach the safety point, because
+`RestoreOutcome` is only constructed on success. The safety manifest is on disk
+and is findable by walking the thread log for the `SAFETY_TURN_PREFIX` entry, but
+the API does not hand it back at the moment it is needed. That is III.1's
+reversibility existing but being out of reach exactly when it matters (C20).
+
+**No automatic rollback.** That is anionex's model, and its cost is that the
+rollback can itself fail, producing a third state the caller cannot observe.
+III.1 promises *reversible*, not *reversed for you* — the caller holds the safety
+target and decides.
+
+**Collected is not the same as shrugged off.** The peer review of competing
+implementations flags exactly this failure: per-file errors gathered into a
+struct nobody prints. A restore with a non-empty `failed` must not read as
+success anywhere — not in the CLI's exit code, not in its output.
+
+Independent of D24's storage change, since it does not touch the manifest, so it
+can land on its own.
+
 ---
 
 ## Open
