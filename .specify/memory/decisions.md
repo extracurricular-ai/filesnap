@@ -524,6 +524,46 @@ Batch stays batched: one unreadable session must not block deleting the others,
 and the batch exists because forks share manifests, so sweeping one at a time
 leaves each pinned by the next.
 
+## D23 · A capture reports what it dropped, bounded; the full list is a query
+
+Two halves, because one report cannot serve both readers.
+
+**In `CheckpointStats`, bounded:** a count of what the scan saw and did not
+store, plus a small sample with reasons. This is what a CLI prints after a turn —
+*"3 files were left out of the snapshot because they exceed the size limit, e.g.
+data/dump.bin"* — and it has to have a length that cannot surprise anyone, because
+it is printed on every turn.
+
+**As a separate query, complete:** an explicit call that re-runs the scan with
+reporting on and returns everything, with reasons. This is the diagnostic — *what
+in my project is not protected?* — and it belongs in `filesnap doctor` or its own
+subcommand.
+
+The query **re-scans rather than reading something the capture stored**. Nothing
+new is persisted, and the answer is about the project as it stands now rather
+than as it stood at some past turn, which is the question a user asking it
+actually has.
+
+Settles C8's shape. `DropReason` distinguishes at least: over the size limit,
+unreadable, and not a regular file — today the first is a bare `continue` in
+`recent_files` and the other two are an undifferentiated `skipped` counter.
+
+## D24 · The storage format change lands first, as one change
+
+C1 versioning, C2's `Option<u32>` mode, D15's path version, D17's rename, and
+D19's partition go in together, before anything else.
+
+They all move either the manifest or the store layout, and changing the manifest
+re-identifies every record on disk because the id is the hash of its own JSON.
+Done before the first publish that costs nothing; done after, it is a migration
+with everything a migration brings. **The door is open exactly once, and nothing
+else on the list closes if it waits.**
+
+The cheap correctness fixes (C16's unlink order, C10's doc contradiction, C15's
+tolerance, C6's fallback) are independent of the format and can follow. The CLI
+follows the format rather than preceding it, so it is written against the layout
+it will ship on.
+
 ---
 
 ## Open
