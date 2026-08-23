@@ -876,6 +876,90 @@ change rewrites the manifest, the layout, and the partition — touching almost
 every line of `refs.rs` and `store.rs`. Doing it on top of zero unit tests in
 those two files is the specific mistake this decision exists to prevent.
 
+## D37 · npm distribution: one package name, seven versions
+
+Copied from the shape codex-rewind already ships, which was verified against its
+scripts and workflow rather than recalled.
+
+**One npm name — `filesnap` (D17) — published seven times per release:**
+
+```
+filesnap@0.1.0                 launcher, pure JS, one bin/ script     → latest
+filesnap@0.1.0-linux-x64       platform build                         → --tag linux-x64
+filesnap@0.1.0-linux-arm64                                            → --tag linux-arm64
+filesnap@0.1.0-darwin-x64                                             → --tag darwin-x64
+filesnap@0.1.0-darwin-arm64                                           → --tag darwin-arm64
+filesnap@0.1.0-win32-x64                                              → --tag win32-x64
+filesnap@0.1.0-win32-arm64                                            → --tag win32-arm64
+```
+
+The launcher names the platform builds through **npm alias specs at exact
+versions**:
+
+```json
+"optionalDependencies": {
+  "filesnap-linux-x64": "npm:filesnap@0.1.0-linux-x64",
+  ...
+}
+```
+
+Those hyphenated names exist **only as alias keys**. Nothing by that name is
+ever published, and the alias is what lets six versions of one name coexist in
+`node_modules/`. `os` and `cpu` on each platform package are what make npm
+install exactly one of them.
+
+**Why one name rather than seven.** An npm package takes exactly **one trusted
+publisher**, so sharing a name means one OIDC registration covers the whole
+sequence. Seven names would mean seven registrations to keep in step.
+
+**Why the version suffix, and a property it buys.** npm refuses to republish a
+name/version pair, so with one shared name each platform tarball needs a unique
+version. It also gives a safety net for free: `0.1.0-linux-x64` is a semver
+*prerelease*, which sorts below `0.1.0` and is excluded from ranges by default —
+so even a mishandled dist-tag cannot make `npm install filesnap` resolve to a
+platform build.
+
+**Two simplifications over codex-rewind.** Its platform packages carry a whole
+resource tree — a code-mode host, `rg`, `bwrap`, a patched `zsh`, and a
+`codex-package.json` marker distinguishing new packaging from legacy — which is
+why it unpacks to 302 MB. filesnap ships **one binary and nothing else**, so a
+platform package is `vendor/<triple>/bin/filesnap` and the marker file is not
+needed, because there is no legacy layout to tell apart. And because filesnap
+versions are plain `x.y.z` rather than prereleases, only the *platform* publishes
+need an explicit `--tag`; the launcher's `latest` is the default.
+
+**The library, if there is ever one.** codex's own `@openai/codex-sdk` is neither
+one package with two entry points nor an independent library: it is a separate
+npm package whose exact-version dependency on the CLI is **injected at publish
+time** (absent from the checked-in `package.json`), and at runtime it resolves
+into the CLI package's vendor tree, spawns the binary, and reads JSONL off
+stdout. That is D29 and D32 already, arrived at independently — so if a JS
+wrapper is ever wanted, this is the shape, published last in the same workflow
+from the same tag. Until a second JS consumer exists it belongs inside the plugin
+repo (D2) rather than as its own package.
+
+**Operational facts that cost someone a broken release to learn:**
+
+- **The first publish of a brand-new name must use a token.** A trusted publisher
+  is configured on the package's settings page, and the page does not exist until
+  the package does. OIDC comes after the first release, not before.
+- **The trusted-publisher claim names the workflow *filename*.** Renaming
+  `release.yml`, or moving the `npm publish` step into a workflow it calls,
+  revokes publishing.
+- **Do not set `registry-url` on `actions/setup-node`.** It writes
+  `_authToken=${NODE_AUTH_TOKEN}` into `.npmrc`; with no token that is an empty
+  credential which npm still sends, so the registry rejects it rather than npm
+  falling back to the OIDC exchange.
+- **Pin npm to `^11.5.1`.** Below 11.5.1 there is no OIDC support at all — Node
+  22 ships 10.x. And `npm@latest` broke a release mid-flight when npm 12 changed
+  `npm pack --json` from a list to an object keyed by package name.
+- **Job-level `permissions:` replaces the workflow-level block, it does not
+  merge.** `contents: read` has to be restated next to `id-token: write`.
+- **There is no rollback.** A published version cannot be replaced, so the only
+  safety nets are a `--dry-run` rehearsal and the publish order: platforms first,
+  launcher last, because the launcher's exact-version aliases must resolve the
+  moment it lands.
+
 ---
 
 ## Open
