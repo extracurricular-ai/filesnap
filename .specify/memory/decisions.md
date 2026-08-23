@@ -699,6 +699,76 @@ success anywhere — not in the CLI's exit code, not in its output.
 Independent of D24's storage change, since it does not touch the manifest, so it
 can land on its own.
 
+## D29 · There is no sidecar. The CLI is the interface.
+
+The plugin spawns `filesnap` per operation. No resident process, no protocol, no
+lifecycle, nothing to reconnect to after a crash.
+
+**D25 removed the only thing a sidecar was for.** The declared set used to live in
+memory, which is what made a resident process look necessary; persisting it left
+the sidecar with nothing to hold but startup cost.
+
+**The startup cost is real and is answered by batching, not by a daemon.** A turn
+with twenty edits would otherwise be twenty spawns at roughly 5–10 ms each, so
+`declare` accepts many paths in one invocation and the plugin submits per tool
+call rather than per file. The expensive operation, `capture`, is a stat walk
+measured in hundreds of milliseconds, against which process startup does not
+register.
+
+If startup ever does show up in a real measurement, a `--serve` mode can be added
+*over the same command surface* without changing it. That is a fallback, not a
+plan.
+
+## D30 · An edit is declared before it happens, and filesnap reads the pre-image
+
+`filesnap declare --session S --turn T --path P...` is called **before** the edit
+lands. filesnap stats and reads each path itself, deriving
+`PreEditImage::Existed(bytes)` or `PreEditImage::DidNotExist` from what it finds.
+
+The caller says *what it is about to change*, never *what the file used to
+contain*. That keeps the engine the only thing that decides what the pre-image
+was — the caller cannot supply a wrong one, by mistake or otherwise, and
+`attach_pre_edit`'s tombstone (the witnessed birth that licenses a later delete)
+rests on an observation rather than on a claim.
+
+**The cost, stated plainly:** calling late is silently wrong. Declare after the
+edit and the stored pre-image is the post-edit content, with nothing to
+distinguish it. This is the one ordering the integration must get right, and it
+is why `declare` is a separate verb rather than a flag on something else — a verb
+can be documented as "before", a flag tends to drift to wherever it is
+convenient.
+
+## D31 · Log entries carry a hash chain and a timestamp
+
+`SnapshotRef` gains the hash of the preceding entry and the time it was written.
+
+Ordering itself needs neither: `ThreadLog.entries` is already an ordered
+append-only array, so "go back N steps" counts distinct turn ids in it. The
+timestamp is for display — `filesnap log` showing when, not just what — and takes
+no part in any decision, so it does not touch VIII.1, which bans reclamation by
+age rather than the display of time.
+
+The chain is **speculative and recorded as such**: no threat model on the table
+asks for it today. It is taken because the cost is small and the value is
+unclear rather than because a failure was named — which is the opposite of how
+every other decision here was made, and the exception is deliberate.
+
+**One thing the chain forces, which must be answered before it is written:** what
+a reader does when the chain does not verify. A field nobody validates is exactly
+the defect VII.4 names; a field that is validated commits the project to a
+failure mode, and refusing to read a log whose chain is broken can make a
+recoverable situation unrecoverable. See O8.
+
+## D32 · Output is JSON Lines, one event per line
+
+Every command emits JSONL on stdout. One format, one schema, one contract; a
+consumer parses incrementally and a long `capture` can report as it goes rather
+than at the end.
+
+**Accepted cost:** a human running `filesnap doctor` gets JSON. Human-facing
+prose therefore belongs on **stderr**, where it cannot be mistaken for the
+contract, and `jq` covers the rest.
+
 ---
 
 ## Open
@@ -710,6 +780,13 @@ can land on its own.
 - ~~**O6 · The scope of the lock D18 requires.**~~ Settled by D18 itself: the
   lock is per session and covers only a session racing itself. Nothing wider is
   locked, so the partition layout does not have to carry the lock's weight.
+- **O8 · What a reader does when D31's hash chain does not verify.** Refuse the
+  log, and a corrupted chain costs the user every snapshot behind it — turning a
+  detection mechanism into a second failure. Warn and continue, and the field is
+  decoration nothing enforces, which VII.4 calls a defect. Refuse only the
+  entries after the break, and the answer depends on what a break means, which
+  nobody has had to define yet.
+
 - **O3 · The CLI command surface and the sidecar protocol.**
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
   re-identifies every record on disk, so they are one change or none. C1's shape
