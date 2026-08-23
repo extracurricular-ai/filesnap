@@ -832,6 +832,50 @@ integration that would have wanted "go back three" is already rendering that lis
 to let the user pick. Whoever counts, counts against a list they are looking at
 rather than against an index they assumed.
 
+## D36 · Coverage is owed per module, and fixtures are shared
+
+Measured 2026-08-23, before any of the storage work:
+
+| module | impl | test | tests |
+|---|---|---|---|
+| **store.rs** | **645** | **0** | **0** |
+| **refs.rs** | **499** | 122 | **2** |
+| scope.rs | 332 | 247 | 8 |
+| controller.rs | 211 | 251 | 5 |
+| manifest.rs | 175 | 76 | 4 |
+| checkpoint.rs | 172 | 217 | 7 |
+| restore.rs | 137 | 96 | 5 |
+| blob.rs | 121 | 56 | 4 |
+
+Integration: 18 tests, 1199 lines — one file, one narrative.
+
+**The total is not the problem; the distribution is.** ~1065 lines of unit tests
+and 1199 of integration against ~2383 of implementation is a reasonable ratio in
+aggregate, and it hides that the two largest modules have almost nothing.
+
+**And the distribution predicts the defects.** Of the ledger's 18 open entries,
+seven cite `refs.rs` and five cite `store.rs` — 12 of 18 in the two files with
+0 and 2 unit tests. That is not a coincidence to note, it is the mechanism: the
+single integration narrative walks those modules only along the path where
+nothing goes wrong, because a scenario that reaches a failure branch is a
+scenario that failed. C12, C13 and C15 are all failure-branch defects in code
+the narrative passes straight through.
+
+**A third symptom: 48 scattered `tempdir()` calls and no shared fixture.**
+Building a realistic store — a workspace, a session with turns, a fork, residue
+in the store — costs thirty lines every time. Coverage is thin wherever setup is
+expensive, and that is a property of the fixtures rather than of anyone's
+discipline.
+
+Three rules added to Quality Gates: no module is exempt because integration
+tests pass through it; setting up a realistic store is one call; every ledger
+entry closes with a test.
+
+**This is owed at the same time as the storage change (D24), not after it.** That
+change rewrites the manifest, the layout, and the partition — touching almost
+every line of `refs.rs` and `store.rs`. Doing it on top of zero unit tests in
+those two files is the specific mistake this decision exists to prevent.
+
 ---
 
 ## Open

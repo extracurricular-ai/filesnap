@@ -352,6 +352,17 @@ in-process guard is not a lock.
   exported that a consumer cannot actually call.
 - Integration tests exercise the engine through its public surface, the way a
   consumer would, and assert whole values rather than field by field.
+- **No module is exempt because integration tests pass through it.** A narrative
+  that walks the happy path proves the happy path. Every module carries unit
+  tests for its own failure branches — the ones an end-to-end scenario never
+  reaches, because a scenario that reaches them is a scenario that failed.
+- **Setting up a realistic store is one call, not thirty lines.** Fixtures for a
+  workspace, a session with turns, a fork, and a store with residue live in one
+  shared place. Coverage is thin wherever setup is expensive; that is a property
+  of the fixtures, not of anyone's discipline.
+- **Every ledger entry closes with a test.** A fix without one is a claim that
+  the defect is gone; the test is the evidence, and it is what stops it coming
+  back under a different name.
 
 ## Governance
 
