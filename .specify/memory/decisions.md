@@ -464,8 +464,42 @@ ordering rule still stands for gc's own two passes.
   the global blob store. The partition says which workspace's history a record
   belongs to, not where the file sits.
 
-`SnapshotStore::open` grows a second root as a result: the global blob directory
-and the workspace partition are no longer one path.
+**The API shape this forces**, settled while reviewing it:
+
+```rust
+impl WorkspaceStore {
+    /// Layout and version segment are the engine's, so the caller passes a
+    /// data directory rather than a store root: <data_dir>/filesnap/v1/.
+    /// `workspace` is canonicalized (V.5) and must exist.
+    pub fn open(data_dir: &Path, workspace: &Path) -> Result<Self>;
+    /// For a workspace that is gone from disk but whose snapshots remain.
+    pub fn open_at(data_dir: &Path, key: &WorkspaceKey) -> Result<Self>;
+    pub fn delete_sessions(&self, session_ids: &[String]) -> DeleteOutcome;
+}
+
+pub struct WorkspaceKey(/* hash of a canonical absolute path */);
+
+/// Spans every partition, so it belongs to no instance.
+pub fn collect_garbage(data_dir: &Path) -> Result<GcStats>;
+```
+
+- **The caller passes `data_dir`, never a store root.** VII.1 requires a reader
+  to fail loudly on a version it does not understand, which it cannot do if the
+  caller composes the path — a caller who writes `v2`, or omits the segment,
+  bypasses exactly the guarantee. `STORE_DIR_NAME` stops needing to be exported.
+- **`gc` and `delete` swap places.** Collection spans partitions and becomes a
+  free function; deletion is answerable inside one and becomes a method. That is
+  the table above expressed in the type system, and it makes `store.gc()` — the
+  natural way to assume a global sweep — fail to compile.
+- **`open` requires the workspace to exist**, because canonicalization does, and
+  falling back to a literal path on failure would produce two partitions for two
+  spellings of one directory, which is precisely V.5.
+
+**`SnapshotStore` is renamed `WorkspaceStore`.** The old name describes what is
+stored and leaves unanswered the question this decision creates — whole store,
+or one slice? `store.delete_sessions(ids)` reads as global and is not. Not
+`Workspace`, which would suggest the methods act on the directory, when some do
+(restore writes files) and some do not (delete touches only records).
 
 ## D20 · The sweep removes what can be recomputed first
 
