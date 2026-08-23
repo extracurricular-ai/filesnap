@@ -385,6 +385,101 @@ because the store is *global*: every session under one `data_dir` shares one
 in unrelated directories still collide in the store, which is exactly where C5's
 race lives.
 
+## D19 · The store is partitioned per workspace
+
+```
+<data_dir>/filesnap/v1/workspaces/<hash>/{blobs,manifests,refs,turns,restores}/
+```
+
+The key is a hash of the **canonical** absolute path of the workspace the
+session is bound to. Canonical matters for the same reason V.5 does: on macOS
+`/var` is a symlink to `/private/var`, and two spellings of one directory must
+not become two partitions.
+
+**This is what makes D18's lock implementable.** A workspace-scoped lock is now
+sufficient, because a workspace's data no longer shares anything with another's.
+Under the previous global store, two sessions in unrelated directories still
+collided in `blobs/`, which is exactly where C5's race lives — so a workspace
+lock would have left the race D18 was meant to retire.
+
+**It also shrinks three other problems rather than fixing them individually.**
+Delete and collection become O(workspace) instead of O(the whole store), so
+C13's and C15's failure mode — one corrupt manifest anywhere aborting a sweep —
+covers far less ground. And D4's binding stops being a rule the caller has to
+enforce and becomes structural: a session's data physically lives under its
+workspace.
+
+**Cost, accepted:** no deduplication across workspaces. Two unrelated projects
+holding byte-identical files store them twice. In practice the overlap is
+lockfiles, licences and vendored dependencies — real but small, and not worth
+the coupling it was buying.
+
+**Two things to get right when implementing:**
+- A session may scan several roots, but D4 binds it to *one* directory. The
+  partition key is that binding, not whichever root a given turn touched.
+- The edit hook records paths anywhere on disk, including outside the workspace.
+  Their content still lives in that session's partition. The partition says who
+  owns the data, not where the file sits.
+
+Settles O6.
+
+## D20 · The sweep removes what can be recomputed first
+
+Order: resolve the surviving-blob set → remove blobs → remove manifests.
+
+Blobs are findable from manifests; a manifest, once removed, takes with it the
+only record of what it referenced. So the thing that can be recomputed goes
+first, and the thing that is the map goes last. Interrupted midway, this leaves
+doomed manifests that nothing references — which the next ordinary sweep
+collects — rather than blobs no operation can ever find again.
+
+The current order is the reverse (refs.rs:409 removes manifests, then
+refs.rs:414 computes which blobs survive). Settles C13's shape; the fix is
+moving two blocks.
+
+D18's lock does not cover this. A lock stops another *process* interfering; it
+says nothing about this process being killed between two statements.
+
+## D21 · Restore residue is both self-healed and inspectable
+
+`apply_plan` writes `<name>.filesnap-restore-tmp` beside each file before
+renaming it into place, so a crash leaves that file in the user's own project —
+somewhere collection can never reach, because it knows the store and not the
+workspace.
+
+Both halves:
+
+- **A restore sweeps its own residue before it writes anything**, in the
+  directories it is about to touch, for files older than the grace window. The
+  window is required: another restore may be holding one right now.
+- **`filesnap doctor <workdir>`** covers the corner the self-healing path never
+  reaches — a workspace that is never restored into again, where the stray file
+  just sits.
+
+Self-healing alone leaves that corner; a command alone requires the user to know
+it exists, and someone who finds a `.filesnap-restore-tmp` in their project is
+more likely to delete it or file a bug.
+
+## D22 · delete returns what it reclaimed and what it refused
+
+```rust
+pub struct DeleteOutcome {
+    pub reclaimed: GcStats,
+    /// Sessions left untouched, with why. Their records are intact and the
+    /// call can be retried once the cause is fixed.
+    pub refused: Vec<(String, SnapshotError)>,
+}
+```
+
+A session whose log cannot be read is **refused, not half-deleted** — today the
+read failure is swallowed by `if let Ok(..)` and the log is removed anyway, so
+nothing enters the doomed set and the only record that could have been retried
+is gone (D9).
+
+Batch stays batched: one unreadable session must not block deleting the others,
+and the batch exists because forks share manifests, so sweeping one at a time
+leaves each pinned by the next.
+
 ---
 
 ## Open
@@ -407,13 +502,8 @@ race lives.
   every writer really goes through the API, which is a CLI question, not an
   engine one.
 
-- **O6 · The scope of the lock D18 requires.** A workspace-scoped lock does not
-  cover the store, which is global: all sessions under one `data_dir` share one
-  `blobs/` and one `manifests/`. The candidates are a store-scoped lock, which
-  serializes every filesnap process on the machine; partitioning the store per
-  workspace as anionex does, which makes a workspace lock sufficient but gives
-  up cross-workspace dedup; or a workspace lock plus keeping the grace window
-  for the cross-workspace case.
+- ~~**O6 · The scope of the lock D18 requires.**~~ Settled by D19: the store is
+  partitioned per workspace, so a workspace-scoped lock is sufficient.
 - **O3 · The CLI command surface and the sidecar protocol.**
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
   re-identifies every record on disk, so they are one change or none. C1's shape

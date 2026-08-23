@@ -254,8 +254,13 @@ yesterday must not fail today because a clock passed a threshold.
 
 **VIII.2 Nothing is collected until it has been on disk for a grace window,** and
 a file whose age cannot be read counts as young. A capture publishes in more than
-one step, nothing coordinates the processes, and a sweep interleaved with a
-publish takes away a snapshot its writer believes it holds.
+one step, and a sweep interleaved with a publish takes away a snapshot its writer
+believes it holds.
+
+*Live processes are serialized by a lock (D18), so the window is not what keeps
+two of them apart. It is what covers the case a lock cannot: a process killed
+between the steps of its own publish, whose half-written state no other process
+was ever in a position to see.*
 
 This applies to **everything that is content-addressed**, which is both the
 contents and the records describing them: a second writer adopts an existing
