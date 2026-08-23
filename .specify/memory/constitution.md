@@ -265,11 +265,31 @@ reference*, not creation — an object adopted a second ago but created weeks ag
 is not old, and a sweep that reads its mtime will think it is. Adoption must
 freshen what it adopts.
 
-**VIII.3 Deleting a conversation deletes everything held for it** — its log, the
-undo records filed under it, and the captured content — and reclaims immediately
-rather than eventually. That has to be wired to the delete path explicitly;
-otherwise deleting a conversation removes the index to its data and keeps every
-byte of it.
+**VIII.3 Deleting a session makes it unreachable, atomically; reclaiming its
+bytes is a separate activity.** The two are different obligations and only the
+first can be atomic.
+
+*Unreachability* is what delete owns, and it must be all-or-nothing: after
+delete returns, nothing resolves that session — no log, no undo record, no
+history. It removes a fixed, small set of records it alone owns, and it does so
+in an order where **every interruption lands on a state the system could have
+reached legitimately**. Two unlinks are not one syscall, and they do not need to
+be: ordering is what buys atomicity here, and it costs nothing. Delete's success
+must depend on nothing but its own session's files.
+
+*Reclamation* cannot be atomic with that, and must not be welded to it. Content
+is deduplicated, so "which bytes belong only to this session" is answerable only
+by a global reachability query — which means an unrelated corrupt record could
+otherwise decide whether a delete succeeds. Reclamation is therefore idempotent,
+resumable, and outside delete's success criterion. It must still actually
+happen: the failure this rule exists to prevent is not "bytes freed a minute
+late", it is **the index removed and the bytes kept, with nothing left that can
+ever find them** — data made simultaneously unreachable and unreclaimable.
+
+What may be promised is exactly this: *after delete, the session is unreachable,
+and the bytes only it held are reclaimed.* Never "the bytes are gone" — a blob
+that a live session also holds stays, and no amount of synchronous work changes
+that.
 
 **VIII.4 The store is written by capture and by nothing else.** A session that
 captures nothing leaves no file behind. State created merely by constructing an

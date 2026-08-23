@@ -194,6 +194,52 @@ sharpened C4 and C5. The two that bear directly on this decision:
   blobs survive, so a failure in between orphans blobs that no later delete can
   ever rediscover — an invariant only the other operation could restore (C13).
 
+## D11 · delete is two ordered unlinks; reclamation is a separate activity
+
+Delete owns exactly two files per session — `restores/<id>.json` and
+`refs/<id>.json` — and removes them **in that order**. It touches nothing else.
+
+**The order is what makes it atomic.** Two unlinks are not one syscall, but they
+do not need to be: what matters is that every interruption lands on a state the
+system could have reached on its own.
+
+```
+remove restores/<id>.json   → interrupted → a session that never rewound.  Legal.
+remove refs/<id>.json       → interrupted → done.
+```
+
+**The current code has it backwards** (`store.rs:628` removes the log, then
+`store.rs:631` the undo records). Interrupted between them, it leaves an undo
+record for a session with no log — a state nothing legitimate produces, and one
+that permanently pins manifests as a GC root, because `all_restore_logs` reads
+every file under `restores/` and never checks whether the session still exists.
+Recorded as C16; **not yet fixed in code.**
+
+**Delete does not touch `turns/`.** The turn index is a pure cache: every
+`set_turn` is paired with a `refs.append` of the same `(turn_id, manifest_id)`
+(store.rs:125→134, 185→192, 219→228), so for any turn the answer is the last log
+entry carrying it. A stale entry is an orphan record, which by D8 is gc's
+territory. An earlier version of D10 gave delete a per-turn removal; there is no
+such operation and there should not be.
+
+**Reclamation is outside delete's success criterion.** It is idempotent,
+resumable, and may fail without making the delete partial — the session is
+already gone. This is not a dependency on gc: gc decides nothing, it only
+reclaims what delete already made unreachable. "Single source of truth" is about
+*what should exist*, not about *when bytes are freed*.
+
+**Refcounting was considered and is not taken.** It would make reclamation
+O(the session) instead of O(the store), but a refcount must be updated
+atomically with publication, and a crash between "write the object" and
+"increment" corrupts it in a way only a full scan can repair — which is the
+sweep it was meant to replace. Git declines refcounting for the same reason, and
+VIII.1 already commits to reachability.
+
+**What delete may promise:** the session is unreachable, and the bytes only it
+held are reclaimed. Never "the bytes are gone" — deduplication means a blob a
+live session also holds stays, and no amount of synchronous work changes that.
+VIII.3 was rewritten to constrain reachability rather than bytes.
+
 ---
 
 ## Open

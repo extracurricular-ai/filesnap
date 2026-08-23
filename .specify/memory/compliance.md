@@ -295,6 +295,26 @@ unlink instead of returning on the first.
 running on deletion, 'later' can mean never". The two comments contradict each
 other and the second one is right.*
 
+### C16 · delete's two unlinks are in the order that makes a crash illegal — VIII.3, D11
+
+`forget_sessions` removes the session log first and the undo records second:
+
+```rust
+store.rs:628   store.remove_thread(thread_id)     // refs/<id>.json
+store.rs:631   store.remove_restores(thread_id)   // restores/<id>.json
+```
+
+**Failure:** interrupted between the two, the store holds an undo record for a
+session with no log — a state no normal operation produces. `all_restore_logs`
+reads every file under `restores/` without checking whether its session still
+exists, so that orphan record becomes a permanent GC root, pinning its target
+and safety manifests and their blobs for good.
+
+**Shape of the fix:** swap them. Removing the undo record first leaves, at the
+only interruption point, a session that simply never rewound — which is legal
+and indistinguishable from the ordinary case. Ordering is the whole fix; no
+journal, no lock, no marker file.
+
 ## Rules with no test
 
 Quality Gates require every rule to be pinned. These are not.
@@ -341,6 +361,8 @@ Recorded so they are not re-litigated.
 ---
 
 **Last reviewed:** 2026-08-23. Opened against `39e5efe`; C3 and C11 closed by
-the rename and API pass. C12–C15 added, and C4/C5 sharpened, by the
-delete/gc boundary audit — C4's consequence turned out to be a broken deletion
-promise rather than a disk leak, and C5's stated fix was wrong twice over.
+the rename and API pass. C12–C15 added, and C4/C5 sharpened, by the delete/gc
+boundary audit — C4's consequence turned out to be a broken deletion promise
+rather than a disk leak, and C5's stated fix was wrong twice over. C16 added
+with D11. **No code has changed since the API pass; every open entry is still
+open.**
