@@ -150,11 +150,23 @@ what it refused.
 
 | | owns |
 |---|---|
-| `delete` | the session's log, its undo records, the turn entries only it held, and the manifests and blobs only it referenced |
-| `gc` | `.tmp` residue past the grace window, manifests no root names, blobs no surviving manifest names |
+| `delete` | records keyed by session id: the session's log, its undo records, and the turn entries whose turn ids no surviving log holds |
+| `gc` | `.tmp` residue past the grace window, and anything unreachable |
+| **neither** | **content.** Manifests and blobs are reclaimed by reachability, by both, through one shared read-only query |
 
 Neither may depend on the other's contract. **Sharing a low-level primitive is
 not a dependency; depending on the other operation's contract is.**
+
+**Content cannot be owned, and an earlier version of this table said it could.**
+Manifests and blobs are content-addressed and deduplicated: `ManifestStore::save`
+and `BlobStore::store_bytes` both write nothing when the hash is already present.
+Two unrelated sessions that capture identical state therefore share the same
+manifest id and the same blobs — sharing follows from *content*, not from
+lineage, so no session can be said to own any of it. "Delete the manifests only
+this session referenced" is not answerable except by a global reachability query.
+That coupling is inherent to a deduplicating store, not an accidental
+entanglement, and severing it would trade a disk leak for `MissingBlob` in a
+session nobody deleted.
 
 **Where the code violates this today — one weld, not two:**
 `forget_sessions` → `gc_for` → `collect_garbage_for` → `live_manifest_ids`,
@@ -166,11 +178,21 @@ liveness computation (D9) — one hole, two symptoms.
 
 **Fix shape:** split it into a pure read-only `live_manifests(refs)` that both
 call, plus explicit pruning that each operation performs for the records it
-owns.
+owns. Note this does not make delete self-sufficient for content — see above —
+it makes the *query* shared rather than one operation reaching through the
+other's entry point.
 
-*A full entanglement audit — crash windows, concurrency, and whether
-"delete then gc" and "gc then delete" produce different stores — was running
-when this was written and is not yet folded in.*
+**A full entanglement audit (2026-08-23) confirmed six defects on this
+boundary**, recorded as C12–C15 in [compliance.md](compliance.md) plus
+sharpened C4 and C5. The two that bear directly on this decision:
+
+- `retain_turns`, reached from delete, unlinks turn entries **by global
+  elimination** rather than scoped to the sessions being deleted, so deleting
+  one conversation can amputate another's history (C12). This is the exact
+  shape D10 forbids.
+- `collect_garbage_for` removes the doomed manifests *before* resolving which
+  blobs survive, so a failure in between orphans blobs that no later delete can
+  ever rediscover — an invariant only the other operation could restore (C13).
 
 ---
 

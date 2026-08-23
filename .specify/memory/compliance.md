@@ -68,7 +68,16 @@ and a vendor prefix on every `use` a consumer would write.
 
 ## Should fix
 
-### C4 · `.tmp` residue becomes an uncollectable GC root — VII.2
+### C4 · `.tmp` residue becomes an uncollectable GC root, and silently defeats delete — VII.2
+
+**Consequence upgraded 2026-08-23.** This is not only a disk leak. An
+interrupted capture in a *live, unrelated* session leaves `turns/<turn>.tmp`
+holding a manifest id M. `all_manifest_ids` counts M live; `retain_turns`
+refuses to delete `.tmp`. When the user then deletes the conversation that owns
+M, `collect_garbage_for` sees M as live, keeps it, and **reports success**. The
+deleted conversation's file contents stay on disk and no operation in the crate
+can ever remove them — a broken VIII.3 deletion promise, caused by a crash in a
+session that has nothing to do with either.
 
 `TurnIndex::all_manifest_ids` (refs.rs:219-228) reads every file under `turns/`,
 `.tmp` included, and inserts its contents as a live manifest id.
@@ -96,10 +105,31 @@ entries, sees no manifest on disk naming it — A has not saved yet — and remo
 it. A's manifest lands seconds later pointing at a missing blob, and the restore
 fails with `MissingBlob`.
 
-**Shape of the fix:** the blob half of the sweep keeps the grace window even on
-the delete path; only the manifest half reclaims immediately. VIII.3's "reclaims
-immediately" is about the records and the bulk of the content, not about a blob
-written in the last five minutes.
+**Shape of the fix — corrected 2026-08-23, twice over.**
+
+*First,* the earlier fix here ("give the delete path a grace window for blobs")
+is not sufficient on its own. `store_bytes` writes nothing when the hash is
+present, so a blob's mtime records when it was *created*, not when it was last
+referenced. A three-day-old blob adopted by a capture one second ago is
+`settled()` and the window never sees it. Git answers this by *freshening* — it
+`utime()`s an existing loose object rather than skipping it silently, so
+`gc.pruneExpire` measures last reference. Do that first; the window is the
+second half, not the first.
+
+*Second,* the hazard is not confined to blobs. **`ManifestStore::save` dedupes
+identically** (manifest.rs:122): a live session that recaptures unchanged state
+re-derives an existing manifest id and writes nothing, so the manifest is
+instantly collectable by both sweeps despite being about to become live. Its log
+entry then points at a manifest that is gone, `latest_manifest` returns
+`MissingManifest`, and **that session stops capturing entirely**. The
+constitution states this hazard for content only (VIII.2, "true of record
+identity and false of content") — manifest *ids* are content-addressed too, so
+the sentence is drawn in the wrong place and needs widening.
+
+The premise `collect_garbage_for` rests on — "a candidate is only considered
+because a thread that has just been removed named it, so no live session can be
+in the middle of publishing it" (refs.rs:376) — is false under dedup in both
+directions. A concurrent session publishes by *reusing the doomed file*.
 
 ### C6 · The ignore filter is inert until the first capture — II.3
 
@@ -176,6 +206,95 @@ from a private module — public surface no consumer could ever call.
 
 ---
 
+### C12 · Deleting one session can amputate another's history — D10, VIII.1
+
+`retain_turns` (refs.rs:306) is reached from the delete path via
+`live_manifest_ids` (refs.rs:436). It unlinks **every** file in `turns/` not
+named by a currently-readable surviving log — global elimination, not scoped to
+the sessions being deleted, and with no grace window.
+
+Every capture writes its log entry *before* its turn file (store.rs:125→134,
+185→192, 219→228), which opens the window:
+
+```
+session A            capture: refs.append(T) … then set_turn(T)
+process B            delete: thread_logs() reads the logs   ← before A's append
+session A            refs.append(T) lands
+session A            set_turn(T) writes turns/T
+process B            retain_turns() unlinks turns/T as unreferenced
+```
+
+**Failure:** A's log still carries turn T, the index does not, and nothing ever
+rebuilds it — `set_turn` runs only at capture time and `target_for_turn` is the
+sole resolution path. The user's rewind to that turn reports no snapshot,
+permanently, in a session nobody deleted. This is the exact shape D10 forbids: a
+sweep editing records that belong to an operation it should be independent of.
+
+**Shape of the fix:** delete scopes turn removal to the doomed sessions' own
+turn ids. Any global reconciliation moves behind the `settled()` check the
+manifest and blob halves already use.
+
+### C13 · The delete sweep removes manifests before it knows which blobs survive — VIII.3
+
+`collect_garbage_for` collects blob candidates into an in-memory set
+(refs.rs:397), **removes the manifests** (refs.rs:409), and only then subtracts
+hashes still referenced by surviving manifests (refs.rs:414-418) before removing
+the rest (refs.rs:419).
+
+**Failure:** any failure between those two points — the `?` on
+`manifests.load` at refs.rs:415 racing a concurrent sweep, a failed
+`blobs.remove`, or a crash — permanently orphans blobs that no future
+`gc_for` can rediscover, because its candidate set is only ever that delete's
+own doomed manifests, which are already gone. Only the full `collect_garbage`,
+which enumerates `blobs/` directly, can find them. The user sees a warning and
+keeps the bytes.
+
+Note also refs.rs:403 (`let Ok(manifest) = manifests.load(id) else { continue }`)
+silently drops any doomed id whose manifest is already gone, so the blobs it
+named are never even considered.
+
+**Shape of the fix:** resolve the keep-set first, then remove blobs, then
+manifests. Or make blob reclamation purely a function of what is on disk, so a
+crashed delete is repaired by the next ordinary sweep.
+
+### C14 · `live_manifest_ids` is a query that writes — D10
+
+`live_manifest_ids` (refs.rs:427) answers "which manifests are live" and, as a
+side effect, calls `retain_turns` to prune the turn index. Both delete and gc
+reach it. So delete's own record cleanup happens inside gc's marking helper, and
+delete's result depends on what that helper read — which is also how
+unwhitelisted `.tmp` residue (C4) enters delete's liveness computation.
+
+One hole, two symptoms, and the reason the two operations cannot currently be
+separated: the query and the mutation are the same function.
+
+**Shape of the fix:** split into a read-only `live_manifests(refs)` both call,
+plus explicit pruning each performs for the records it owns.
+
+### C15 · The delete sweep is more fragile than the general one, in the wrong direction
+
+`collect_garbage_for`'s blob-liveness scan loads **every** manifest in the store
+with hard `?` propagation (refs.rs:414-415), with no liveness filter. The
+general sweep is strictly more tolerant: it only loads manifests it has already
+decided to keep (refs.rs:478), so a dead corrupt manifest is unlinked rather
+than fatal.
+
+**Failure:** one corrupt or concurrently-unlinked manifest belonging to an
+unrelated surviving session aborts the delete sweep *after* the index is gone
+and *before* one blob is freed — index removed, bytes kept, which store.rs:587
+says is precisely what this function exists to prevent. `refs.thread_logs()?`
+and `retain_turns`'s intolerance of a racing `NotFound` (refs.rs:315) abort even
+earlier, before anything is reclaimed.
+
+**Shape of the fix:** tolerate an unloadable manifest in the blob-liveness scan
+the way the doomed loop above it already does, and continue past a single failed
+unlink instead of returning on the first.
+
+*Also worth fixing: store.rs:593 claims "a partial sweep is not a corrupt store
+— the next one finishes the job", while refs.rs:379 admits "with the sweep only
+running on deletion, 'later' can mean never". The two comments contradict each
+other and the second one is right.*
+
 ## Rules with no test
 
 Quality Gates require every rule to be pinned. These are not.
@@ -221,5 +340,7 @@ Recorded so they are not re-litigated.
 
 ---
 
-**Last reviewed:** 2026-08-22. Opened against `39e5efe`; C3 and C11 closed by
-the rename and API pass.
+**Last reviewed:** 2026-08-23. Opened against `39e5efe`; C3 and C11 closed by
+the rename and API pass. C12–C15 added, and C4/C5 sharpened, by the
+delete/gc boundary audit — C4's consequence turned out to be a broken deletion
+promise rather than a disk leak, and C5's stated fix was wrong twice over.

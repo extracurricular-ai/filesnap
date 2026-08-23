@@ -255,10 +255,15 @@ yesterday must not fail today because a clock passed a threshold.
 **VIII.2 Nothing is collected until it has been on disk for a grace window,** and
 a file whose age cannot be read counts as young. A capture publishes in more than
 one step, nothing coordinates the processes, and a sweep interleaved with a
-publish takes away a snapshot its writer believes it holds. This applies to
-content as much as to records: content-addressed storage means a second writer may
-adopt a blob without writing anything, so "no live writer can be publishing this"
-is true of record identity and false of content.
+publish takes away a snapshot its writer believes it holds.
+
+This applies to **everything that is content-addressed**, which is both the
+contents and the records describing them: a second writer adopts an existing
+object by writing nothing at all, so "nothing can be publishing this, it was
+just orphaned" is never a safe premise. It also means age must measure *last
+reference*, not creation — an object adopted a second ago but created weeks ago
+is not old, and a sweep that reads its mtime will think it is. Adoption must
+freshen what it adopts.
 
 **VIII.3 Deleting a conversation deletes everything held for it** — its log, the
 undo records filed under it, and the captured content — and reclaims immediately
