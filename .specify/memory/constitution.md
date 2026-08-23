@@ -291,9 +291,10 @@ happen: the failure this rule exists to prevent is not "bytes freed a minute
 late", it is **the index removed and the bytes kept, with nothing left that can
 ever find them** — data made simultaneously unreachable and unreclaimable.
 
-What may be promised is exactly this: *after delete, the session is unreachable,
-and the bytes only it held are reclaimed.* Never "the bytes are gone" — a blob
-that a live session also holds stays, and no amount of synchronous work changes
+What may be promised is exactly this: *after delete, the session is unreachable
+and its records are gone; the content only it held is reclaimed at the next
+collection.* Never "the bytes are gone" — content is shared by deduplication, so
+a blob a live session also holds stays, and no amount of synchronous work changes
 that.
 
 **VIII.4 The store is written by capture and by nothing else.** A session that

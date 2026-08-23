@@ -253,9 +253,12 @@ Note also refs.rs:403 (`let Ok(manifest) = manifests.load(id) else { continue }`
 silently drops any doomed id whose manifest is already gone, so the blobs it
 named are never even considered.
 
-**Shape of the fix:** resolve the keep-set first, then remove blobs, then
-manifests. Or make blob reclamation purely a function of what is on disk, so a
-crashed delete is repaired by the next ordinary sweep.
+**Shape of the fix — retired by the layout (D19), not fixed directly.** Delete no
+longer touches blobs at all: content is global and only `gc` reclaims it, and
+gc's blob pass enumerates `blobs/` and marks from surviving manifests, so it is a
+function of what is on disk and repairs itself after any interruption. There is
+no remembered doomed set left to lose. D20's ordering rule still governs gc's own
+two passes.
 
 ### C14 · `live_manifest_ids` is a query that writes — D10
 

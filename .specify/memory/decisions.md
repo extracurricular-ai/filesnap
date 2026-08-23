@@ -361,67 +361,111 @@ says `filesnap:`; `STORE_DIR_NAME` becomes `filesnap` when the store path gains
 its version segment, so the layout is `<data_dir>/filesnap/v1/`. Doing it then
 costs nothing, because that change is already moving the store root.
 
-## D18 · Every mutating operation serializes on a lock
+## D18 · A lock serializes a session against itself, and nothing wider
 
-Capture, restore, delete, and collection all take a lock. Concurrency was never
-recommended or supported, so serializing is the honest implementation of what the
-design already assumed rather than a new restriction.
+The lock is **per session**. It exists because several of the store's files are
+read-modify-write and a session can race itself:
 
-This is a deliberate departure from the reasoning in VIII.2, which declined a
-lock on the capture path and answered the sweep-versus-publish race with a grace
-window instead, git-style. Under a lock that race cannot occur at all, and
-several confirmed defects lose their root cause rather than needing individual
-fixes: C5's dedup race, C12's turn-index race, and C13's mid-sweep interference
-all require two processes mutating at once.
-
-**The grace window stays regardless.** A lock serializes live processes; it does
-nothing about a process killed mid-publish, whose residue the window and the
-whitelisting (D9) still have to handle. Locks and windows answer different
-questions and neither replaces the other.
-
-**Scope is unresolved — see O6.** A workspace-scoped lock is not sufficient here,
-because the store is *global*: every session under one `data_dir` shares one
-`blobs/` and one `manifests/`, whatever workspace it belongs to. So two sessions
-in unrelated directories still collide in the store, which is exactly where C5's
-race lives.
-
-## D19 · The store is partitioned per workspace
-
-```
-<data_dir>/filesnap/v1/workspaces/<hash>/{blobs,manifests,refs,turns,restores}/
+```rust
+let mut log = self.load(thread_id)?;   // read
+log.entries.push(entry);               // modify
+write_atomic(&path, ...)               // write
 ```
 
-The key is a hash of the **canonical** absolute path of the workspace the
-session is bound to. Canonical matters for the same reason V.5 does: on macOS
-`/var` is a symlink to `/private/var`, and two spellings of one directory must
-not become two partitions.
+Two concurrent invocations for one session — a hook that fires twice, a user who
+runs the command while one is already running — silently lose a log entry.
+`push_restore` and `pop_restore` have the same shape on the restore log. In a
+long-lived library this could not happen; in a CLI it is ordinary.
 
-**This is what makes D18's lock implementable.** A workspace-scoped lock is now
-sufficient, because a workspace's data no longer shares anything with another's.
-Under the previous global store, two sessions in unrelated directories still
-collided in `blobs/`, which is exactly where C5's race lives — so a workspace
-lock would have left the race D18 was meant to retire.
+**Nothing wider is locked, deliberately.** Two sessions working in one directory,
+or in nested directories, is not a configuration the engine tries to make
+coherent. Each capture is still a truthful record of what was on disk at that
+moment; interleaved edits do not make a snapshot wrong, they make the *user's*
+mental model harder, and that is the user's tradeoff to weigh. The engine stays
+agnostic about cross-modification, and does not adopt restrictions — such as
+forbidding nested workspaces — in order to police it.
 
-**It also shrinks three other problems rather than fixing them individually.**
-Delete and collection become O(workspace) instead of O(the whole store), so
-C13's and C15's failure mode — one corrupt manifest anywhere aborting a sweep —
-covers far less ground. And D4's binding stops being a rule the caller has to
-enforce and becomes structural: a session's data physically lives under its
-workspace.
+**This corrects an earlier version of this decision**, which locked every
+mutating operation and claimed that doing so retired the root cause of C5, C12
+and C13. Under a per-session lock that claim is false: C5's race is *between*
+sessions — one adopts a blob a concurrent delete then sweeps — so a per-session
+lock does not touch it. **C5's freshen fix is required after all.** C12 and C13
+are unaffected either way; D11 and D20 already answer them, and D20 explicitly
+notes a lock cannot help with a process killed between two statements.
 
-**Cost, accepted:** no deduplication across workspaces. Two unrelated projects
-holding byte-identical files store them twice. In practice the overlap is
-lockfiles, licences and vendored dependencies — real but small, and not worth
-the coupling it was buying.
+**The grace window stays.** It is what covers the case a lock cannot: a process
+killed between the steps of its own publish.
+
+*Observation, not yet acted on:* `restore_to` writes to the restore log of the
+session named by `undo_for`, which may not be the performing session — so a
+per-session lock does not cover it. But D6 fixes history as linear with no
+branches, and without a fork there is no other session to hand the workspace to,
+so the destination should always be the performer. If that holds, the lock does
+cover it, and `RestoreKind`'s `undo_for` / `spending` fields are vestiges of
+codex's fork model.
+
+## D19 · Records are partitioned per workspace; content stays global
+
+```
+<data_dir>/filesnap/v1/
+  ├── blobs/                    ← global. Deduplicated across everything.
+  └── workspaces/<hash>/
+        ├── manifests/
+        ├── refs/
+        ├── turns/
+        └── restores/
+```
+
+The key is a hash of the **canonical** absolute path of the workspace. Canonical
+matters for the same reason V.5 does: on macOS `/var` is a symlink to
+`/private/var`, and two spellings of one directory must not become two
+partitions. All sessions working in one directory share one partition, so
+**deduplication across conversations is untouched** — and so is deduplication
+across directories, since blobs never partition at all.
+
+**The split follows the shape of the two liveness questions**, which are not the
+same question:
+
+| | scope | who answers it |
+|---|---|---|
+| is this **manifest** still referenced? | one workspace — nothing outside it can name a manifest in its partition | `delete`, cheaply |
+| is this **blob** still referenced? | global — any workspace's manifests may name it | `gc`, and only `gc` |
+
+**What this buys.** The expensive scan becomes bounded by the project. Both
+sweeps load every manifest they consider (refs.rs:414, :478), and a manifest runs
+about 1.5 MB on a 6,000-file repository — one per turn. Under a single global
+store, a year of use across a dozen projects means a `delete` parses gigabytes of
+JSON belonging to projects the user is not touching, and that cost grows without
+bound. Partitioned, it is bounded by one project's history. C15's failure mode —
+one corrupt manifest aborting a sweep — shrinks from "anywhere on this machine"
+to "in this project".
+
+**What it costs.** `delete` no longer frees any content. It removes records,
+which is what makes the session unreachable; the bytes wait for the next `gc`.
+That is a sharpening of VIII.3 rather than a departure from it: that rule already
+separates unreachability, which delete owns and which is atomic, from
+reclamation, which is idempotent, resumable, and outside delete's success
+criterion. The division is now crisp instead of best-effort — **delete reclaims
+records, gc reclaims content** — and VIII.3's closing promise was adjusted to say
+so.
+
+**A defect retires as a side effect.** C13 existed because delete removed
+manifests before resolving which blobs survived, orphaning blobs no later delete
+could rediscover. Delete no longer touches blobs at all, and gc's blob pass
+enumerates `blobs/` directly and marks from surviving manifests — so it is a
+function of what is on disk and repairs itself after any interruption. D20's
+ordering rule still stands for gc's own two passes.
 
 **Two things to get right when implementing:**
 - A session may scan several roots, but D4 binds it to *one* directory. The
   partition key is that binding, not whichever root a given turn touched.
 - The edit hook records paths anywhere on disk, including outside the workspace.
-  Their content still lives in that session's partition. The partition says who
-  owns the data, not where the file sits.
+  Their manifest entries live in that workspace's partition and their content in
+  the global blob store. The partition says which workspace's history a record
+  belongs to, not where the file sits.
 
-Settles O6.
+`SnapshotStore::open` grows a second root as a result: the global blob directory
+and the workspace partition are no longer one path.
 
 ## D20 · The sweep removes what can be recomputed first
 
@@ -502,8 +546,9 @@ leaves each pinned by the next.
   every writer really goes through the API, which is a CLI question, not an
   engine one.
 
-- ~~**O6 · The scope of the lock D18 requires.**~~ Settled by D19: the store is
-  partitioned per workspace, so a workspace-scoped lock is sufficient.
+- ~~**O6 · The scope of the lock D18 requires.**~~ Settled by D18 itself: the
+  lock is per session and covers only a session racing itself. Nothing wider is
+  locked, so the partition layout does not have to carry the lock's weight.
 - **O3 · The CLI command surface and the sidecar protocol.**
 - **O4 · C1 and C2 land together.** Both change the manifest, and adding a field
   re-identifies every record on disk, so they are one change or none. C1's shape
