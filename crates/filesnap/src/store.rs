@@ -71,6 +71,16 @@ pub enum RestoreKind<'a> {
     /// `undo_for: None` is a rewind with no destination session to be
     /// reachable from: nothing is recorded and the restore is not undoable.
     /// The caller is expected to have said so before running it.
+    ///
+    /// **The lock does not reach a destination that is not the performer.**
+    /// A session's lock serializes it against itself (D18), and the undo
+    /// record is written under `undo_for` — so naming a *different* session
+    /// writes to a file this lock does not cover. It is safe in the case that
+    /// motivates it, where a forking host creates that session immediately
+    /// before the call and nothing else is using it yet. A host that hands
+    /// `undo_for` a session already in use is outside what the lock protects,
+    /// and the two concurrent `push_restore` read-modify-writes can lose an
+    /// entry (D26).
     Rewind { undo_for: Option<&'a str> },
     /// Reversing `spending`'s most recent rewind and consuming that record,
     /// so undoing twice walks back through two rewinds rather than
@@ -97,6 +107,7 @@ pub struct WorkspaceStore {
     manifests: ManifestStore,
     refs: RefStore,
     turns: TurnIndex,
+    declared: crate::declared::DeclaredStore,
     key: WorkspaceKey,
     partition: PathBuf,
 }
@@ -138,6 +149,7 @@ impl WorkspaceStore {
             manifests: ManifestStore::open(partition.join("manifests"))?,
             refs: RefStore::open(partition.join("refs"))?,
             turns: TurnIndex::open(&partition)?,
+            declared: crate::declared::DeclaredStore::open(crate::declared::dir_in(&partition))?,
             key: key.clone(),
             partition,
         })
@@ -183,6 +195,25 @@ impl WorkspaceStore {
         // resolve the same state from any branch.
         self.turns.set_turn(turn_id, &cp.id)?;
         Ok(cp)
+    }
+
+    /// Record that `paths` are being edited during `turn_id`, so later
+    /// captures keep watching them.
+    ///
+    /// Persisted, so a session resuming in a new process picks up what the
+    /// last one declared. A path stays watched for
+    /// [`crate::DECLARED_WINDOW_TURNS`] turns after its last declaration
+    /// (D25); redeclaring renews it.
+    pub fn declare_paths(&self, session_id: &str, turn_id: &str, paths: &[PathBuf]) -> Result<()> {
+        crate::id::validate_external("session id", session_id)?;
+        crate::id::validate_external("turn id", turn_id)?;
+        self.declared.declare(session_id, turn_id, paths)
+    }
+
+    /// Paths this session declared that are still inside the window — what a
+    /// capture unions into its scan.
+    pub fn declared_paths(&self, session_id: &str) -> Result<std::collections::BTreeSet<PathBuf>> {
+        self.declared.active(session_id)
     }
 
     /// Whether `session_id` has a snapshot log. With session-scoped binding,
@@ -386,6 +417,15 @@ impl WorkspaceStore {
             // misses is a path the plan can never delete.
             out.extend(manifest.absent);
         }
+        // Every path this session ever declared, window or not. The window
+        // governs what future captures *watch*; the safety scope has to look
+        // at everything ever observed, or a plan can never remove it again.
+        out.extend(
+            self.declared
+                .all(thread_id)?
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
         Ok(out)
     }
 
@@ -697,6 +737,10 @@ impl WorkspaceStore {
             // ordinary case. The other order leaves an undo record for a
             // session with no log, which nothing produces and which pins its
             // manifests as a root for good.
+            if let Err(err) = self.declared.remove(session_id) {
+                outcome.refused.push((session_id.clone(), err));
+                continue;
+            }
             if let Err(err) = self.remove_restores(session_id) {
                 outcome.refused.push((session_id.clone(), err));
                 continue;

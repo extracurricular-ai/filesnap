@@ -56,9 +56,12 @@ pub struct SnapshotTracker {
 
 #[derive(Default)]
 struct TrackState {
-    /// Agent-edited paths registered via pre-edit attach; unioned into
-    /// every checkpoint scan so post-edit states keep being observed.
-    /// In-memory for v1: lost on resume (recorded manifests stay valid).
+    /// Agent-edited paths registered via pre-edit attach, unioned into every
+    /// checkpoint scan so post-edit states keep being observed.
+    ///
+    /// A cache over the persisted set, not the truth: the store holds it, so
+    /// a session resuming in a new process picks up what the last one
+    /// declared (D25).
     extras: BTreeSet<PathBuf>,
     /// Directory whose ignore rules scope this session's captures: the
     /// workspace root when one was found, else the invocation directory.
@@ -166,7 +169,14 @@ impl SnapshotTracker {
         // instead was unbounded by construction: on a repository of any age
         // most of what is on disk is build output, which is both the bulk of
         // the cost and the least worth keeping.
-        let extras: Vec<PathBuf> = self.lock_state().extras.iter().cloned().collect();
+        // The persisted set is authoritative and applies the turn window; the
+        // in-memory one is this process's own additions since it last wrote.
+        let mut extras: BTreeSet<PathBuf> = self.lock_state().extras.iter().cloned().collect();
+        match self.store.declared_paths(&self.session_id) {
+            Ok(declared) => extras.extend(declared),
+            Err(err) => warn!("filesnap: declared set unreadable, using this process's: {err}"),
+        }
+        let extras: Vec<PathBuf> = extras.into_iter().collect();
         let scan = tracked_files(&roots, extras, self.hidden, self.limits);
         // What the *scan* passed over is a drop too, and the capture cannot
         // see it: an over-size file never reaches the manifest at all.
@@ -204,6 +214,7 @@ impl SnapshotTracker {
         // well — bypassing the scan's own ignore filter. The rules are read
         // fresh so the current ignore file governs.
         let ignore = self.lock_state().ignore_root.as_deref().map(load_ignore);
+        let mut declared = Vec::new();
         for (path, image) in pre_images {
             if ignore
                 .as_ref()
@@ -211,9 +222,11 @@ impl SnapshotTracker {
             {
                 continue;
             }
-            // The edit-touched partition: unbounded on purpose, since its size
-            // follows what the agent did rather than what is on disk.
+            // The edit-touched partition. Bounded by a rolling window of
+            // turns rather than by count, so its size follows what the agent
+            // is working on rather than everything it ever touched (D25).
             self.lock_state().extras.insert(path.clone());
+            declared.push(path.clone());
             let key = path.to_string_lossy().into_owned();
             if let Err(err) = self
                 .store
@@ -221,6 +234,16 @@ impl SnapshotTracker {
             {
                 warn!("filesnap: pre-edit attach failed for {key}: {err}");
             }
+        }
+        // Persisted last, and separately: a declaration that fails to land
+        // costs this session future *observation* of those paths, which is
+        // recoverable by editing them again. Letting it fail the attach above
+        // would cost the pre-edit images themselves, which is not.
+        if let Err(err) = self
+            .store
+            .declare_paths(&self.session_id, turn_id, &declared)
+        {
+            warn!("filesnap: could not persist the declared set: {err}");
         }
     }
 

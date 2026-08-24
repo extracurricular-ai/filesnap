@@ -11,9 +11,12 @@
 //! by the protection predicate (the symmetric ignore rule) are untouched in
 //! both directions.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use crate::blob::BlobStore;
 use crate::error::Result;
@@ -122,6 +125,7 @@ pub struct ApplyStats {
 /// and decides.
 pub fn apply_plan(blobs: &BlobStore, plan: &RestorePlan) -> ApplyStats {
     let mut stats = ApplyStats::default();
+    sweep_residue(plan);
     for write in &plan.writes {
         let path = PathBuf::from(&write.path);
         match write_one(blobs, write, &path) {
@@ -159,13 +163,73 @@ fn write_one(blobs: &BlobStore, write: &WriteAction, path: &Path) -> Result<()> 
     fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))
 }
 
-/// Sibling name a restore writes to before renaming into place. It lands in
-/// the user's own directory, so it is named after this tool rather than
-/// after whatever host embeds it.
+/// Suffix of the sibling a restore writes before renaming into place.
+///
+/// It lands in the user's own directory, so it is named after this tool
+/// rather than after whatever host embeds it — someone who finds one in their
+/// project should be able to tell where it came from.
+pub const RESTORE_TMP_SUFFIX: &str = ".filesnap-restore-tmp";
+
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".filesnap-restore-tmp");
+    name.push(RESTORE_TMP_SUFFIX);
     path.with_file_name(name)
+}
+
+/// How long a stray temp file is left alone before a restore clears it.
+///
+/// Required, not caution: another restore may be holding one right now, and
+/// unlinking it mid-write would make that restore fail for no reason.
+const RESIDUE_GRACE: Duration = Duration::from_secs(300);
+
+/// Clear this restore's own leavings from the directories it is about to
+/// touch, before it touches them.
+///
+/// A write is temp-file-then-rename, so a process killed between the two
+/// leaves a stray in the *user's project* — somewhere store collection can
+/// never reach, because it knows the store and not the workspace. Sweeping
+/// here is the self-healing half of D21; `doctor` (via [`residue_in`]) is the
+/// half that reaches a workspace nothing restores into again.
+///
+/// Failures are ignored throughout. Residue is a tidiness matter and must
+/// never be the reason a restore does not happen.
+fn sweep_residue(plan: &RestorePlan) {
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    for write in &plan.writes {
+        let Some(parent) = Path::new(&write.path).parent() else {
+            continue;
+        };
+        if !seen.insert(parent.to_path_buf()) {
+            continue;
+        }
+        for stray in residue_in(parent) {
+            let _ = fs::remove_file(stray);
+        }
+    }
+}
+
+/// Stray restore temporaries in `dir` that are old enough to be nobody's.
+///
+/// The inspectable half of D21: a caller walks a workspace with this and
+/// reports, or removes, what it finds.
+pub fn residue_in(dir: &Path) -> Vec<PathBuf> {
+    let cutoff = SystemTime::now()
+        .checked_sub(RESIDUE_GRACE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(RESTORE_TMP_SUFFIX))
+                && fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|written| written <= cutoff)
+        })
+        .collect()
 }
 
 /// What `path` is set to right now, if it exists and the platform says.

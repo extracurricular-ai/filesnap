@@ -425,3 +425,71 @@ fn a_change_made_after_a_rewind_is_reported_as_a_conflict() {
         "a protected path is not a conflict, because an undo would not touch it"
     );
 }
+
+/// A declared path is still watched by a **new** tracker on the same session.
+///
+/// This is D25's whole point. The set used to live only in memory, so a
+/// session resuming in another process silently stopped watching everything
+/// it had edited — silently, because the manifests already written stayed
+/// perfectly valid. What was lost was future observation.
+#[test]
+fn a_declared_path_survives_the_process_that_declared_it() {
+    let fx = Fixture::new();
+    let outside = fx.path("declared-by-edit.txt");
+    std::fs::write(&outside, "one").unwrap();
+
+    fx.store()
+        .declare_paths(S, "turn-1", std::slice::from_ref(&outside))
+        .unwrap();
+
+    // A fresh handle is what a resumed session gets.
+    assert!(fx.store().declared_paths(S).unwrap().contains(&outside));
+}
+
+/// It is still in the safety scope after ageing out of the window.
+///
+/// The window governs what future captures *watch*, never what a restore may
+/// touch. A path missing from `tracked_paths` is one no plan can ever remove,
+/// so ageing out must not quietly make a file unremovable.
+#[test]
+fn a_path_past_the_window_is_still_in_the_safety_scope() {
+    let fx = Fixture::new();
+    let old = fx.path("edited-long-ago.txt");
+    let store = fx.store();
+    store
+        .declare_paths(S, "turn-0", std::slice::from_ref(&old))
+        .unwrap();
+    for i in 1..=crate::declared::DECLARED_WINDOW_TURNS {
+        store
+            .declare_paths(S, &format!("turn-{i}"), &[fx.path("recent.txt")])
+            .unwrap();
+    }
+
+    assert!(
+        !store.declared_paths(S).unwrap().contains(&old),
+        "no longer watched"
+    );
+    assert!(
+        store
+            .tracked_paths(S)
+            .unwrap()
+            .contains(&old.to_string_lossy().into_owned()),
+        "but still observed, so a restore can still act on it"
+    );
+}
+
+/// Deleting a session takes its declared set with it — a third file under a
+/// third lifetime, and one left behind keeps naming paths nothing owns.
+#[test]
+fn deleting_a_session_drops_its_declared_set() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+    let store = fx.store();
+    store
+        .declare_paths(S, "turn-1", &[fx.path("edited.txt")])
+        .unwrap();
+
+    store.delete_sessions(&[S.to_string()]);
+    assert_eq!(store.declared_paths(S).unwrap(), Default::default());
+}
