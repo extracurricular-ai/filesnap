@@ -27,8 +27,14 @@ use crate::restore::plan_restore;
 use crate::workspace;
 use crate::workspace::WorkspaceKey;
 
-/// Turn-id prefix used for the safety checkpoint recorded before a restore.
-pub const SAFETY_TURN_PREFIX: &str = "safety-restore:";
+/// Turn-id prefix for the safety checkpoint recorded before every restore.
+///
+/// Begins with the reserved character, so it lies in a namespace no caller can
+/// reach: [`WorkspaceStore::checkpoint`] and its siblings refuse an id
+/// starting with `_`. It used to be `safety-restore:`, which the old sanitizer
+/// mapped to `safety-restore_` — a name a user's own turn could hold exactly,
+/// putting a rewind and a safety capture in one record (D7).
+pub const SAFETY_TURN_PREFIX: &str = "_safety-restore-";
 
 /// The state a restore moves the workspace to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +157,22 @@ impl WorkspaceStore {
         turn_id: &str,
         files: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Checkpoint> {
+        crate::id::validate_external("session id", thread_id)?;
+        crate::id::validate_external("turn id", turn_id)?;
+        self.checkpoint_internal(thread_id, turn_id, files)
+    }
+
+    /// The capture itself, reachable with an id from the reserved namespace.
+    ///
+    /// Only one caller needs that: the safety checkpoint `restore_to` takes
+    /// before it writes, whose turn id is minted rather than supplied. Every
+    /// other route is the public one above, which refuses a reserved id.
+    fn checkpoint_internal(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        files: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Checkpoint> {
         let prev = self.latest_manifest(thread_id)?;
         let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref())?;
         self.refs
@@ -170,6 +192,7 @@ impl WorkspaceStore {
     /// Create the (empty) snapshot log for `session_id` if missing, marking
     /// the session as tracking for its whole lifetime.
     pub fn ensure_session(&self, session_id: &str) -> Result<()> {
+        crate::id::validate_external("session id", session_id)?;
         self.refs.ensure(session_id)
     }
 
@@ -192,6 +215,8 @@ impl WorkspaceStore {
         path_key: &str,
         image: &PreEditImage,
     ) -> Result<Option<String>> {
+        crate::id::validate_external("session id", session_id)?;
+        crate::id::validate_external("turn id", turn_id)?;
         let thread_id = session_id;
         let latest = self.latest_manifest(thread_id)?.unwrap_or_default();
         if latest.entries.contains_key(path_key) {
@@ -378,6 +403,9 @@ impl WorkspaceStore {
         new_thread_id: &str,
         through_turn_id: &str,
     ) -> Result<usize> {
+        crate::id::validate_external("session id", source_thread_id)?;
+        crate::id::validate_external("session id", new_thread_id)?;
+        crate::id::validate_external("turn id", through_turn_id)?;
         let log = self.refs.load(source_thread_id)?;
         let Some(cut) = log
             .entries
@@ -468,7 +496,7 @@ impl WorkspaceStore {
             .into_iter()
             .chain(target_manifest.entries.keys().map(PathBuf::from))
             .chain(target_manifest.absent.iter().map(PathBuf::from));
-        let safety = self.checkpoint(
+        let safety = self.checkpoint_internal(
             thread_id,
             &format!("{SAFETY_TURN_PREFIX}{}", target.manifest_id),
             observed,
@@ -661,7 +689,7 @@ impl WorkspaceStore {
                 doomed_manifests.insert(record.safety_manifest_id);
             }
             for entry in &log.entries {
-                doomed_turns.insert(crate::refs::safe_file_name(&entry.turn_id));
+                doomed_turns.insert(crate::refs::turn_file_name(&entry.turn_id));
                 doomed_manifests.insert(entry.manifest_id.clone());
             }
 

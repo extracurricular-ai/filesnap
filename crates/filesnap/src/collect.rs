@@ -83,7 +83,14 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
     // its blobs before its manifest, so a blob written moments ago may belong
     // to a manifest that has not landed yet.
     for hash in blobs.hashes()? {
-        if live_blobs.contains(&hash) || !crate::sweep::settled(&blobs.path_for(&hash)) {
+        // Unprovable age keeps it, and so does an id we cannot even build a
+        // path for: a sweep removes only what it can show is both unreachable
+        // and settled.
+        if live_blobs.contains(&hash)
+            || !blobs
+                .path_for(&hash)
+                .is_ok_and(|p| crate::sweep::settled(&p))
+        {
             stats.blobs_kept += 1;
         } else {
             blobs.remove(&hash)?;

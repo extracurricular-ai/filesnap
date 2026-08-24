@@ -36,7 +36,7 @@ impl BlobStore {
     /// rename) and idempotent: existing blobs are never rewritten.
     pub fn store_bytes(&self, content: &[u8]) -> Result<String> {
         let hash = Self::hash_bytes(content);
-        let path = self.blob_path(&hash);
+        let path = self.blob_path(&hash)?;
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
@@ -62,11 +62,11 @@ impl BlobStore {
     }
 
     pub fn contains(&self, hash: &str) -> bool {
-        self.blob_path(hash).exists()
+        self.blob_path(hash).is_ok_and(|p| p.exists())
     }
 
     pub fn load(&self, hash: &str) -> Result<Vec<u8>> {
-        let path = self.blob_path(hash);
+        let path = self.blob_path(hash)?;
         fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 SnapshotError::MissingBlob(hash.to_string())
@@ -77,12 +77,12 @@ impl BlobStore {
     }
 
     /// Where `hash` lives, so the sweep can ask how old it is.
-    pub(crate) fn path_for(&self, hash: &str) -> PathBuf {
+    pub(crate) fn path_for(&self, hash: &str) -> Result<PathBuf> {
         self.blob_path(hash)
     }
 
     pub fn remove(&self, hash: &str) -> Result<()> {
-        let path = self.blob_path(hash);
+        let path = self.blob_path(hash)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -104,18 +104,28 @@ impl BlobStore {
             for entry in entries {
                 let entry = entry.map_err(|e| SnapshotError::io(dir.path(), e))?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".tmp") {
+                let hash = format!("{prefix}{name}");
+                // Whitelist the shape we mint. A `.tmp` blacklist admits
+                // anything nobody thought to exclude (D9).
+                if !crate::id::is_object_name(&hash) {
                     continue;
                 }
-                out.insert(format!("{prefix}{name}"));
+                out.insert(hash);
             }
         }
         Ok(out)
     }
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        let (prefix, rest) = hash.split_at(2.min(hash.len()));
-        self.root.join(prefix).join(rest)
+    /// Where `hash`'s content lives, once proven to be a hash.
+    ///
+    /// The check is not ceremony: these ids are read back out of manifests
+    /// and handed to `remove`, and joining an absolute path discards
+    /// everything before it — a forged entry naming `/etc/passwd` resolved
+    /// exactly there (D5).
+    fn blob_path(&self, hash: &str) -> Result<PathBuf> {
+        crate::id::validate_object("blob id", hash)?;
+        let (prefix, rest) = hash.split_at(2);
+        Ok(self.root.join(prefix).join(rest))
     }
 }
 
@@ -160,9 +170,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::open(dir.path().join("blobs")).unwrap();
         assert!(matches!(
-            store.load("deadbeef"),
+            store.load(&"a".repeat(64)),
             Err(crate::error::SnapshotError::MissingBlob(_))
         ));
+    }
+
+    /// "Not a hash" and "a hash we do not hold" are different answers, and
+    /// the first is caught before a path is built from it — a hash read back
+    /// out of a corrupt record must not be able to aim `load` or `remove`
+    /// anywhere it likes (D5).
+    #[test]
+    fn a_malformed_hash_is_refused_rather_than_reported_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path().join("blobs")).unwrap();
+        for forged in ["deadbeef", "/etc/passwd", "../../etc/passwd", ""] {
+            assert!(
+                matches!(
+                    store.load(forged),
+                    Err(crate::error::SnapshotError::InvalidId { .. })
+                ),
+                "{forged:?}"
+            );
+            assert!(!store.contains(forged), "{forged:?}");
+        }
     }
 
     #[test]

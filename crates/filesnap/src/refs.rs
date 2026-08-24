@@ -99,6 +99,11 @@ impl SnapshotRef {
     }
 }
 
+/// What a turn's index entry is suffixed with, so the directory can be read
+/// by whitelist and `with_extension("tmp")` has an extension to replace
+/// rather than eating the id's own last dot (D5, D9).
+pub(crate) const TURN_SUFFIX: &str = ".turn";
+
 pub struct RefStore {
     root: PathBuf,
 }
@@ -121,7 +126,7 @@ impl RefStore {
         let mut log = self.load(thread_id)?;
         let entry = SnapshotRef::chained(turn_id, manifest_id, log.entries.last());
         log.entries.push(entry);
-        let path = self.log_path(thread_id);
+        let path = self.log_path(thread_id)?;
         let tmp = path.with_extension("tmp");
         let bytes = serde_json::to_vec_pretty(&log)?;
         fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
@@ -132,13 +137,13 @@ impl RefStore {
     /// Whether a log file exists for `thread_id`. With session-scoped
     /// binding, log existence *is* the persisted "tracking enabled" state.
     pub fn exists(&self, thread_id: &str) -> bool {
-        self.log_path(thread_id).exists()
+        self.log_path(thread_id).is_ok_and(|p| p.exists())
     }
 
     /// Create an empty log for `thread_id` if none exists — the durable
     /// marker that this session is tracking.
     pub fn ensure(&self, thread_id: &str) -> Result<()> {
-        let path = self.log_path(thread_id);
+        let path = self.log_path(thread_id)?;
         if path.exists() {
             return Ok(());
         }
@@ -151,7 +156,7 @@ impl RefStore {
 
     /// Load a thread's log; a thread with no snapshots yields an empty log.
     pub fn load(&self, thread_id: &str) -> Result<ThreadLog> {
-        let path = self.log_path(thread_id);
+        let path = self.log_path(thread_id)?;
         match fs::read(&path) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ThreadLog::default()),
@@ -161,7 +166,7 @@ impl RefStore {
 
     /// Drop a thread's refs (its snapshots become garbage for the next GC).
     pub fn remove(&self, thread_id: &str) -> Result<()> {
-        let path = self.log_path(thread_id);
+        let path = self.log_path(thread_id)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -194,20 +199,15 @@ impl RefStore {
         Ok(out)
     }
 
-    fn log_path(&self, thread_id: &str) -> PathBuf {
-        // Thread ids are UUID-like; anything else is defensively mapped to
-        // a filename-safe character set.
-        let safe: String = thread_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.root.join(format!("{safe}.json"))
+    /// Where `thread_id`'s log lives, once the id is proven able to be one.
+    ///
+    /// The id becomes the filename unchanged. It used to be character-mapped
+    /// here — and mapped a second time, differently, when the turn index was
+    /// built — so two spellings could land on one file and a sweep could
+    /// disagree with a writer about which record was which (D7).
+    fn log_path(&self, thread_id: &str) -> Result<PathBuf> {
+        crate::id::validate_stored("session id", thread_id)?;
+        Ok(self.root.join(format!("{thread_id}.json")))
     }
 }
 
@@ -301,12 +301,12 @@ impl TurnIndex {
     /// Record the snapshot captured at `turn_id`'s start. Later writes win:
     /// a supplemental pre-edit attach extends that turn's capture.
     pub fn set_turn(&self, turn_id: &str, manifest_id: &str) -> Result<()> {
-        let path = self.turn_path(turn_id);
+        let path = self.turn_path(turn_id)?;
         write_atomic(&path, manifest_id.as_bytes())
     }
 
     pub fn manifest_for_turn(&self, turn_id: &str) -> Result<Option<String>> {
-        let path = self.turn_path(turn_id);
+        let path = self.turn_path(turn_id)?;
         match fs::read_to_string(&path) {
             Ok(id) => Ok(Some(id.trim().to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -322,7 +322,10 @@ impl TurnIndex {
             fs::read_dir(&self.turns_root).map_err(|e| SnapshotError::io(&self.turns_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.turns_root, e))?;
-            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+            // Whitelist, not a `.tmp` blacklist: a blacklist admits anything
+            // nobody thought to exclude, which is how a half-written file
+            // became readable as a record (D9, C4).
+            if !entry.file_name().to_string_lossy().ends_with(TURN_SUFFIX) {
                 continue;
             }
             match fs::read_to_string(entry.path()) {
@@ -387,7 +390,7 @@ impl TurnIndex {
             let excess = log.entries.len() - MAX_RESTORE_HISTORY;
             log.entries.drain(..excess);
         }
-        let path = self.restore_path(thread_id);
+        let path = self.restore_path(thread_id)?;
         write_atomic(&path, &serde_json::to_vec_pretty(&log)?)
     }
 
@@ -404,7 +407,7 @@ impl TurnIndex {
         let mut log = self.restore_log(thread_id)?;
         let popped = log.entries.pop();
         if popped.is_some() {
-            let path = self.restore_path(thread_id);
+            let path = self.restore_path(thread_id)?;
             write_atomic(&path, &serde_json::to_vec_pretty(&log)?)?;
         }
         Ok(popped)
@@ -420,7 +423,7 @@ impl TurnIndex {
     /// conversation ends both — and leaving this behind would strand a GC
     /// root, pinning the manifests it names for good.
     pub fn remove_restores(&self, thread_id: &str) -> Result<()> {
-        let path = self.restore_path(thread_id);
+        let path = self.restore_path(thread_id)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -429,7 +432,7 @@ impl TurnIndex {
     }
 
     fn restore_log(&self, thread_id: &str) -> Result<RestoreLog> {
-        let path = self.restore_path(thread_id);
+        let path = self.restore_path(thread_id)?;
         match fs::read(&path) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RestoreLog::default()),
@@ -443,7 +446,7 @@ impl TurnIndex {
             .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+            if !entry.file_name().to_string_lossy().ends_with(".json") {
                 continue;
             }
             // An undo record that will not parse used to be skipped in
@@ -475,7 +478,7 @@ impl TurnIndex {
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.turns_root, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".tmp")
+            if !name.ends_with(TURN_SUFFIX)
                 || live_turn_ids.contains(&name)
                 || !crate::sweep::settled(&entry.path())
             {
@@ -486,13 +489,22 @@ impl TurnIndex {
         Ok(())
     }
 
-    fn turn_path(&self, turn_id: &str) -> PathBuf {
-        self.turns_root.join(safe_file_name(turn_id))
+    /// Where `turn_id`'s index entry lives.
+    ///
+    /// The `.turn` suffix is not decoration. Without an extension,
+    /// `write_atomic`'s `with_extension("tmp")` truncated at the last dot, so
+    /// `v1.2` and `v1.9` shared the temporary path `v1.tmp` — and dots in an
+    /// external conversation id are ordinary. Two concurrent writes could
+    /// leave one turn pointing at another turn's manifest. The suffix also
+    /// makes the whitelist D9 asks for possible here at all.
+    fn turn_path(&self, turn_id: &str) -> Result<PathBuf> {
+        crate::id::validate_stored("turn id", turn_id)?;
+        Ok(self.turns_root.join(format!("{turn_id}{TURN_SUFFIX}")))
     }
 
-    fn restore_path(&self, thread_id: &str) -> PathBuf {
-        self.restores_root
-            .join(format!("{}.json", safe_file_name(thread_id)))
+    fn restore_path(&self, thread_id: &str) -> Result<PathBuf> {
+        crate::id::validate_stored("session id", thread_id)?;
+        Ok(self.restores_root.join(format!("{thread_id}.json")))
     }
 }
 
@@ -504,16 +516,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Thread and turn ids are UUID-like; anything else is mapped to a
 /// filename-safe character set.
-pub(crate) fn safe_file_name(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// What a turn's index entry is named, given an id already proven storable.
+pub(crate) fn turn_file_name(turn_id: &str) -> String {
+    format!("{turn_id}{TURN_SUFFIX}")
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

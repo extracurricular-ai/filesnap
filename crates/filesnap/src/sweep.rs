@@ -113,7 +113,7 @@ fn roots_from_logs(refs: &RefStore) -> Result<(BTreeSet<String>, BTreeSet<String
     };
     for log in logs.logs {
         for entry in log.entries {
-            turn_files.insert(crate::refs::safe_file_name(&entry.turn_id));
+            turn_files.insert(crate::refs::turn_file_name(&entry.turn_id));
             manifests.insert(entry.manifest_id);
         }
     }
@@ -217,7 +217,7 @@ pub(crate) fn collect_partition(
     for id in manifests.ids()? {
         // A manifest too young to sweep is also too young to trust as dead:
         // the capture that is about to name it may not have landed yet.
-        if live_manifests.contains(&id) || !settled(&manifests.path_for(&id)) {
+        if live_manifests.contains(&id) || !manifests.path_for(&id).is_ok_and(|p| settled(&p)) {
             stats.manifests_kept += 1;
         } else {
             manifests.remove(&id)?;

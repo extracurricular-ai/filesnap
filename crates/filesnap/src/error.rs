@@ -37,6 +37,15 @@ pub enum SnapshotError {
         found: u32,
         supported: u32,
     },
+    /// An id cannot become a filename. Refused rather than rewritten: mapping
+    /// it onto something legal is what silently merges two distinct
+    /// conversations into one record (D7).
+    #[error("invalid {kind} {id:?}: {reason}")]
+    InvalidId {
+        kind: &'static str,
+        id: String,
+        reason: &'static str,
+    },
 }
 
 impl SnapshotError {

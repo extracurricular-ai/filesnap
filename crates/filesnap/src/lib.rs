@@ -20,6 +20,7 @@ mod controller;
 mod error;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixture;
+mod id;
 mod manifest;
 mod refs;
 mod restore;

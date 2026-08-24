@@ -158,7 +158,7 @@ impl ManifestStore {
     /// Persist `manifest`, returning its id. Idempotent.
     pub fn save(&self, manifest: &Manifest) -> Result<String> {
         let id = manifest.id()?;
-        let path = self.manifest_path(&id);
+        let path = self.manifest_path(&id)?;
         if !path.exists() {
             let tmp = path.with_extension("tmp");
             let bytes = serde_json::to_vec_pretty(manifest)?;
@@ -169,7 +169,7 @@ impl ManifestStore {
     }
 
     pub fn load(&self, id: &str) -> Result<Manifest> {
-        let path = self.manifest_path(id);
+        let path = self.manifest_path(id)?;
         let bytes = fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 SnapshotError::MissingManifest(id.to_string())
@@ -193,12 +193,12 @@ impl ManifestStore {
     }
 
     /// Where `id` lives, so the sweep can ask how old it is.
-    pub(crate) fn path_for(&self, id: &str) -> PathBuf {
+    pub(crate) fn path_for(&self, id: &str) -> Result<PathBuf> {
         self.manifest_path(id)
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
-        let path = self.manifest_path(id);
+        let path = self.manifest_path(id)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -213,15 +213,21 @@ impl ManifestStore {
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.root, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".json") {
+            if let Some(id) = name.strip_suffix(".json")
+                && crate::id::is_object_name(id)
+            {
                 out.insert(id.to_string());
             }
         }
         Ok(out)
     }
 
-    fn manifest_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.json"))
+    /// Where manifest `id` lives, once proven to be one. See
+    /// [`crate::blob::BlobStore`]'s equivalent for why an internally minted
+    /// id is still checked.
+    fn manifest_path(&self, id: &str) -> Result<PathBuf> {
+        crate::id::validate_object("manifest id", id)?;
+        Ok(self.root.join(format!("{id}.json")))
     }
 }
 
@@ -274,8 +280,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ManifestStore::open(dir.path().join("manifests")).unwrap();
         assert!(matches!(
-            store.load("nope"),
+            store.load(&"a".repeat(64)),
             Err(SnapshotError::MissingManifest(_))
+        ));
+    }
+
+    /// A manifest id that is not the shape we mint is refused before it
+    /// becomes a path. See the equivalent in `blob.rs`.
+    #[test]
+    fn a_malformed_manifest_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ManifestStore::open(dir.path().join("manifests")).unwrap();
+        assert!(matches!(
+            store.load("nope"),
+            Err(SnapshotError::InvalidId { .. })
         ));
     }
 

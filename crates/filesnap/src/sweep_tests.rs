@@ -95,7 +95,7 @@ fn a_prune_touches_nothing_the_doomed_sessions_did_not_name() {
     s.turns.set_turn("turn-live", &bystander_id).unwrap();
 
     // Delete reads what the doomed log named, then unlinks it.
-    let doomed_turns = BTreeSet::from([crate::refs::safe_file_name("turn-doomed")]);
+    let doomed_turns = BTreeSet::from([crate::refs::turn_file_name("turn-doomed")]);
     let doomed_manifests = BTreeSet::from([doomed_id]);
     s.refs.remove("doomed").unwrap();
 
@@ -136,7 +136,7 @@ fn a_prune_keeps_what_a_survivor_still_names() {
         &s.refs,
         &s.turns,
         &s.manifests,
-        &BTreeSet::from([crate::refs::safe_file_name("turn-a")]),
+        &BTreeSet::from([crate::refs::turn_file_name("turn-a")]),
         &BTreeSet::from([shared.clone()]),
     )
     .unwrap();
@@ -171,7 +171,7 @@ fn an_unreadable_log_defers_reclamation_rather_than_guessing() {
         &s.refs,
         &s.turns,
         &s.manifests,
-        &BTreeSet::from([crate::refs::safe_file_name("turn-a")]),
+        &BTreeSet::from([crate::refs::turn_file_name("turn-a")]),
         &BTreeSet::from([doomed_id]),
     )
     .unwrap();
@@ -198,8 +198,8 @@ fn collection_reclaims_the_orphan_a_prune_cannot_see() {
     let stats = collect_partition(&s.refs, &s.turns, &s.manifests).unwrap();
     assert_eq!(stats.manifests_removed, 0);
 
-    age_out(&s.manifests.path_for(&orphan));
-    age_out(&s.manifests.path_for(&live));
+    age_out(&s.manifests.path_for(&orphan).unwrap());
+    age_out(&s.manifests.path_for(&live).unwrap());
     let stats = collect_partition(&s.refs, &s.turns, &s.manifests).unwrap();
     assert_eq!((stats.manifests_kept, stats.manifests_removed), (1, 1));
     assert_eq!(ids(&s), BTreeSet::from([live]));
@@ -253,8 +253,8 @@ fn collection_drops_an_undo_record_whose_session_is_gone() {
 
     for p in [
         s.restore_path("vanished"),
-        s.manifests.path_for(&target),
-        s.manifests.path_for(&safety),
+        s.manifests.path_for(&target).unwrap(),
+        s.manifests.path_for(&safety).unwrap(),
     ] {
         age_out(&p);
     }
