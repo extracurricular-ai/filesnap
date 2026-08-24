@@ -749,6 +749,7 @@ fn a_capture_covers_every_configured_root() {
             HiddenFiles::Skip,
             filesnap::ScanLimits::default(),
         )
+        .files
         .into_iter()
         .collect::<Vec<_>>()
     };

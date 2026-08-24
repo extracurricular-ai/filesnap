@@ -89,42 +89,74 @@ pub fn plan_restore(target: &Manifest, current: &Manifest, rules: &Gitignore) ->
     plan
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// What an apply managed, and what it could not.
+///
+/// Not `Clone`/`PartialEq`: `SnapshotError` carries a `std::io::Error`, which
+/// is neither. Compare the counts and `failed.is_empty()` instead.
+#[derive(Debug, Default)]
 pub struct ApplyStats {
     pub written: usize,
     pub deleted: usize,
+    /// Each file fails on its own without stopping the rest. Empty on a
+    /// clean apply.
+    ///
+    /// **Collected is not shrugged off.** A restore with a non-empty `failed`
+    /// must not read as success anywhere — not in an exit code, not in
+    /// output. The peer review of competing implementations flags exactly
+    /// this failure: per-file errors gathered into a struct nobody prints.
+    pub failed: Vec<(PathBuf, SnapshotError)>,
 }
 
 /// Apply a plan: write blob contents (atomically, restoring permissions)
 /// and remove paths the target recorded as absent. Missing targets are fine.
-pub fn apply_plan(blobs: &BlobStore, plan: &RestorePlan) -> Result<ApplyStats> {
+///
+/// **Each file succeeds or fails on its own.** Propagating the first error
+/// stranded the other 499 and handed the caller a bare `Io` with no record of
+/// how far it got — and, because `RestoreOutcome` was built only on success,
+/// no way to reach the safety point. That is III.1's reversibility existing
+/// and being out of reach exactly when it is needed (C20).
+///
+/// **Nothing is rolled back automatically.** A rollback can itself fail,
+/// producing a third state the caller cannot observe. III.1 promises
+/// *reversible*, not *reversed for you*: the caller holds the safety target
+/// and decides.
+pub fn apply_plan(blobs: &BlobStore, plan: &RestorePlan) -> ApplyStats {
     let mut stats = ApplyStats::default();
     for write in &plan.writes {
         let path = PathBuf::from(&write.path);
-        let content = blobs.load(&write.hash)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
+        match write_one(blobs, write, &path) {
+            Ok(()) => stats.written += 1,
+            Err(err) => stats.failed.push((path, err)),
         }
-        let tmp = tmp_path(&path);
-        fs::write(&tmp, &content).map_err(|e| SnapshotError::io(&tmp, e))?;
-        // A write is a replace, so "leave the permissions alone" has to mean
-        // carrying the existing ones onto the replacement. Doing nothing
-        // would hand the file whatever the temporary got from the umask,
-        // which is a change made by omission — the same executable bit lost
-        // by a different route.
-        set_mode(&tmp, write.mode.or_else(|| current_mode(&path)))?;
-        fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
-        stats.written += 1;
     }
     for del in &plan.deletes {
         let path = PathBuf::from(del);
         match fs::remove_file(&path) {
             Ok(()) => stats.deleted += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(SnapshotError::io(&path, e)),
+            Err(e) => stats
+                .failed
+                .push((path.clone(), SnapshotError::io(&path, e))),
         }
     }
-    Ok(stats)
+    stats
+}
+
+/// One file, all of it or none of it.
+fn write_one(blobs: &BlobStore, write: &WriteAction, path: &Path) -> Result<()> {
+    let content = blobs.load(&write.hash)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
+    }
+    let tmp = tmp_path(path);
+    fs::write(&tmp, &content).map_err(|e| SnapshotError::io(&tmp, e))?;
+    // A write is a replace, so "leave the permissions alone" has to mean
+    // carrying the existing ones onto the replacement. Doing nothing would
+    // hand the file whatever the temporary got from the umask, which is a
+    // change made by omission — the same executable bit lost by a different
+    // route.
+    set_mode(&tmp, write.mode.or_else(|| current_mode(path)))?;
+    fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))
 }
 
 /// Sibling name a restore writes to before renaming into place. It lands in

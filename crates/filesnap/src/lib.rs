@@ -32,6 +32,7 @@ mod workspace;
 pub use blob::BlobStore;
 pub use checkpoint::Checkpoint;
 pub use checkpoint::CheckpointStats;
+pub use checkpoint::DROP_SAMPLE_LIMIT;
 pub use checkpoint::capture;
 pub use collect::collect_garbage;
 pub use controller::SessionStart;
@@ -52,12 +53,17 @@ pub use restore::RestorePlan;
 pub use restore::WriteAction;
 pub use restore::apply_plan;
 pub use restore::plan_restore;
+pub use scope::Drop;
+pub use scope::DropReason;
 pub use scope::HiddenFiles;
+pub use scope::Recent;
 pub use scope::SNAPSHOT_IGNORE_FILENAME;
+pub use scope::Scan;
 pub use scope::ScanLimits;
 pub use scope::find_workspace_root;
 pub use scope::git_tracked_files;
 pub use scope::is_ignored;
+pub use scope::scan_report;
 // D13: consumers name `Gitignore` in our signatures, so they get the type
 // from us rather than adding their own dependency on `ignore`.
 pub use ignore::gitignore::Gitignore;

@@ -8,6 +8,7 @@
 //! hashed, and stored.
 
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -60,8 +61,29 @@ pub struct CheckpointStats {
     pub reused: usize,
     /// Files read, hashed, and (if new) stored.
     pub hashed: usize,
-    /// Paths skipped: vanished mid-walk or not regular files.
-    pub skipped: usize,
+    /// How many paths the scan saw and did not store. Complete count.
+    pub dropped: usize,
+    /// A few of them, with reasons — enough to print after a turn.
+    ///
+    /// **Bounded on purpose.** This is what a CLI shows every turn ("3 files
+    /// were left out, e.g. data/dump.bin"), so it must have a length nobody
+    /// can be surprised by. The complete list is a separate question with a
+    /// separate reader, answered by [`crate::scan_report`], which re-scans
+    /// rather than reading anything stored here (D23).
+    pub sample: Vec<crate::scope::Drop>,
+}
+
+/// How many drops a per-turn report carries. Small: it is printed every turn,
+/// and the reader wants a hint, not an inventory.
+pub const DROP_SAMPLE_LIMIT: usize = 3;
+
+impl CheckpointStats {
+    fn drop_path(&mut self, path: &Path, reason: crate::scope::DropReason) {
+        self.dropped += 1;
+        if self.sample.len() < DROP_SAMPLE_LIMIT {
+            self.sample.push((path.to_path_buf(), reason));
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,13 +136,16 @@ fn capture_at(
                 continue;
             }
             Err(_) => {
-                stats.skipped += 1;
+                // Exists but could not be stat'ed. Deliberately *not*
+                // recorded as absent: a tombstone is the only licence a
+                // restore has to delete, and a failed read verifies nothing.
+                stats.drop_path(&path, crate::scope::DropReason::Unreadable);
                 continue;
             }
         };
         if !meta.is_file() {
             // Symlinks and other non-regular files are out of scope for v1.
-            stats.skipped += 1;
+            stats.drop_path(&path, crate::scope::DropReason::NotARegularFile);
             continue;
         }
         let key = path.to_string_lossy().into_owned();
@@ -140,7 +165,7 @@ fn capture_at(
         // Read once; hash and size derive from the same bytes so the
         // stored blob is always consistent with the manifest entry.
         let Ok(content) = fs::read(&path) else {
-            stats.skipped += 1;
+            stats.drop_path(&path, crate::scope::DropReason::Unreadable);
             continue;
         };
         let hash = blobs.store_bytes(&content)?;
@@ -425,7 +450,7 @@ mod tests {
         fs::set_permissions(&denied, fs::Permissions::from_mode(0o644)).unwrap();
 
         let cp = cp.unwrap();
-        assert_eq!(cp.stats.skipped, 2);
+        assert_eq!(cp.stats.dropped, 2);
         assert_eq!(cp.manifest.entries, Default::default());
         assert_eq!(
             cp.manifest.absent,

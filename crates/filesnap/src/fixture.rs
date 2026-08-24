@@ -183,6 +183,7 @@ impl Fixture {
             HiddenFiles::Skip,
             crate::ScanLimits::default(),
         )
+        .files
         .into_iter()
         .collect()
     }

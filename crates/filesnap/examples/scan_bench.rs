@@ -46,7 +46,7 @@ fn main() {
             &covered,
             filesnap::ScanLimits::default(),
         );
-        report("recent (residue)", &recent, t.elapsed());
+        report("recent (residue)", &recent.files, t.elapsed());
 
         let blind = filesnap::recent_files(
             p,
@@ -55,11 +55,11 @@ fn main() {
             &std::collections::BTreeSet::new(),
             filesnap::ScanLimits::default(),
         );
-        let wasted = blind.iter().filter(|f| covered.contains(*f)).count();
+        let wasted = blind.files.iter().filter(|f| covered.contains(*f)).count();
         println!(
             "  {:<16} {wasted:>7} of {} slots would go to files git already covers",
             "without it:",
-            blind.len()
+            blind.files.len()
         );
     }
 }

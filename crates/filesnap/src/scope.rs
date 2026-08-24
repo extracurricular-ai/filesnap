@@ -83,6 +83,35 @@ pub fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
     ignore.matched_path_or_any_parents(path, false).is_ignore()
 }
 
+/// Why a file the scan saw is not in the snapshot.
+///
+/// Three reasons, because they call for three different responses and were
+/// previously one bare `continue` and one undifferentiated counter. Over the
+/// size limit is a bound working as designed; unreadable is usually
+/// permissions and usually fixable; not-a-regular-file is out of scope for v1
+/// and always will be for some paths (D23, C8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DropReason {
+    /// Larger than [`ScanLimits::max_file_bytes`].
+    OverSizeLimit,
+    /// Present, but could not be read — permissions, most often.
+    Unreadable,
+    /// A symlink, socket, device: out of scope for v1.
+    NotARegularFile,
+}
+
+/// A file left out of the snapshot, and why.
+pub type Drop = (PathBuf, DropReason);
+
+/// What a scan picked up, and what it passed over.
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub files: BTreeSet<PathBuf>,
+    /// Complete for this scan. A capture bounds it before reporting; see
+    /// [`crate::CheckpointStats`].
+    pub dropped: Vec<Drop>,
+}
+
 /// What bounds the recency partition.
 ///
 /// A parameter with a correct default, not a setting. IV.4 forbids a bound
@@ -202,18 +231,22 @@ pub fn tracked_files(
     already_known: impl IntoIterator<Item = PathBuf>,
     hidden: HiddenFiles,
     limits: ScanLimits,
-) -> BTreeSet<PathBuf> {
+) -> Scan {
     let ignores: Vec<Gitignore> = roots.iter().map(|root| load_ignore(root)).collect();
 
-    let mut files: BTreeSet<PathBuf> = already_known.into_iter().collect();
+    let mut scan = Scan {
+        files: already_known.into_iter().collect(),
+        dropped: Vec::new(),
+    };
     for (root, ignore) in roots.iter().zip(&ignores) {
-        files.extend(git_tracked_files(root, ignore));
+        scan.files.extend(git_tracked_files(root, ignore));
     }
     for (root, ignore) in roots.iter().zip(&ignores) {
-        let picked = recent_files(root, ignore, hidden, &files, limits);
-        files.extend(picked);
+        let picked = recent_files(root, ignore, hidden, &scan.files, limits);
+        scan.files.extend(picked.files);
+        scan.dropped.extend(picked.dropped);
     }
-    files
+    scan
 }
 
 /// Files the project's own index lists that lie under `root`.
@@ -317,7 +350,7 @@ pub fn recent_files(
     hidden: HiddenFiles,
     covered: &BTreeSet<PathBuf>,
     limits: ScanLimits,
-) -> Vec<PathBuf> {
+) -> Recent {
     let walker = WalkBuilder::new(dir)
         .standard_filters(false)
         .hidden(hidden == HiddenFiles::Skip)
@@ -329,6 +362,7 @@ pub fn recent_files(
         .build();
 
     let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut dropped: Vec<Drop> = Vec::new();
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -338,19 +372,55 @@ pub fn recent_files(
             continue;
         }
         let Ok(meta) = fs::metadata(&path) else {
+            dropped.push((path, DropReason::Unreadable));
             continue;
         };
         if meta.len() > limits.max_file_bytes {
+            // The one IV.3 most wants named: a bound silently dropping a file
+            // the user would expect back reads as data loss (C8).
+            dropped.push((path, DropReason::OverSizeLimit));
             continue;
         }
         let Ok(modified) = meta.modified() else {
+            dropped.push((path, DropReason::Unreadable));
             continue;
         };
         candidates.push((modified, path));
     }
     candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    // Past the budget is not a drop worth naming: those files are ordinary
+    // and simply lost a ranking. What IV.3 is about is a file excluded for a
+    // reason the user cannot see.
     candidates.truncate(limits.max_files);
-    candidates.into_iter().map(|(_, path)| path).collect()
+    Recent {
+        files: candidates.into_iter().map(|(_, path)| path).collect(),
+        dropped,
+    }
+}
+
+/// What one root's recency pass picked up, and what it passed over.
+#[derive(Debug, Default)]
+pub struct Recent {
+    pub files: Vec<PathBuf>,
+    pub dropped: Vec<Drop>,
+}
+
+/// Everything in `roots` the scan would leave out of a snapshot, with reasons.
+///
+/// The diagnostic half of D23 — *what in my project is not protected?* — where
+/// [`crate::CheckpointStats`] is the per-turn half. Two readers, two reports:
+/// one is printed every turn and must be short, this one is asked for and must
+/// be complete.
+///
+/// **Re-scans rather than reading anything a capture stored.** Nothing is
+/// persisted, and the answer is about the project as it stands now rather than
+/// as it stood at some past turn — which is the question someone asking it
+/// actually has.
+pub fn scan_report(roots: &[PathBuf], hidden: HiddenFiles, limits: ScanLimits) -> Vec<Drop> {
+    let mut dropped = tracked_files(roots, [], hidden, limits).dropped;
+    dropped.sort();
+    dropped.dedup();
+    dropped
 }
 
 #[cfg(test)]
@@ -446,6 +516,7 @@ mod tests {
                 &BTreeSet::new(),
                 ScanLimits::default(),
             )
+            .files
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
             .collect();
@@ -500,17 +571,78 @@ mod tests {
         );
 
         assert_eq!(
-            picked.len(),
+            picked.files.len(),
             ScanLimits::default().max_files,
             "count is capped"
         );
         assert!(
-            !picked.iter().any(|p| p.ends_with("artifact.o")),
+            !picked.files.iter().any(|p| p.ends_with("artifact.o")),
             "churn directories are never descended into"
         );
         assert!(
-            !picked.iter().any(|p| p.ends_with("huge.bin")),
+            !picked.files.iter().any(|p| p.ends_with("huge.bin")),
             "oversized files are left out however recent"
+        );
+
+        // And the one left out for a reason is *named*. A bound that silently
+        // drops a file the user expects back reads as data loss; a bound that
+        // says which file is a bound (IV.3, D23).
+        assert!(
+            picked
+                .dropped
+                .iter()
+                .any(|(p, why)| p.ends_with("huge.bin") && *why == DropReason::OverSizeLimit),
+            "{:?}",
+            picked.dropped
+        );
+        assert!(
+            !picked
+                .dropped
+                .iter()
+                .any(|(p, _)| p.ends_with("artifact.o")),
+            "an ignored path is not a drop — nothing was left out against the user's wishes"
+        );
+    }
+
+    /// The diagnostic half of D23: complete, asked for rather than printed,
+    /// and about the project as it stands now.
+    #[test]
+    fn the_report_names_every_file_the_scan_would_leave_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("ordinary.rs"), "kept");
+        std::fs::write(
+            root.join("huge.bin"),
+            vec![0u8; (ScanLimits::default().max_file_bytes + 1) as usize],
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("also-huge.bin"),
+            vec![0u8; (ScanLimits::default().max_file_bytes + 1) as usize],
+        )
+        .unwrap();
+
+        let report = scan_report(
+            &[root.to_path_buf()],
+            HiddenFiles::Skip,
+            ScanLimits::default(),
+        );
+
+        // Complete — both, not a sample. That is the whole difference from
+        // what a capture reports per turn.
+        let names: Vec<String> = report
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["also-huge.bin", "huge.bin"]);
+        assert!(
+            report
+                .iter()
+                .all(|(_, why)| *why == DropReason::OverSizeLimit)
+        );
+        assert!(
+            !names.iter().any(|n| n == "ordinary.rs"),
+            "a file that made it in is not a drop"
         );
     }
 
@@ -544,7 +676,7 @@ mod tests {
         );
 
         assert_eq!(
-            picked,
+            picked.files,
             vec![root.join("stray.txt")],
             "the one uncovered file wins, however old"
         );

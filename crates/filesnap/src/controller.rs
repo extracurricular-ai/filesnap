@@ -167,14 +167,25 @@ impl SnapshotTracker {
         // most of what is on disk is build output, which is both the bulk of
         // the cost and the least worth keeping.
         let extras: Vec<PathBuf> = self.lock_state().extras.iter().cloned().collect();
-        let files = tracked_files(&roots, extras, self.hidden, self.limits);
-        let checkpoint = self.store.checkpoint(&self.session_id, turn_id, files)?;
+        let scan = tracked_files(&roots, extras, self.hidden, self.limits);
+        // What the *scan* passed over is a drop too, and the capture cannot
+        // see it: an over-size file never reaches the manifest at all.
+        let scan_dropped = scan.dropped;
+        let mut checkpoint = self
+            .store
+            .checkpoint(&self.session_id, turn_id, scan.files)?;
+        for drop in scan_dropped {
+            checkpoint.stats.dropped += 1;
+            if checkpoint.stats.sample.len() < crate::checkpoint::DROP_SAMPLE_LIMIT {
+                checkpoint.stats.sample.push(drop);
+            }
+        }
         info!(
-            "filesnap: turn {turn_id} checkpoint {} ({} reused, {} hashed, {} skipped)",
+            "filesnap: turn {turn_id} checkpoint {} ({} reused, {} hashed, {} dropped)",
             checkpoint.id,
             checkpoint.stats.reused,
             checkpoint.stats.hashed,
-            checkpoint.stats.skipped,
+            checkpoint.stats.dropped,
         );
         Ok(())
     }

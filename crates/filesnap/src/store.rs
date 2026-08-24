@@ -505,7 +505,7 @@ impl WorkspaceStore {
         // workspace is and where it is going.
         let current = self.manifests.load(&safety.id)?;
         let plan = plan_restore(&target_manifest, &current, rules);
-        let stats = apply_plan(&self.blobs, &plan)?;
+        let stats = apply_plan(&self.blobs, &plan);
 
         // The undo record is filed under the session this hands the workspace
         // to. A rewind names the branch it creates; an undo names itself,
