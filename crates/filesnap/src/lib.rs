@@ -46,6 +46,7 @@ mod restore;
 mod scope;
 mod store;
 mod sweep;
+mod turn;
 mod workspace;
 
 pub use blob::BlobStore;
@@ -86,6 +87,10 @@ pub use scope::find_workspace_root;
 pub use scope::git_tracked_files;
 pub use scope::is_ignored;
 pub use scope::scan_report;
+pub use turn::DeclareOutcome;
+pub use turn::TurnScope;
+pub use turn::capture_turn;
+pub use turn::declare_edits;
 // D13: consumers name `Gitignore` in our signatures, so they get the type
 // from us rather than adding their own dependency on `ignore`.
 pub use ignore::gitignore::Gitignore;

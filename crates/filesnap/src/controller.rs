@@ -13,20 +13,17 @@
 //! - Capture failures degrade to "no snapshot for this turn" — they are
 //!   logged and never fail the turn.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use crate::error::Result;
 use crate::scope::HiddenFiles;
 use crate::scope::ScanLimits;
-use crate::scope::is_ignored;
-use crate::scope::load_ignore;
-use crate::scope::tracked_files;
 use crate::store::PreEditImage;
 use crate::store::WorkspaceStore;
+use crate::turn::TurnScope;
+use crate::turn::capture_turn;
+use crate::turn::declare_edits;
 use tracing::info;
 use tracing::warn;
 
@@ -44,43 +41,23 @@ pub enum SessionStart {
     Resumed,
 }
 
+/// A session's tracking decision plus the scope it captures at.
+///
+/// **Holds no mutable state.** It used to carry a mutex over an `extras` cache
+/// and an `ignore_root`; D38 moved the work to [`crate::turn`] and both are
+/// gone — the declared set is persisted (D25) and the ignore root is derived
+/// from the scope each call carries. What remains is a convenience for an
+/// embedder that wants the tracking decision made once: the CLI and any other
+/// caller reach the same functions directly.
 pub struct SnapshotTracker {
     store: WorkspaceStore,
     session_id: String,
-    hidden: HiddenFiles,
     /// Carried rather than read at each scan so one session's bound cannot
     /// change under it mid-conversation (D14).
+    hidden: HiddenFiles,
     limits: ScanLimits,
-    /// The directory this session is bound to (D4), and the fallback the
-    /// ignore filter uses before any capture has run — see `ignore_root`.
+    /// The directory this session is bound to (D4).
     workspace: PathBuf,
-    state: Mutex<TrackState>,
-}
-
-#[derive(Default)]
-struct TrackState {
-    /// Agent-edited paths registered via pre-edit attach, unioned into every
-    /// checkpoint scan so post-edit states keep being observed.
-    ///
-    /// A **fallback** for when the persisted set cannot be read, not a second
-    /// source of truth. The store holds the real one and is the only thing
-    /// that applies the turn window; unioning this in as well would keep an
-    /// aged-out path alive for the rest of the process (D25).
-    extras: BTreeSet<PathBuf>,
-    /// Directory whose ignore rules scope this session's captures: the
-    /// workspace root when one was found, else the invocation directory.
-    /// Recorded by the turn-start checkpoint.
-    ///
-    /// `None` until then, which used to mean the edit hook's filter matched
-    /// nothing at all — `None.is_some_and(..)` is `false`. The ordering that
-    /// saved it ("the turn-start checkpoint always precedes tool execution")
-    /// was a promise about a caller in another crate, with nothing here to
-    /// enforce it, and the cost of it not holding is an ignored file — a
-    /// `.env`, a key — entering the blob store and then being kept by every
-    /// later capture, since the path is registered as an extra. II.3 requires
-    /// the rule to hold from the first operation, so the session's bound
-    /// directory is the fallback (C6).
-    ignore_root: Option<PathBuf>,
 }
 
 impl SnapshotTracker {
@@ -130,8 +107,21 @@ impl SnapshotTracker {
             hidden,
             limits,
             workspace: workspace.to_path_buf(),
-            state: Mutex::new(TrackState::default()),
         }))
+    }
+
+    /// The scope a turn in `cwd` captures at, with this session's settings.
+    fn scope(&self, cwd: &Path, workspace_roots: &[PathBuf]) -> TurnScope {
+        TurnScope {
+            cwd: cwd.to_path_buf(),
+            roots: if workspace_roots.is_empty() {
+                vec![self.workspace.clone()]
+            } else {
+                workspace_roots.to_vec()
+            },
+            hidden: self.hidden,
+            limits: self.limits,
+        }
     }
 
     /// Capture the turn-start checkpoint.
@@ -139,150 +129,37 @@ impl SnapshotTracker {
     /// Stat-walks the tracked set and hashes what changed, so this can take
     /// hundreds of milliseconds on a large project — call it off an async
     /// runtime's reactor thread.
+    ///
+    /// A failure degrades to "no snapshot for this turn": it is logged and
+    /// never fails the turn, because a host that cannot snapshot should still
+    /// be able to work.
     pub fn checkpoint_turn_start(&self, turn_id: &str, cwd: &Path, workspace_roots: &[PathBuf]) {
-        if let Err(err) = self.checkpoint_inner(turn_id, cwd, workspace_roots) {
+        let scope = self.scope(cwd, workspace_roots);
+        if let Err(err) = capture_turn(&self.store, &self.session_id, turn_id, &scope) {
             warn!("filesnap: turn-start checkpoint failed (turn {turn_id}): {err}");
         }
     }
 
-    fn checkpoint_inner(
-        &self,
-        turn_id: &str,
-        cwd: &Path,
-        workspace_roots: &[PathBuf],
-    ) -> Result<()> {
-        // The session's own workspace roots come first: they are what the
-        // user declared the workspace to be, and on a sandboxed host they are
-        // also where the agent is permitted to write, so scoping to them
-        // makes "whatever can be changed can be reverted" structural rather
-        // than coincidental. The marker walk-up is a guess about intent and
-        // only stands in when there is nothing to go on.
-        //
-        // Roots unrelated to the turn's cwd are dropped. A configured root can
-        // describe a different environment, or simply be stale, and scanning
-        // an unrelated tree is the over-capture failure this feature exists to
-        // avoid — a root that neither contains nor sits under the directory
-        // being worked in is not this session's workspace.
-        let related: Vec<PathBuf> = workspace_roots
-            .iter()
-            .filter(|root| cwd.starts_with(root) || root.starts_with(cwd))
-            .cloned()
-            .collect();
-        let roots: Vec<PathBuf> = if related.is_empty() {
-            vec![cwd.to_path_buf()]
-        } else {
-            related
-        };
-        // Whichever directory scoped this capture also scopes the ignore rules
-        // applied to edit-hook captures (see `attach_pre_edits`).
-        let primary = roots.first().cloned().unwrap_or_else(|| cwd.to_path_buf());
-        self.lock_state().ignore_root = Some(primary);
-
-        // Three partitions, unioned (see `scope`), plus what the agent has
-        // written this session — wherever it lives. Walking the subtree
-        // instead was unbounded by construction: on a repository of any age
-        // most of what is on disk is build output, which is both the bulk of
-        // the cost and the least worth keeping.
-        // The persisted set is the truth, and it is the only one that applies
-        // the window. Unioning the in-memory copy in as well defeated the
-        // bound in exactly the case D25 was written for — a long-lived
-        // process, where nothing ever pruned `extras`, so a path that had
-        // aged out was still re-stat'd by every capture for the rest of the
-        // session and the tracked set grew without limit. The window only
-        // took effect after a restart, which is the opposite of the point.
-        let extras: Vec<PathBuf> = match self.store.declared_paths(&self.session_id) {
-            Ok(declared) => declared.into_iter().collect(),
-            // Only now is the cache the best available answer.
-            Err(err) => {
-                warn!("filesnap: declared set unreadable, falling back to this process's: {err}");
-                self.lock_state().extras.iter().cloned().collect()
-            }
-        };
-        // Note the turn even when it declares nothing, so the window counts
-        // turns rather than "turns that declared something" — otherwise a
-        // session that declares once and then runs 500 edit-free turns ages
-        // nothing out at all.
-        if let Err(err) = self.store.note_turn(&self.session_id, turn_id) {
-            warn!("filesnap: could not record turn order for the declared set: {err}");
-        }
-        let scan = tracked_files(&roots, extras, self.hidden, self.limits);
-        // What the *scan* passed over is a drop too, and the capture cannot
-        // see it: an over-size file never reaches the manifest at all.
-        let scan_dropped = scan.dropped;
-        let mut checkpoint = self
-            .store
-            .checkpoint(&self.session_id, turn_id, scan.files)?;
-        for drop in scan_dropped {
-            checkpoint.stats.dropped += 1;
-            if checkpoint.stats.sample.len() < crate::checkpoint::DROP_SAMPLE_LIMIT {
-                checkpoint.stats.sample.push(drop);
-            }
-        }
-        info!(
-            "filesnap: turn {turn_id} checkpoint {} ({} reused, {} hashed, {} dropped)",
-            checkpoint.id,
-            checkpoint.stats.reused,
-            checkpoint.stats.hashed,
-            checkpoint.stats.dropped,
-        );
-        Ok(())
-    }
-
-    /// Record pre-edit images from an applied edit and register the paths
-    /// for future checkpoints. `pre_images` pairs each absolute path with
-    /// what it held before the edit.
+    /// Record pre-edit images from an applied edit and register the paths for
+    /// future checkpoints.
+    ///
+    /// Takes the scope rather than remembering one: `cwd` is what makes the
+    /// ignore rules resolvable, and a value derived per call cannot be absent
+    /// the way a remembered one was before the first capture (C6).
     ///
     /// Hashes and writes blobs — call it off an async runtime's reactor
     /// thread.
-    pub fn attach_pre_edits(&self, turn_id: &str, pre_images: Vec<(PathBuf, PreEditImage)>) {
-        // Symmetric ignore: a path the user excluded from snapshots must not
-        // enter the store through the edit hook either. Without this, editing
-        // an ignored file would both store its pre-edit content and register
-        // the path as an extra, so every later checkpoint would capture it as
-        // well — bypassing the scan's own ignore filter. The rules are read
-        // fresh so the current ignore file governs.
-        // Never `None`: an unfiltered edit hook is how an ignored file gets
-        // into the store permanently (C6).
-        let root = self
-            .lock_state()
-            .ignore_root
-            .clone()
-            .unwrap_or_else(|| self.workspace.clone());
-        let ignore = load_ignore(&root);
-        let mut declared = Vec::new();
-        for (path, image) in pre_images {
-            if is_ignored(&ignore, &path) {
-                continue;
-            }
-            // The edit-touched partition. Bounded by a rolling window of
-            // turns rather than by count, so its size follows what the agent
-            // is working on rather than everything it ever touched (D25).
-            self.lock_state().extras.insert(path.clone());
-            declared.push(path.clone());
-            let key = path.to_string_lossy().into_owned();
-            if let Err(err) = self
-                .store
-                .attach_pre_edit(&self.session_id, turn_id, &key, &image)
-            {
-                warn!("filesnap: pre-edit attach failed for {key}: {err}");
-            }
-        }
-        // Persisted last, and separately: a declaration that fails to land
-        // costs this session future *observation* of those paths, which is
-        // recoverable by editing them again. Letting it fail the attach above
-        // would cost the pre-edit images themselves, which is not.
-        if let Err(err) = self
-            .store
-            .declare_paths(&self.session_id, turn_id, &declared)
+    pub fn attach_pre_edits(
+        &self,
+        turn_id: &str,
+        cwd: &Path,
+        pre_images: Vec<(PathBuf, PreEditImage)>,
+    ) {
+        let scope = self.scope(cwd, &[]);
+        if let Err(err) = declare_edits(&self.store, &self.session_id, turn_id, &scope, pre_images)
         {
-            warn!("filesnap: could not persist the declared set: {err}");
+            warn!("filesnap: declare failed (turn {turn_id}): {err}");
         }
-    }
-
-    fn lock_state(&self) -> std::sync::MutexGuard<'_, TrackState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -429,6 +306,7 @@ mod tests {
         let workflow = ws.path().join(".github/workflows/ci.yml");
         ctl.attach_pre_edits(
             "turn-1",
+            ws.path(),
             vec![(
                 workflow.clone(),
                 PreEditImage::Existed(b"on: push".to_vec()),
@@ -486,6 +364,7 @@ mod tests {
         let tracked = ws.path().join("src.rs");
         ctl.attach_pre_edits(
             "turn-1",
+            ws.path(),
             vec![
                 (secret.clone(), PreEditImage::Existed(b"private".to_vec())),
                 (tracked.clone(), PreEditImage::Existed(b"code".to_vec())),
@@ -522,6 +401,7 @@ mod tests {
         let outside = home.path().join("elsewhere.cfg");
         ctl2.attach_pre_edits(
             "turn-1",
+            ws.path(),
             vec![(outside.clone(), PreEditImage::Existed(b"pre".to_vec()))],
         );
         std::fs::write(&outside, "post").unwrap();
@@ -574,6 +454,7 @@ mod tests {
         // No checkpoint yet, so nothing has recorded an ignore root.
         tracker.attach_pre_edits(
             "turn-1",
+            ws.path(),
             vec![(
                 secret.clone(),
                 PreEditImage::Existed(b"TOKEN=hunter2".to_vec()),
@@ -621,6 +502,7 @@ mod tests {
         tracker.checkpoint_turn_start("turn-0", ws.path(), &[ws.path().to_path_buf()]);
         tracker.attach_pre_edits(
             "turn-0",
+            ws.path(),
             vec![(outside.clone(), PreEditImage::Existed(b"before".to_vec()))],
         );
 

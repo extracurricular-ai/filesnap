@@ -1,0 +1,30 @@
+[package]
+name = "filesnap-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface to filesnap: git-free file snapshots and rewind."
+repository = "https://github.com/extracurricular-ai/filesnap"
+keywords = ["snapshot", "rewind", "undo", "checkpoint", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine. A path *and* a version, so the workspace builds against the
+# local copy while a published `filesnap-cli` resolves the crates.io one.
+filesnap = { path = "../filesnap", version = "0.1.0" }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+
+# The crate is suffixed and the command is not, which is the ordinary Rust
+# arrangement — ripgrep produces `rg` the same way (D17).
+[[bin]]
+name = "filesnap"
+path = "src/main.rs"
