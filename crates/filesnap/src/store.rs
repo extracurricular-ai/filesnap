@@ -20,8 +20,6 @@ use crate::refs::RefStore;
 use crate::refs::RestoreRecord;
 use crate::refs::SnapshotRef;
 use crate::refs::TurnIndex;
-use crate::refs::collect_garbage_for;
-use crate::refs::collect_partition;
 use crate::restore::ApplyStats;
 use crate::restore::RestorePlan;
 use crate::restore::apply_plan;
@@ -518,16 +516,6 @@ impl WorkspaceStore {
         self.refs.remove(thread_id)
     }
 
-    /// Mark-and-sweep the manifests **this partition** no longer references.
-    ///
-    /// Content is deliberately not touched: whether a blob is still
-    /// referenced is a question about every workspace, so only
-    /// [`crate::collect_garbage`] can answer it. Delete reclaims records; the
-    /// collector reclaims content.
-    pub(crate) fn sweep_records(&self) -> Result<GcStats> {
-        collect_partition(&self.refs, &self.turns, &self.manifests, &self.blobs)
-    }
-
     /// Paths this thread has observed that `target` has no opinion about and
     /// that lie outside `roots` — so a restore to it will leave them exactly
     /// as they are, whatever the user expected.
@@ -562,18 +550,6 @@ impl WorkspaceStore {
             .collect();
         out.sort();
         Ok(out)
-    }
-
-    /// Sweep just the manifests named by threads that have been removed.
-    /// Unlike `gc`, this reclaims immediately — see `collect_garbage_for`.
-    pub fn gc_for(&self, doomed: &std::collections::BTreeSet<String>) -> Result<GcStats> {
-        collect_garbage_for(
-            &self.refs,
-            &self.turns,
-            &self.manifests,
-            &self.blobs,
-            doomed,
-        )
     }
 
     /// Also delete the undo records filed under `thread_id`, which
@@ -622,7 +598,18 @@ pub struct DeleteOutcome {
     pub reclaimed: GcStats,
     /// Sessions left **exactly as they were**, with why. Their records are
     /// intact and the call can be retried once the cause is addressed.
+    ///
+    /// Every pair here really is a session. The reclamation pass used to
+    /// report its own failure as a `"<sweep>"` entry, which made the list a
+    /// mix of two different things and gave that pseudo-session a name a real
+    /// one could collide with.
     pub refused: Vec<(String, SnapshotError)>,
+    /// Why reclamation did not run, if it did not.
+    ///
+    /// Independent of `refused`: the sessions are unreachable either way —
+    /// that is what delete promised and it is already done — and the bytes
+    /// simply wait for the next collection (VIII.3).
+    pub sweep_error: Option<SnapshotError>,
 }
 
 impl WorkspaceStore {
@@ -651,12 +638,31 @@ impl WorkspaceStore {
             return outcome;
         }
 
+        // What the doomed sessions named, gathered before their logs are
+        // unlinked — afterwards there is no way to learn it. This is also the
+        // whole of what the prune below is permitted to remove: delete
+        // enumerates nothing, so it can never reach a record belonging to a
+        // session it was not asked about (D10, C12).
+        let mut doomed_turns = std::collections::BTreeSet::new();
+        let mut doomed_manifests = std::collections::BTreeSet::new();
+
         for session_id in session_ids {
             // Read before removing anything: a session that cannot be read is
             // left whole rather than emptied of the evidence needed to retry.
-            if let Err(err) = self.refs.load(session_id) {
-                outcome.refused.push((session_id.clone(), err));
-                continue;
+            let log = match self.refs.load(session_id) {
+                Ok(log) => log,
+                Err(err) => {
+                    outcome.refused.push((session_id.clone(), err));
+                    continue;
+                }
+            };
+            if let Some(record) = self.turns.last_restore(session_id).ok().flatten() {
+                doomed_manifests.insert(record.target_manifest_id);
+                doomed_manifests.insert(record.safety_manifest_id);
+            }
+            for entry in &log.entries {
+                doomed_turns.insert(crate::refs::safe_file_name(&entry.turn_id));
+                doomed_manifests.insert(entry.manifest_id.clone());
             }
 
             // Undo records first, then the log. Interrupted between the two,
@@ -675,10 +681,20 @@ impl WorkspaceStore {
             }
         }
 
-        match self.sweep_records() {
+        match crate::sweep::prune_sessions(
+            &self.refs,
+            &self.turns,
+            &self.manifests,
+            &doomed_turns,
+            &doomed_manifests,
+        ) {
             Ok(stats) => outcome.reclaimed = stats,
-            Err(err) => outcome.refused.push(("<sweep>".to_string(), err)),
+            Err(err) => outcome.sweep_error = Some(err),
         }
         outcome
     }
 }
+
+#[cfg(test)]
+#[path = "store_tests.rs"]
+mod tests;

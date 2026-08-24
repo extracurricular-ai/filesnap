@@ -386,4 +386,51 @@ mod tests {
         let key = a.to_string_lossy().into_owned();
         assert_eq!(cp2.manifest.entries[&key].mode, Some(0o755));
     }
+
+    /// **A path that exists but cannot be read is skipped, never recorded as
+    /// absent.** Both routes to unreadable are checked, because both end at
+    /// the same `continue`.
+    ///
+    /// This is the dangerous direction. A tombstone is the *only* licence a
+    /// restore has to delete a file, so treating "I could not look" as "it
+    /// was not there" converts a permission error into a deletion — of a file
+    /// whose contents were, by construction, never stored. A capture records
+    /// what it verified, and a failed read verifies nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_read_is_skipped_rather_than_declared_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = fixture();
+
+        // Route 1: the file itself denies reading, so `fs::read` fails after
+        // a successful stat.
+        let denied = f.ws.join("denied.txt");
+        fs::write(&denied, b"secret").unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Route 2: the parent denies traversal, so even the stat fails —
+        // with a plain error rather than `NotFound`.
+        let locked = f.ws.join("locked");
+        fs::create_dir(&locked).unwrap();
+        let inside = locked.join("a.txt");
+        fs::write(&inside, b"also secret").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let cp = capture(&f.blobs, &f.manifests, vec![denied.clone(), inside], None);
+
+        // Reopen before asserting: a panic must not leave the temp directory
+        // undeletable.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&denied, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let cp = cp.unwrap();
+        assert_eq!(cp.stats.skipped, 2);
+        assert_eq!(cp.manifest.entries, Default::default());
+        assert_eq!(
+            cp.manifest.absent,
+            Default::default(),
+            "a read that failed is not evidence the file was gone"
+        );
+    }
 }

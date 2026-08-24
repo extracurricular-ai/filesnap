@@ -1,0 +1,425 @@
+//! Unit tests for the facade, concentrating on branches an end-to-end
+//! narrative never reaches — because a scenario that reaches a failure branch
+//! is a scenario that failed, and nobody writes those as a story.
+//!
+//! This module exists because `store.rs` had 645 lines and no tests at all,
+//! and the defect audit found five of its problems here. It is a child module
+//! of `store`, so it can reach the partition path directly to corrupt a
+//! record. That is deliberate and is the reason these are not integration
+//! tests: `Fixture` refuses to know the layout, and proving what happens to a
+//! damaged record means writing one.
+
+#![allow(clippy::unwrap_used)]
+
+use super::*;
+use crate::fixture::Fixture;
+use pretty_assertions::assert_eq;
+
+const S: &str = "session-1";
+
+/// Where a session's log lives. Only a test that must damage one needs this.
+fn log_path(store: &WorkspaceStore, session: &str) -> PathBuf {
+    store.partition.join("refs").join(format!("{session}.json"))
+}
+
+/// A session whose log cannot be read is left **exactly as it was**, and one
+/// such session does not stop the others from being deleted.
+///
+/// The tempting alternative is to swallow the read error and remove the log
+/// anyway. Nothing then enters the doomed set, so nothing is reclaimed — and
+/// the only record of what the session held is gone, so the call cannot even
+/// be retried. A delete that reports success having done neither thing is
+/// worse than one that says it could not.
+///
+/// Reclamation is the part that does stop. See the test below.
+#[test]
+fn a_session_whose_log_cannot_be_read_is_refused_not_half_deleted() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+    fx.capture("healthy", "turn-2");
+
+    let store = fx.store();
+    let log = log_path(&store, S);
+    // Truncated mid-write is what this looks like in the wild.
+    std::fs::write(&log, b"{\"version\":1,\"entr").unwrap();
+
+    let outcome = store.delete_sessions(&[S.to_string(), "healthy".to_string()]);
+
+    assert!(
+        outcome.refused.iter().any(|(id, _)| id == S),
+        "{:?}",
+        outcome.refused
+    );
+    assert!(log.exists(), "the refused session keeps its records");
+    assert!(
+        !store.session_exists("healthy"),
+        "one unreadable session does not block deleting the others"
+    );
+}
+
+/// An unreadable log defers **reclamation** without failing the deletion, and
+/// without guessing that anything is dead.
+///
+/// Liveness is computed by reading every log there is. Skipping one that will
+/// not parse would leave its manifests looking unreferenced, and the prune
+/// would remove them — converting a damaged log into snapshots that are
+/// actually gone, for a session nobody asked to delete. So an incomplete
+/// answer licenses no removal at all.
+///
+/// It is not an error either. Unreachability is what delete promised and it
+/// is already done; reclamation was never part of its success criterion
+/// (VIII.3), so the bytes simply wait for the next collection.
+#[test]
+fn an_unreadable_log_defers_reclamation_without_failing_the_delete() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+    fx.capture("healthy", "turn-2");
+
+    let store = fx.store();
+    std::fs::write(log_path(&store, S), b"not json at all").unwrap();
+
+    let outcome = store.delete_sessions(&["healthy".to_string()]);
+
+    assert!(!store.session_exists("healthy"), "the promise it can keep");
+    assert_eq!(outcome.reclaimed.manifests_removed, 0);
+    assert!(
+        outcome.sweep_error.is_none(),
+        "deferring is not failing — delete has no preconditions (D9): {:?}",
+        outcome.sweep_error
+    );
+    assert!(outcome.refused.is_empty());
+}
+
+/// Deleting takes the undo record as well as the log.
+///
+/// They are two files with two lifetimes: a session's log is what it
+/// captured, its restore log is what was handed *to* it. Leaving the second
+/// behind strands a GC root, because the sweep reads every file under
+/// `restores/` without asking whether the session named still exists.
+#[test]
+fn deleting_takes_the_undo_record_with_the_log() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+
+    let store = fx.store();
+    let target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            S,
+            &target,
+            RestoreKind::Rewind { undo_for: Some(S) },
+            fx.restore_scope(S),
+            &|_| false,
+        )
+        .unwrap();
+    assert!(store.last_restore_target(S).unwrap().is_some());
+
+    store.delete_sessions(&[S.to_string()]);
+
+    assert!(!store.session_exists(S));
+    assert_eq!(
+        store.last_restore_target(S).unwrap(),
+        None,
+        "the undo record goes too, or it pins its manifests as a root for good"
+    );
+}
+
+#[test]
+fn an_empty_delete_touches_nothing() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+
+    let outcome = fx.store().delete_sessions(&[]);
+
+    assert_eq!(outcome.reclaimed, GcStats::default());
+    assert!(outcome.refused.is_empty());
+    assert!(fx.store().session_exists(S));
+}
+
+/// The undo stack drops its **oldest** records when full.
+///
+/// Draining the wrong end is invisible in every ordinary scenario: fewer
+/// rewinds than the cap and the two behave identically. Past the cap the
+/// wrong end makes the next undo reverse the *first* rewind rather than the
+/// most recent, discarding every state in between while reporting success.
+#[test]
+fn a_full_undo_stack_forgets_the_oldest_rewind_not_the_newest() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "v0");
+    let store = fx.store();
+    fx.capture(S, "turn-0");
+    let origin = store.target_for_turn("turn-0").unwrap().unwrap();
+
+    // Each pass leaves a distinct state and rewinds it away, so the undo
+    // record pushed on pass i is the only route back to "v{i}".
+    let passes = crate::refs::MAX_RESTORE_HISTORY + 3;
+    for i in 1..=passes {
+        fx.write("a.txt", format!("v{i}"));
+        store
+            .restore_to(
+                S,
+                &origin,
+                RestoreKind::Rewind { undo_for: Some(S) },
+                fx.restore_scope(S),
+                &|_| false,
+            )
+            .unwrap();
+    }
+    assert_eq!(fx.read("a.txt"), "v0");
+
+    // Undoing returns to the state the newest rewind replaced.
+    let undo = store.last_restore_target(S).unwrap().unwrap();
+    store
+        .restore_to(
+            S,
+            &undo,
+            RestoreKind::Undo { spending: S },
+            fx.restore_scope(S),
+            &|_| false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fx.read("a.txt"),
+        format!("v{passes}"),
+        "the record on top is the newest rewind's, not one from beyond the cut"
+    );
+}
+
+/// A turn resolves to the *last* thing written for it, so a supplemental
+/// pre-edit attach becomes the state that turn restores to.
+#[test]
+fn a_turn_resolves_to_its_most_complete_capture() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    let first = fx.capture(S, "turn-1");
+
+    // A path the scan never covered, because it did not exist when the scan
+    // ran. The edit hook extends the same turn with it.
+    let late = fx.write("late.txt", "pre");
+    let supplemental = fx
+        .store()
+        .attach_pre_edit(
+            S,
+            "turn-1",
+            &late.to_string_lossy(),
+            &PreEditImage::Existed(b"pre".to_vec()),
+        )
+        .unwrap()
+        .expect("a path outside the scan attaches");
+
+    assert_ne!(supplemental, first.id);
+    assert_eq!(
+        fx.store()
+            .target_for_turn("turn-1")
+            .unwrap()
+            .unwrap()
+            .manifest_id(),
+        supplemental,
+        "the turn resolves to the extended capture, not the original"
+    );
+}
+
+#[test]
+fn an_unknown_turn_resolves_to_nothing() {
+    let fx = Fixture::new();
+    assert_eq!(fx.store().target_for_turn("never-happened").unwrap(), None);
+}
+
+/// `attach_pre_edit` returning `Ok(None)` is an ordinary outcome, not a
+/// failure: the scan already covered this path, so there is nothing to add.
+#[test]
+fn attaching_a_path_the_scan_already_covered_adds_nothing() {
+    let fx = Fixture::new();
+    let a = fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+
+    assert_eq!(
+        fx.store()
+            .attach_pre_edit(
+                S,
+                "turn-1",
+                &a.to_string_lossy(),
+                &PreEditImage::Existed(b"one".to_vec()),
+            )
+            .unwrap(),
+        None
+    );
+}
+
+/// A path the turn created is tombstoned once, and the tombstone is what
+/// licenses a rewind to remove it again.
+#[test]
+fn a_created_path_is_tombstoned_once() {
+    let fx = Fixture::new();
+    let store = fx.store();
+    let born = fx.path("born.txt");
+    let key = born.to_string_lossy().into_owned();
+
+    let id = store
+        .attach_pre_edit(S, "turn-1", &key, &PreEditImage::DidNotExist)
+        .unwrap()
+        .expect("a created path records that it did not exist");
+    assert!(store.manifest(&id).unwrap().absent.contains(&key));
+
+    assert_eq!(
+        store
+            .attach_pre_edit(S, "turn-1", &key, &PreEditImage::DidNotExist)
+            .unwrap(),
+        None,
+        "the second attach says nothing the first did not"
+    );
+}
+
+/// `tracked_paths` is the union of everything observed, tombstones included.
+///
+/// It is half of what builds a restore's safety scope, and a path missing
+/// from it is a path no plan can ever delete: the safety capture never looks
+/// there, so `current.entries` lacks it, and `plan_restore` needs both sides.
+#[test]
+fn tracked_paths_includes_what_was_looked_for_and_not_found() {
+    let fx = Fixture::new();
+    fx.write("present.txt", "here");
+    fx.capture(S, "turn-1");
+
+    let gone = fx.path("gone.txt").to_string_lossy().into_owned();
+    fx.store()
+        .attach_pre_edit(S, "turn-1", &gone, &PreEditImage::DidNotExist)
+        .unwrap();
+
+    let paths = fx.store().tracked_paths(S).unwrap();
+    assert!(paths.contains(&fx.path("present.txt").to_string_lossy().into_owned()));
+    assert!(
+        paths.contains(&gone),
+        "a tombstone is an observation, and the safety scope needs it"
+    );
+}
+
+/// Disk usage reports this workspace's records, not the content they name.
+///
+/// Content is shared with every other workspace, so charging it to one would
+/// report the same bytes once per reference — a dashboard that adds up to
+/// several times the true size.
+#[test]
+fn disk_usage_measures_records_rather_than_content() {
+    let fx = Fixture::new();
+    fx.write("big.txt", "x".repeat(200_000));
+    fx.capture(S, "turn-1");
+
+    let records = fx.store().records_disk_usage().unwrap();
+    assert!(records > 0, "the manifest and log are real files");
+    assert!(
+        records < 200_000,
+        "the 200 kB of content is not charged to the partition: {records}"
+    );
+}
+
+/// Inheriting a log copies entries through the named turn and nothing after.
+#[test]
+fn inheriting_a_log_stops_at_the_named_turn() {
+    let fx = Fixture::new();
+    let store = fx.store();
+    for i in 0..4 {
+        fx.write("a.txt", format!("v{i}"));
+        fx.capture(S, &format!("turn-{i}"));
+    }
+
+    assert_eq!(store.inherit_log(S, "fork", "turn-1").unwrap(), 2);
+    let inherited: Vec<String> = store
+        .thread_history("fork")
+        .unwrap()
+        .into_iter()
+        .map(|(entry, _)| entry.turn_id)
+        .collect();
+    assert_eq!(inherited, vec!["turn-0".to_string(), "turn-1".to_string()]);
+}
+
+/// A fork from a turn the source never had inherits nothing — but still
+/// exists.
+///
+/// The distinction matters to `session_exists`, which is how a caller tells a
+/// session that has captured nothing yet from one that was never started.
+#[test]
+fn a_fork_from_an_unknown_turn_is_empty_but_real() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+
+    let store = fx.store();
+    assert_eq!(store.inherit_log(S, "fork", "never-happened").unwrap(), 0);
+    assert!(store.session_exists("fork"));
+    assert!(store.thread_history("fork").unwrap().is_empty());
+}
+
+/// Nothing has moved right after a rewind, so there is no conflict to report.
+/// An undo with nothing to undo is likewise quiet rather than an error.
+#[test]
+fn undo_conflicts_are_empty_when_nothing_moved() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+    let store = fx.store();
+
+    assert!(
+        store.undo_conflicts(S, &|_| false).unwrap().is_empty(),
+        "no rewind, nothing to conflict with"
+    );
+
+    fx.write("a.txt", "two");
+    let target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            S,
+            &target,
+            RestoreKind::Rewind { undo_for: Some(S) },
+            fx.restore_scope(S),
+            &|_| false,
+        )
+        .unwrap();
+
+    assert!(store.undo_conflicts(S, &|_| false).unwrap().is_empty());
+}
+
+/// A file changed after the rewind is reported, because undoing would
+/// overwrite that change without mentioning it.
+///
+/// The undo records are per-session but the files are not, so this is the
+/// only thing standing between a concurrent edit and silent loss.
+#[test]
+fn a_change_made_after_a_rewind_is_reported_as_a_conflict() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture(S, "turn-1");
+    let store = fx.store();
+
+    fx.write("a.txt", "two");
+    let target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            S,
+            &target,
+            RestoreKind::Rewind { undo_for: Some(S) },
+            fx.restore_scope(S),
+            &|_| false,
+        )
+        .unwrap();
+
+    // Somebody else edits the file the rewind just wrote.
+    fx.write("a.txt", "three");
+
+    assert_eq!(
+        store.undo_conflicts(S, &|_| false).unwrap(),
+        vec![fx.path("a.txt").to_string_lossy().into_owned()]
+    );
+    assert!(
+        store
+            .undo_conflicts(S, &|p: &str| p.ends_with("a.txt"))
+            .unwrap()
+            .is_empty(),
+        "a protected path is not a conflict, because an undo would not touch it"
+    );
+}

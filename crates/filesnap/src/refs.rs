@@ -9,16 +9,13 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
 use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::blob::BlobStore;
 use crate::error::Result;
 use crate::error::SnapshotError;
-use crate::manifest::ManifestStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRef {
@@ -56,6 +53,17 @@ pub struct ThreadLog {
     /// Format version of this record — see [`crate::manifest::Manifest`].
     pub version: u32,
     pub entries: Vec<SnapshotRef>,
+}
+
+/// Every log a partition holds, and whether the enumeration was whole.
+///
+/// The flag exists so a sweep can tell "nothing points at this" from "I could
+/// not read everything that might". Only the first licenses a removal.
+#[derive(Debug, Default)]
+pub struct ThreadLogs {
+    pub logs: Vec<ThreadLog>,
+    /// True when at least one log could not be read or parsed.
+    pub incomplete: bool,
 }
 
 impl Default for ThreadLog {
@@ -161,8 +169,16 @@ impl RefStore {
         }
     }
 
-    pub fn thread_logs(&self) -> Result<Vec<ThreadLog>> {
-        let mut out = Vec::new();
+    /// Every thread log in this partition, and whether any could not be read.
+    ///
+    /// One damaged log used to abort the whole enumeration with `?`, which
+    /// made every sweep — and therefore every delete's reclamation — hostage
+    /// to a single corrupt file. It now reports what it could read and says
+    /// that it is incomplete, so a caller can reclaim nothing rather than
+    /// fail outright. Which it must: an unreadable log is not evidence that
+    /// its manifests are dead.
+    pub fn thread_logs(&self) -> Result<ThreadLogs> {
+        let mut out = ThreadLogs::default();
         let entries = fs::read_dir(&self.root).map_err(|e| SnapshotError::io(&self.root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.root, e))?;
@@ -170,8 +186,10 @@ impl RefStore {
             if !name.ends_with(".json") {
                 continue;
             }
-            let bytes = fs::read(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
-            out.push(serde_json::from_slice(&bytes)?);
+            match fs::read(entry.path()).map(|b| serde_json::from_slice::<ThreadLog>(&b)) {
+                Ok(Ok(log)) => out.logs.push(log),
+                _ => out.incomplete = true,
+            }
         }
         Ok(out)
     }
@@ -195,7 +213,7 @@ impl RefStore {
 
 /// How many restores a thread remembers. Undo only needs the most recent
 /// one; the rest is history that would otherwise keep manifests alive.
-const MAX_RESTORE_HISTORY: usize = 20;
+pub(crate) const MAX_RESTORE_HISTORY: usize = 20;
 
 /// A restore that has been applied, recorded so it can be undone.
 ///
@@ -223,9 +241,38 @@ pub struct RestoreRecord {
     pub safety_manifest_id: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreLog {
+    /// Format version of this record — see [`crate::manifest::Manifest`].
+    pub version: u32,
     pub entries: Vec<RestoreRecord>,
+}
+
+/// Hand-written rather than derived: `#[derive(Default)]` would write
+/// `version: 0`, which is a version number no build has ever used and is
+/// worse than having no field at all — a reader would refuse a record this
+/// build itself wrote.
+impl Default for RestoreLog {
+    fn default() -> Self {
+        Self {
+            version: crate::workspace::FORMAT_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+/// Undo records across a partition, and whether any could not be read.
+#[derive(Debug, Default)]
+pub struct RestoreLogs {
+    pub logs: Vec<RestoreLog>,
+    pub incomplete: bool,
+}
+
+/// Manifests the turn index and undo records still name.
+#[derive(Debug, Default)]
+pub struct HeldManifests {
+    pub ids: BTreeSet<String>,
+    pub incomplete: bool,
 }
 
 /// Maps turn ids to the state captured at their start, and threads to
@@ -267,23 +314,69 @@ impl TurnIndex {
         }
     }
 
-    pub fn all_manifest_ids(&self) -> Result<BTreeSet<String>> {
-        let mut out = BTreeSet::new();
+    /// Manifests the turn index and the undo records still name, and whether
+    /// either could be read whole. See [`crate::refs::ThreadLogs`].
+    pub fn all_manifest_ids(&self) -> Result<HeldManifests> {
+        let mut out = HeldManifests::default();
         let entries =
             fs::read_dir(&self.turns_root).map_err(|e| SnapshotError::io(&self.turns_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.turns_root, e))?;
-            if let Ok(id) = fs::read_to_string(entry.path()) {
-                out.insert(id.trim().to_string());
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            match fs::read_to_string(entry.path()) {
+                Ok(id) => {
+                    out.ids.insert(id.trim().to_string());
+                }
+                Err(_) => out.incomplete = true,
             }
         }
-        for log in self.all_restore_logs()? {
+        let logs = self.all_restore_logs()?;
+        out.incomplete |= logs.incomplete;
+        for log in logs.logs {
             for record in log.entries {
-                out.insert(record.target_manifest_id);
-                out.insert(record.safety_manifest_id);
+                out.ids.insert(record.target_manifest_id);
+                out.ids.insert(record.safety_manifest_id);
             }
         }
         Ok(out)
+    }
+
+    /// Undo records filed under a session that has no log any more.
+    ///
+    /// Nothing can reach such a record to spend it, so it is not a root — but
+    /// `all_manifest_ids` reads it as one, which pins its two manifests for
+    /// good. Delete removes the pair together (D11); this finds the ones a
+    /// crash left behind.
+    pub fn orphan_restore_logs(&self, refs: &RefStore) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let entries = fs::read_dir(&self.restores_root)
+            .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(thread_id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            // Grace-gated like every other reclamation: a rewind writes the
+            // undo record under a session whose own log may be moments away.
+            if !refs.exists(thread_id) && crate::sweep::settled(&entry.path()) {
+                out.push(thread_id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove one turn entry by its on-disk name, for the sessions a delete
+    /// just removed. Missing is fine — delete is idempotent.
+    pub fn remove_turn_file(&self, turn_file: &str) -> Result<()> {
+        let path = self.turns_root.join(turn_file);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SnapshotError::io(&path, e)),
+        }
     }
 
     pub fn push_restore(&self, thread_id: &str, record: RestoreRecord) -> Result<()> {
@@ -344,29 +437,48 @@ impl TurnIndex {
         }
     }
 
-    fn all_restore_logs(&self) -> Result<Vec<RestoreLog>> {
-        let mut out = Vec::new();
+    fn all_restore_logs(&self) -> Result<RestoreLogs> {
+        let mut out = RestoreLogs::default();
         let entries = fs::read_dir(&self.restores_root)
             .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-            if let Ok(bytes) = fs::read(entry.path())
-                && let Ok(log) = serde_json::from_slice::<RestoreLog>(&bytes)
-            {
-                out.push(log);
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                continue;
+            }
+            // An undo record that will not parse used to be skipped in
+            // silence, which reads to a sweep as "this holds nothing" — and
+            // its two manifests then look dead. Say so instead.
+            match fs::read(entry.path()).map(|b| serde_json::from_slice::<RestoreLog>(&b)) {
+                Ok(Ok(log)) => out.logs.push(log),
+                _ => out.incomplete = true,
             }
         }
         Ok(out)
     }
 
     /// Drop index entries for turns no thread holds any more.
+    ///
+    /// **Grace-gated, like every other reclamation.** A capture writes its
+    /// log entry before its turn file, so between those two writes a live
+    /// session's turn exists on disk while no log names it yet. Without the
+    /// window this unlinked it, and nothing ever rebuilds a turn entry —
+    /// `set_turn` runs only at capture time — so the rewind was lost
+    /// permanently, in a session nobody deleted (C12).
+    ///
+    /// `.tmp` residue is skipped here and reclaimed by
+    /// [`crate::sweep::sweep_residue`]; unlinking a half-written record
+    /// mid-rename is not this pass's job.
     pub fn retain_turns(&self, live_turn_ids: &BTreeSet<String>) -> Result<()> {
         let entries =
             fs::read_dir(&self.turns_root).map_err(|e| SnapshotError::io(&self.turns_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.turns_root, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".tmp") || live_turn_ids.contains(&name) {
+            if name.ends_with(".tmp")
+                || live_turn_ids.contains(&name)
+                || !crate::sweep::settled(&entry.path())
+            {
                 continue;
             }
             fs::remove_file(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
@@ -392,7 +504,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Thread and turn ids are UUID-like; anything else is mapped to a
 /// filename-safe character set.
-fn safe_file_name(id: &str) -> String {
+pub(crate) fn safe_file_name(id: &str) -> String {
     id.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
@@ -424,172 +536,12 @@ impl GcStats {
     }
 }
 
-/// How new a file has to be for the sweep to leave it alone regardless.
-///
-/// A capture publishes in three steps — blobs, then the manifest, then the
-/// log entry — and none of it is atomic across processes. A sweep that reads
-/// the logs before that last step but lists the files after it would delete a
-/// snapshot a live session believes it holds, which is worse than any amount
-/// of retained garbage. Nothing coordinates the two: this workspace is
-/// explicitly multi-session, and the sweep runs from whichever process
-/// deleted a conversation.
-///
-/// Git answers the same race the same way rather than by locking
-/// (`gc.pruneExpire`): fresh objects are simply never pruned, and whatever
-/// garbage is among them waits for the next sweep. Reclamation is delayed;
-/// nothing is lost.
-const GC_GRACE: Duration = Duration::from_secs(300);
-
-/// Whether `path` is old enough that its absence from the live set can be
-/// trusted.
-///
-/// Unreadable or undatable files count as **young**: a sweep declines to
-/// delete anything it cannot age, because the cost of waiting is retained
-/// bytes and the cost of guessing is a snapshot a live session believes it
-/// holds.
-pub(crate) fn settled(path: &Path) -> bool {
-    let cutoff = SystemTime::now()
-        .checked_sub(GC_GRACE)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .is_ok_and(|written| written <= cutoff)
-}
-
-/// Sweep only `doomed` — manifests that belonged to threads just deleted.
-///
-/// The grace window does not apply here, and must not: a candidate is only
-/// considered because a thread that has just been removed named it, so no
-/// live session can be in the middle of publishing it. Waiting would defeat
-/// the point, since someone deleting a conversation is asking for its
-/// contents to be gone now, not in five minutes — and with the sweep only
-/// running on deletion, "later" can mean never.
-///
-/// Anything still reachable from a surviving thread stays: manifests are
-/// shared across forks, and the deleted thread naming one says nothing about
-/// whether its siblings still do.
-pub fn collect_garbage_for(
-    refs: &RefStore,
-    turns: &TurnIndex,
-    manifests: &ManifestStore,
-    blobs: &BlobStore,
-    doomed: &BTreeSet<String>,
-) -> Result<GcStats> {
-    let live_manifests = live_manifest_ids(refs, turns)?;
-    let mut stats = GcStats::default();
-
-    // Blobs are only candidates if a manifest being removed named them.
-    let mut orphan_blobs = BTreeSet::new();
-    for id in doomed {
-        if live_manifests.contains(id) {
-            stats.manifests_kept += 1;
-            continue;
-        }
-        let Ok(manifest) = manifests.load(id) else {
-            continue;
-        };
-        for entry in manifest.entries.values() {
-            orphan_blobs.insert(entry.hash.clone());
-        }
-        manifests.remove(id)?;
-        stats.manifests_removed += 1;
-    }
-
-    // A blob survives if any manifest still on disk references it.
-    for id in manifests.ids()? {
-        for entry in manifests.load(&id)?.entries.values() {
-            orphan_blobs.remove(&entry.hash);
-        }
-    }
-    for hash in orphan_blobs {
-        blobs.remove(&hash)?;
-        stats.blobs_removed += 1;
-    }
-    Ok(stats)
-}
-
-/// Manifests some surviving thread log or turn still points at.
-fn live_manifest_ids(refs: &RefStore, turns: &TurnIndex) -> Result<BTreeSet<String>> {
-    let mut live_manifests = BTreeSet::new();
-    let mut live_turn_ids = BTreeSet::new();
-    for log in refs.thread_logs()? {
-        for entry in log.entries {
-            live_turn_ids.insert(safe_file_name(&entry.turn_id));
-            live_manifests.insert(entry.manifest_id);
-        }
-    }
-    turns.retain_turns(&live_turn_ids)?;
-    live_manifests.extend(turns.all_manifest_ids()?);
-    Ok(live_manifests)
-}
-
-/// Mark-and-sweep: manifests referenced by any thread log are live; blobs
-/// referenced by any live manifest are live; everything else is removed —
-/// unless it was written within `GC_GRACE`, which is never touched.
-pub fn collect_partition(
-    refs: &RefStore,
-    turns: &TurnIndex,
-    manifests: &ManifestStore,
-    blobs: &BlobStore,
-) -> Result<GcStats> {
-    let mut live_manifests = BTreeSet::new();
-    let mut live_turn_ids = BTreeSet::new();
-    for log in refs.thread_logs()? {
-        for entry in log.entries {
-            live_turn_ids.insert(safe_file_name(&entry.turn_id));
-            live_manifests.insert(entry.manifest_id);
-        }
-    }
-    // A turn only matters while some thread still holds it.
-    turns.retain_turns(&live_turn_ids)?;
-    live_manifests.extend(turns.all_manifest_ids()?);
-
-    let mut stats = GcStats::default();
-    let mut live_blobs = BTreeSet::new();
-    for id in manifests.ids()? {
-        // A manifest too young to sweep is also too young to trust as dead:
-        // its blobs stay live with it, or the next capture to reference it
-        // would find its contents gone.
-        if live_manifests.contains(&id) || !settled(&manifests.path_for(&id)) {
-            stats.manifests_kept += 1;
-            for entry in manifests.load(&id)?.entries.values() {
-                live_blobs.insert(entry.hash.clone());
-            }
-        } else {
-            manifests.remove(&id)?;
-            stats.manifests_removed += 1;
-        }
-    }
-
-    for hash in blobs.hashes()? {
-        if live_blobs.contains(&hash) || !settled(&blobs.path_for(&hash)) {
-            stats.blobs_kept += 1;
-        } else {
-            blobs.remove(&hash)?;
-            stats.blobs_removed += 1;
-        }
-    }
-    Ok(stats)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
     use pretty_assertions::assert_eq;
-
-    /// Backdate a file past `GC_GRACE` so a sweep will consider it.
-    ///
-    /// Tests write everything milliseconds before they assert, which is
-    /// exactly the state the grace window exists to protect. Reaching for the
-    /// clock is the only way to exercise the other side of it.
-    fn age_out(path: &Path) {
-        let when = SystemTime::now() - GC_GRACE - Duration::from_secs(60);
-        let f = fs::File::options().write(true).open(path).unwrap();
-        f.set_times(fs::FileTimes::new().set_modified(when))
-            .unwrap();
-    }
 
     #[test]
     fn append_and_load_roundtrip() {
@@ -605,72 +557,19 @@ mod tests {
         assert_eq!(log.entries[1].manifest_id, "m2");
     }
 
+    /// A log that will not parse is reported as such rather than aborting the
+    /// enumeration, so one damaged file cannot hold every sweep hostage.
     #[test]
-    fn gc_sweeps_unreferenced_manifests_and_blobs() {
+    fn an_unreadable_log_makes_the_enumeration_incomplete_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
-        let refs = RefStore::open(dir.path().join("refs")).unwrap();
-        let turns = TurnIndex::open(dir.path()).unwrap();
-        let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
-        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let root = dir.path().join("refs");
+        let refs = RefStore::open(&root).unwrap();
+        refs.append("good", "turn-1".into(), "m1".into()).unwrap();
+        fs::write(root.join("bad.json"), b"{ truncated").unwrap();
 
-        let live_hash = blobs.store_bytes(b"live").unwrap();
-        let dead_hash = blobs.store_bytes(b"dead").unwrap();
-
-        let mut live = crate::manifest::Manifest::default();
-        live.entries.insert(
-            "/f".into(),
-            crate::manifest::FileEntry {
-                mode: Some(0o644),
-                size: 4,
-                mtime_secs: 1,
-                mtime_nanos: 0,
-                hash: live_hash.clone(),
-            },
-        );
-        let live_id = manifests.save(&live).unwrap();
-
-        let mut dead = live.clone();
-        dead.entries.get_mut("/f").unwrap().hash = dead_hash.clone();
-        let dead_id = manifests.save(&dead).unwrap();
-
-        refs.append("t1", "turn".into(), live_id.clone()).unwrap();
-
-        // Everything written a moment ago is inside the grace window, so a
-        // sweep right now must take nothing at all — the point being that a
-        // concurrent capture's not-yet-referenced manifest is indistinguishable
-        // from garbage, and guessing wrong destroys a live session's snapshot.
-        let stats = collect_partition(&refs, &turns, &manifests, &blobs).unwrap();
-        assert_eq!(
-            (stats.manifests_removed, stats.blobs_removed),
-            (0, 0),
-            "fresh objects are never swept"
-        );
-        assert!(manifests.load(&dead_id).is_ok());
-
-        age_out(&manifests.path_for(&dead_id));
-        age_out(&manifests.path_for(&live_id));
-        age_out(&blobs.path_for(&dead_hash));
-        age_out(&blobs.path_for(&live_hash));
-
-        let stats = collect_partition(&refs, &turns, &manifests, &blobs).unwrap();
-        assert_eq!(stats.manifests_kept, 1);
-        assert_eq!(stats.manifests_removed, 1);
-        assert_eq!(stats.blobs_kept, 1);
-        assert_eq!(stats.blobs_removed, 1);
-        assert!(manifests.load(&live_id).is_ok());
-        assert!(manifests.load(&dead_id).is_err());
-        assert!(blobs.contains(&live_hash));
-        assert!(!blobs.contains(&dead_hash));
-
-        // Dropping the thread makes everything garbage.
-        refs.remove("t1").unwrap();
-        age_out(&manifests.path_for(&live_id));
-        age_out(&blobs.path_for(&live_hash));
-        let stats = collect_partition(&refs, &turns, &manifests, &blobs).unwrap();
-        assert_eq!(stats.manifests_removed, 1);
-        assert_eq!(stats.blobs_removed, 1);
-        assert_eq!(manifests.ids().unwrap().len(), 0);
-        assert_eq!(blobs.hashes().unwrap().len(), 0);
+        let logs = refs.thread_logs().unwrap();
+        assert_eq!(logs.logs.len(), 1, "the readable one still comes back");
+        assert!(logs.incomplete);
     }
 
     /// The chain runs unbroken from the first entry.
@@ -743,5 +642,41 @@ mod tests {
             fork.entries[1].prev_hash.as_deref(),
             Some(SnapshotRef::digest(&fork.entries[0]).as_str())
         );
+    }
+
+    /// `last_restore` peeks and `pop_restore` pops.
+    ///
+    /// If the peek mutated, asking what an undo would do would consume the
+    /// answer — the conflict check reads the same record before the undo
+    /// runs, so undoing would then reverse the rewind *before* the one the
+    /// user was shown.
+    #[test]
+    fn reading_the_top_of_the_undo_stack_does_not_consume_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
+
+        let record = |n: &str| RestoreRecord {
+            target_manifest_id: format!("target-{n}"),
+            safety_manifest_id: format!("safety-{n}"),
+        };
+        turns.push_restore("t1", record("a")).unwrap();
+        turns.push_restore("t1", record("b")).unwrap();
+
+        assert_eq!(turns.last_restore("t1").unwrap(), Some(record("b")));
+        assert_eq!(
+            turns.last_restore("t1").unwrap(),
+            Some(record("b")),
+            "reading twice reads the same thing"
+        );
+
+        assert_eq!(turns.pop_restore("t1").unwrap(), Some(record("b")));
+        assert_eq!(
+            turns.last_restore("t1").unwrap(),
+            Some(record("a")),
+            "a second undo walks back another rewind rather than oscillating"
+        );
+
+        assert_eq!(turns.pop_restore("t1").unwrap(), Some(record("a")));
+        assert_eq!(turns.pop_restore("t1").unwrap(), None);
     }
 }

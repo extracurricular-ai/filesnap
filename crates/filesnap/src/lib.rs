@@ -25,6 +25,7 @@ mod refs;
 mod restore;
 mod scope;
 mod store;
+mod sweep;
 mod workspace;
 
 pub use blob::BlobStore;

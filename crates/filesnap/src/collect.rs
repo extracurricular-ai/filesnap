@@ -25,7 +25,7 @@ use crate::manifest::ManifestStore;
 use crate::refs::GcStats;
 use crate::refs::RefStore;
 use crate::refs::TurnIndex;
-use crate::refs::collect_partition;
+use crate::sweep::collect_partition;
 use crate::workspace;
 
 /// Reclaim what nothing references, across every workspace in the store.
@@ -53,7 +53,15 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
         let turns = TurnIndex::open(&partition)?;
         let manifests = ManifestStore::open(partition.join("manifests"))?;
 
-        stats = stats.plus(collect_partition(&refs, &turns, &manifests, &blobs)?);
+        stats = stats.plus(collect_partition(&refs, &turns, &manifests)?);
+
+        // Residue from a write killed between its temp file and its rename.
+        // Nothing else removes one — every enumeration merely *skips* `.tmp`,
+        // which made a stray permanent and, where a record's name could
+        // collide with it, an uncollectable root (C4). D10 assigns it here.
+        for dir in ["refs", "manifests", "turns", "restores"] {
+            crate::sweep::sweep_residue(&partition.join(dir));
+        }
 
         // Mark: every hash named by a manifest that survived that sweep.
         for id in manifests.ids()? {
@@ -75,7 +83,7 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
     // its blobs before its manifest, so a blob written moments ago may belong
     // to a manifest that has not landed yet.
     for hash in blobs.hashes()? {
-        if live_blobs.contains(&hash) || !crate::refs::settled(&blobs.path_for(&hash)) {
+        if live_blobs.contains(&hash) || !crate::sweep::settled(&blobs.path_for(&hash)) {
             stats.blobs_kept += 1;
         } else {
             blobs.remove(&hash)?;
@@ -84,3 +92,7 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
     }
     Ok(stats)
 }
+
+#[cfg(test)]
+#[path = "collect_tests.rs"]
+mod tests;

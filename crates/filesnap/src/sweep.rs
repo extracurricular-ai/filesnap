@@ -1,0 +1,260 @@
+//! Reclaiming records: what delete prunes, and what collection sweeps.
+//!
+//! Both operations answer the same question — which manifests is anything
+//! still pointing at — and D10 requires them to answer it through **one
+//! read-only query**. Sharing a primitive is not a dependency; reaching
+//! through the other operation's entry point is. Before this module, delete
+//! ran gc's whole mutating partition sweep, so delete's result depended on
+//! gc's marking logic, and gc's marking logic pruned records delete owned.
+//!
+//! **Nothing here touches content.** Whether a blob is still referenced is a
+//! question about every workspace at once, because content is deduplicated
+//! and lineage has nothing to do with it (D10). Only
+//! [`crate::collect_garbage`] can answer it, so only it may remove a blob.
+//! Everything in this module is scoped to one partition, which is exactly
+//! why none of it is allowed near the shared blob store: a partition-scoped
+//! answer applied to a global space deletes other workspaces' content.
+//!
+//! The two entry points differ in what they are allowed to reach:
+//!
+//! | | reaches | removes |
+//! |---|---|---|
+//! | [`prune_sessions`] | the turn ids and manifests the deleted logs named | only those |
+//! | [`collect_partition`] | every record in the partition | anything unreachable |
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+use std::time::SystemTime;
+
+use crate::error::Result;
+use crate::manifest::ManifestStore;
+use crate::refs::GcStats;
+use crate::refs::RefStore;
+use crate::refs::TurnIndex;
+
+/// How new a file has to be for a sweep to leave it alone regardless.
+///
+/// A capture publishes in three steps — blobs, then the manifest, then the
+/// log entry — and none of it is atomic across processes. A sweep that read
+/// the logs before that last step but listed the files after it would delete
+/// a snapshot a live session believes it holds, which is worse than any
+/// amount of retained garbage. Nothing coordinates the two: a workspace is
+/// explicitly multi-session, and collection runs from whichever process asked
+/// for it.
+///
+/// Git answers the same race the same way rather than by locking
+/// (`gc.pruneExpire`): fresh objects are simply never pruned, and whatever
+/// garbage is among them waits for the next sweep. Reclamation is delayed;
+/// nothing is lost.
+pub(crate) const GC_GRACE: Duration = Duration::from_secs(300);
+
+/// Whether `path` is old enough that its absence from the live set can be
+/// trusted.
+///
+/// Unreadable or undatable files count as **young**: a sweep declines to
+/// delete anything it cannot age, because the cost of waiting is retained
+/// bytes and the cost of guessing is a snapshot a live session believes it
+/// holds.
+pub(crate) fn settled(path: &Path) -> bool {
+    let cutoff = SystemTime::now()
+        .checked_sub(GC_GRACE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|written| written <= cutoff)
+}
+
+/// Whether the live set below could be built from every root there is.
+///
+/// A record that cannot be read is not evidence that anything is dead — it is
+/// evidence of nothing at all. So an unreadable root does not make a sweep
+/// fail; it makes the sweep's answer **incomplete**, and an incomplete answer
+/// may not be used to remove anything. The cost is retained bytes until the
+/// damaged record is dealt with. The alternative is deleting the snapshots of
+/// a session nobody touched, because the file naming them happened to be
+/// corrupt.
+///
+/// This is also what keeps delete free of preconditions (D9): a corrupt log
+/// belonging to some *other* session cannot make deleting this one fail. It
+/// only defers the reclamation, which was never part of delete's success
+/// criterion (VIII.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Coverage {
+    /// Every root was read. Anything absent from the live set is unreachable.
+    Complete,
+    /// At least one root could not be read. Nothing may be removed.
+    Partial,
+}
+
+/// What the surviving **logs** name: their manifests, and their turn ids in
+/// on-disk form.
+///
+/// Logs are the primary root. The turn index and the undo records are roots
+/// too, but they are read *after* the stale entries among them have been
+/// pruned — otherwise a turn entry about to be removed vouches for the very
+/// manifest it was the last thing pointing at, and the sweep converges one
+/// pass later than it should.
+///
+/// **Read-only.** An earlier version pruned the turn index as a side effect,
+/// which is how delete's own record cleanup ended up inside gc's marking
+/// helper — one hole with two symptoms (D10, C14). What each operation prunes
+/// is now explicit at its call site.
+fn roots_from_logs(refs: &RefStore) -> Result<(BTreeSet<String>, BTreeSet<String>, Coverage)> {
+    let mut manifests = BTreeSet::new();
+    let mut turn_files = BTreeSet::new();
+
+    let logs = refs.thread_logs()?;
+    let coverage = if logs.incomplete {
+        Coverage::Partial
+    } else {
+        Coverage::Complete
+    };
+    for log in logs.logs {
+        for entry in log.entries {
+            turn_files.insert(crate::refs::safe_file_name(&entry.turn_id));
+            manifests.insert(entry.manifest_id);
+        }
+    }
+    Ok((manifests, turn_files, coverage))
+}
+
+/// Remove the records the just-deleted sessions owned, and nothing else.
+///
+/// `doomed_turns` and `doomed_manifests` are what those sessions' logs named,
+/// gathered **before** the logs were unlinked — after the unlink there is no
+/// way to learn it, which is why delete reads first and removes second.
+///
+/// Scoped on purpose. The previous implementation reconciled the whole turn
+/// index by global elimination, so deleting one conversation could unlink a
+/// turn entry belonging to a live session whose log entry had landed but
+/// whose turn file had not yet been written — a rewind lost permanently, in a
+/// session nobody deleted (C12). Nothing here enumerates a directory: every
+/// candidate was named by a log that is now gone.
+pub(crate) fn prune_sessions(
+    refs: &RefStore,
+    turns: &TurnIndex,
+    manifests: &ManifestStore,
+    doomed_turns: &BTreeSet<String>,
+    doomed_manifests: &BTreeSet<String>,
+) -> Result<GcStats> {
+    let mut stats = GcStats::default();
+    let (mut live_manifests, live_turns, coverage) = roots_from_logs(refs)?;
+
+    if coverage == Coverage::Partial {
+        // Something is unreadable, so "nothing points at this any more" is
+        // not a claim we can make. The sessions are already unreachable —
+        // that part is done and is what delete promised.
+        stats.manifests_kept = doomed_manifests.len();
+        return Ok(stats);
+    }
+
+    // Turn entries first. A doomed session's turn entry names a doomed
+    // manifest, so leaving it in place until after the liveness question
+    // would have it answer that question in its own favour.
+    for turn_file in doomed_turns {
+        if !live_turns.contains(turn_file) {
+            turns.remove_turn_file(turn_file)?;
+        }
+    }
+
+    let held = turns.all_manifest_ids()?;
+    if held.incomplete {
+        stats.manifests_kept = doomed_manifests.len();
+        return Ok(stats);
+    }
+    live_manifests.extend(held.ids);
+
+    for id in doomed_manifests {
+        if live_manifests.contains(id) {
+            stats.manifests_kept += 1;
+            continue;
+        }
+        manifests.remove(id)?;
+        stats.manifests_removed += 1;
+    }
+    Ok(stats)
+}
+
+/// Sweep every record in this partition that nothing points at.
+///
+/// Unlike [`prune_sessions`] this enumerates, so it is the one that finds
+/// what a crashed operation left behind — the orphans D8 makes collection's
+/// job. It removes **records only**; see the module header.
+pub(crate) fn collect_partition(
+    refs: &RefStore,
+    turns: &TurnIndex,
+    manifests: &ManifestStore,
+) -> Result<GcStats> {
+    let mut stats = GcStats::default();
+    let (mut live_manifests, live_turns, coverage) = roots_from_logs(refs)?;
+    if coverage == Coverage::Partial {
+        return Ok(stats);
+    }
+
+    // An undo record for a session that has no log is not a root, it is
+    // residue: nothing can reach it to spend it, and left in place it pins
+    // its two manifests for good. Dropped before liveness is computed, so
+    // what it was holding becomes collectable in this same pass.
+    for thread_id in turns.orphan_restore_logs(refs)? {
+        turns.remove_restores(&thread_id)?;
+    }
+
+    // Turn entries next: pure index, rebuilt by nothing, and a stale one
+    // keeps a manifest alive. Grace-gated — a capture writes its log entry
+    // before its turn file, so a turn younger than the window may belong to
+    // a log that was read moments ago.
+    turns.retain_turns(&live_turns)?;
+
+    // Only now are the remaining index and undo records asked what they hold.
+    let held = turns.all_manifest_ids()?;
+    if held.incomplete {
+        return Ok(stats);
+    }
+    live_manifests.extend(held.ids);
+
+    for id in manifests.ids()? {
+        // A manifest too young to sweep is also too young to trust as dead:
+        // the capture that is about to name it may not have landed yet.
+        if live_manifests.contains(&id) || !settled(&manifests.path_for(&id)) {
+            stats.manifests_kept += 1;
+        } else {
+            manifests.remove(&id)?;
+            stats.manifests_removed += 1;
+        }
+    }
+    Ok(stats)
+}
+
+/// Unlink `*.tmp` residue under `dir` that is past the grace window.
+///
+/// Every atomic write in the store is write-to-`.tmp`-then-rename, so a
+/// process killed between the two leaves one behind. D10 assigns this to
+/// collection, and until now nothing removed one: all three enumerations
+/// merely *skipped* `.tmp`, which made a stray file permanent — and, where a
+/// record's name could collide with it, an uncollectable GC root (C4).
+///
+/// Errors on individual entries are ignored. Residue is a tidiness matter,
+/// and failing a collection over a file nobody can read would trade a small
+/// leak for a large one.
+pub(crate) fn sweep_residue(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "tmp")
+            && settled(&path)
+            && fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+#[path = "sweep_tests.rs"]
+mod tests;
