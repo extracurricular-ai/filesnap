@@ -172,7 +172,9 @@ pub(crate) fn prune_sessions(
     // manifest, so leaving it in place until after the liveness question
     // would have it answer that question in its own favour.
     for turn_file in doomed_turns {
-        if !live_turns.contains(turn_file) {
+        // Same gate, same reason: a fork's `inherit_log` may have landed
+        // after the liveness read, which is C12's shape on the delete path.
+        if !live_turns.contains(turn_file) && turns.turn_file_settled(turn_file) {
             turns.remove_turn_file(turn_file)?;
         }
     }
@@ -185,7 +187,15 @@ pub(crate) fn prune_sessions(
     live_manifests.extend(held.ids);
 
     for id in doomed_manifests {
-        if live_manifests.contains(id) {
+        // Unreachable *and* old enough to trust as unreachable — the same
+        // gate `collect_partition` applies, and for a reason delete cannot
+        // opt out of. `ManifestStore::save` dedups, so a live session that
+        // re-derives an existing manifest writes nothing and appends its log
+        // entry afterwards. A delete whose liveness read fell in that gap
+        // would unlink a manifest that session is about to name, and it would
+        // then stop capturing entirely. Reclaiming late costs disk;
+        // reclaiming early costs a live session.
+        if live_manifests.contains(id) || !manifests.path_for(id).is_ok_and(|p| settled(&p)) {
             stats.manifests_kept += 1;
             continue;
         }
@@ -263,6 +273,13 @@ pub(crate) fn sweep_residue(dir: &Path) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
+        // One level down, for the content store's two-character fan-out. A
+        // half-written blob is whole-file content bytes, so it is the most
+        // expensive residue there is and was the one nothing swept.
+        if path.is_dir() {
+            removed += sweep_residue(&path);
+            continue;
+        }
         if path.extension().is_some_and(|ext| ext == "tmp")
             && settled(&path)
             && fs::remove_file(&path).is_ok()
@@ -271,6 +288,24 @@ pub(crate) fn sweep_residue(dir: &Path) -> usize {
         }
     }
     removed
+}
+
+/// Declared sets belonging to sessions that have no log any more.
+///
+/// The third record under a session's name, and the one nothing enumerated.
+/// Delete removes it with the other two; this finds the ones a crash left.
+pub(crate) fn orphan_declared(
+    declared: &crate::declared::DeclaredStore,
+    refs: &RefStore,
+) -> Result<usize> {
+    let mut removed = 0;
+    for session_id in declared.session_ids()? {
+        if !refs.exists(&session_id) && declared.settled(&session_id) {
+            declared.remove(&session_id)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

@@ -96,8 +96,32 @@ fn a_prune_touches_nothing_the_doomed_sessions_did_not_name() {
 
     // Delete reads what the doomed log named, then unlinks it.
     let doomed_turns = BTreeSet::from([crate::refs::turn_file_name("turn-doomed")]);
-    let doomed_manifests = BTreeSet::from([doomed_id]);
+    let doomed_manifests = BTreeSet::from([doomed_id.clone()]);
     s.refs.remove("doomed").unwrap();
+
+    // Fresh records are spared, even here. `save` dedups, so a live session
+    // that re-derives an existing manifest writes nothing and appends its log
+    // entry afterwards — a delete whose liveness read fell in that gap would
+    // unlink a manifest that session is about to name.
+    let spared = prune_sessions(
+        &s.refs,
+        &s.turns,
+        &s.manifests,
+        &doomed_turns,
+        &doomed_manifests,
+    )
+    .unwrap();
+    assert_eq!(spared.manifests_removed, 0, "too young to judge");
+    assert!(s.manifests.load(&doomed_id).is_ok());
+
+    age_out(&s.manifests.path_for(&doomed_id).unwrap());
+    age_out(
+        &s.dir
+            .path()
+            .join("turns")
+            .join(crate::refs::turn_file_name("turn-doomed")),
+    );
+    age_out(&s.manifests.path_for(&bystander_id).unwrap());
 
     let stats = prune_sessions(
         &s.refs,

@@ -123,6 +123,26 @@ impl DeclaredStore {
         self.save(session_id, &file)
     }
 
+    /// Record that `turn_id` happened, whether or not it declared anything.
+    ///
+    /// The window counts turns. Assigning an ordinal only when something is
+    /// declared makes it "the last N turns that declared something" instead,
+    /// so a session that declares once and then runs hundreds of edit-free
+    /// turns ages nothing out.
+    pub fn note_turn(&self, session_id: &str, turn_id: &str) -> Result<()> {
+        let mut file = self.load(session_id)?;
+        if file.turns.iter().any(|t| t == turn_id) {
+            return Ok(());
+        }
+        // Nothing has ever been declared, so there is no window to advance
+        // and no file worth creating.
+        if file.entries.is_empty() {
+            return Ok(());
+        }
+        file.turns.push(turn_id.to_string());
+        self.save(session_id, &file)
+    }
+
     /// The paths still inside the window, for the next capture's scan.
     ///
     /// A session with no file yields nothing, which is the ordinary case for
@@ -161,6 +181,25 @@ impl DeclaredStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
+    }
+
+    /// Every session with a declared set here, for the collector.
+    pub fn session_ids(&self) -> Result<Vec<String>> {
+        let entries = fs::read_dir(&self.root).map_err(|e| SnapshotError::io(&self.root, e))?;
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_suffix(".json") {
+                out.push(id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether this session's record is old enough to judge as unreferenced.
+    pub fn settled(&self, session_id: &str) -> bool {
+        self.path_for(session_id)
+            .is_ok_and(|path| crate::sweep::settled(&path))
     }
 
     fn load(&self, session_id: &str) -> Result<DeclaredFile> {

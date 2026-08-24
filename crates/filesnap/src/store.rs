@@ -210,6 +210,12 @@ impl WorkspaceStore {
         self.declared.declare(session_id, turn_id, paths)
     }
 
+    /// Record that a turn happened, so the declared set's window counts
+    /// turns rather than only the turns that declared something.
+    pub fn note_turn(&self, session_id: &str, turn_id: &str) -> Result<()> {
+        self.declared.note_turn(session_id, turn_id)
+    }
+
     /// Paths this session declared that are still inside the window — what a
     /// capture unions into its scan.
     pub fn declared_paths(&self, session_id: &str) -> Result<std::collections::BTreeSet<PathBuf>> {
@@ -574,13 +580,22 @@ impl WorkspaceStore {
         match kind {
             RestoreKind::Rewind {
                 undo_for: Some(owner),
-            } => self.turns.push_restore(
-                owner,
-                RestoreRecord {
-                    target_manifest_id: target.manifest_id.clone(),
-                    safety_manifest_id: safety.id.clone(),
-                },
-            )?,
+            } => {
+                // The destination is tracking from this moment: it holds the
+                // workspace and it has an undo to spend. Without a log,
+                // "no log" and "orphaned undo record" are the same state on
+                // disk, and collection removed a record a live session could
+                // still have spent — with its two manifests, if it was their
+                // last root.
+                self.refs.ensure(owner)?;
+                self.turns.push_restore(
+                    owner,
+                    RestoreRecord {
+                        target_manifest_id: target.manifest_id.clone(),
+                        safety_manifest_id: safety.id.clone(),
+                    },
+                )?;
+            }
             RestoreKind::Rewind { undo_for: None } => {}
             RestoreKind::Undo { spending } => {
                 self.turns.pop_restore(spending)?;
@@ -675,6 +690,13 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// A session's records, gathered before any of them is unlinked.
+#[derive(Debug, Default)]
+struct SessionRecords {
+    turns: std::collections::BTreeSet<String>,
+    manifests: std::collections::BTreeSet<String>,
+}
+
 /// What a delete did, and what it declined to touch.
 #[derive(Debug, Default)]
 pub struct DeleteOutcome {
@@ -689,6 +711,15 @@ pub struct DeleteOutcome {
     /// mix of two different things and gave that pseudo-session a name a real
     /// one could collide with.
     pub refused: Vec<(String, SnapshotError)>,
+    /// Sessions whose removal **began and did not finish**, with why.
+    ///
+    /// Distinct from `refused`, which promises the session is untouched. The
+    /// two used to be one list, so a failure partway through the unlinks was
+    /// reported as "left exactly as it was" — the one thing it was not.
+    /// Retrying is still the right move; delete is idempotent, and the
+    /// ordering means the intermediate state is one the system reaches on its
+    /// own (D11).
+    pub incomplete: Vec<(String, SnapshotError)>,
     /// Why reclamation did not run, if it did not.
     ///
     /// Independent of `refused`: the sessions are unreachable either way —
@@ -717,6 +748,32 @@ impl WorkspaceStore {
     /// Takes the whole set at once because a session's manifests are
     /// routinely shared with the siblings being deleted alongside it: swept
     /// one at a time, each would still be pinned by the next.
+    /// Everything a session's records name, read before any of them is
+    /// removed. Afterwards there is no way to learn it.
+    fn records_of(&self, session_id: &str) -> Result<SessionRecords> {
+        let log = self.refs.load(session_id)?;
+        let mut records = SessionRecords::default();
+        // The **whole** undo stack, not just its top. Up to 20 records live
+        // there, and reading one left the other 19's manifests out of the
+        // doomed set entirely — reclaimed eventually by collection, but never
+        // by the delete that was supposed to own them.
+        for record in self.turns.restore_records(session_id)? {
+            records.manifests.insert(record.target_manifest_id);
+            records.manifests.insert(record.safety_manifest_id);
+        }
+        for entry in log.entries {
+            records
+                .turns
+                .insert(crate::refs::turn_file_name(&entry.turn_id));
+            records.manifests.insert(entry.manifest_id);
+        }
+        Ok(records)
+    }
+
+    fn remove_declared(&self, session_id: &str) -> Result<()> {
+        self.declared.remove(session_id)
+    }
+
     pub fn delete_sessions(&self, session_ids: &[String]) -> DeleteOutcome {
         let mut outcome = DeleteOutcome::default();
         if session_ids.is_empty() {
@@ -731,42 +788,40 @@ impl WorkspaceStore {
         let mut doomed_turns = std::collections::BTreeSet::new();
         let mut doomed_manifests = std::collections::BTreeSet::new();
 
+        // Read everything first, and refuse before touching anything. A
+        // session that fails partway through its unlinks is neither deleted
+        // nor "left exactly as it was", which is what `refused` promises —
+        // and the only honest way to keep that promise is to have done no
+        // work by the time the promise is made.
+        let mut doomed = Vec::new();
         for session_id in session_ids {
-            // Read before removing anything: a session that cannot be read is
-            // left whole rather than emptied of the evidence needed to retry.
-            let log = match self.refs.load(session_id) {
-                Ok(log) => log,
-                Err(err) => {
-                    outcome.refused.push((session_id.clone(), err));
-                    continue;
-                }
-            };
-            if let Some(record) = self.turns.last_restore(session_id).ok().flatten() {
-                doomed_manifests.insert(record.target_manifest_id);
-                doomed_manifests.insert(record.safety_manifest_id);
+            match self.records_of(session_id) {
+                Ok(records) => doomed.push((session_id, records)),
+                Err(err) => outcome.refused.push((session_id.clone(), err)),
             }
-            for entry in &log.entries {
-                doomed_turns.insert(crate::refs::turn_file_name(&entry.turn_id));
-                doomed_manifests.insert(entry.manifest_id.clone());
-            }
+        }
+
+        for (session_id, records) in doomed {
+            doomed_turns.extend(records.turns);
+            doomed_manifests.extend(records.manifests);
 
             // Undo records first, then the log. Interrupted between the two,
             // this leaves a session that simply never rewound — a state the
             // system reaches on its own and cannot tell apart from the
             // ordinary case. The other order leaves an undo record for a
-            // session with no log, which nothing produces and which pins its
-            // manifests as a root for good.
-            if let Err(err) = self.declared.remove(session_id) {
-                outcome.refused.push((session_id.clone(), err));
-                continue;
-            }
-            if let Err(err) = self.remove_restores(session_id) {
-                outcome.refused.push((session_id.clone(), err));
-                continue;
-            }
-            if let Err(err) = self.remove_thread(session_id) {
-                outcome.refused.push((session_id.clone(), err));
-                continue;
+            // session with no log, which pins its manifests as a root.
+            //
+            // A failure here is reported separately: the session is *not*
+            // intact, so calling it refused would be a lie.
+            for step in [
+                Self::remove_declared as fn(&Self, &str) -> Result<()>,
+                Self::remove_restores,
+                Self::remove_thread,
+            ] {
+                if let Err(err) = step(self, session_id) {
+                    outcome.incomplete.push((session_id.clone(), err));
+                    break;
+                }
             }
         }
 

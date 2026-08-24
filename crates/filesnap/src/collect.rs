@@ -59,9 +59,14 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
         // Nothing else removes one — every enumeration merely *skips* `.tmp`,
         // which made a stray permanent and, where a record's name could
         // collide with it, an uncollectable root (C4). D10 assigns it here.
-        for dir in ["refs", "manifests", "turns", "restores"] {
+        for dir in ["refs", "manifests", "turns", "restores", "declared"] {
             crate::sweep::sweep_residue(&partition.join(dir));
         }
+
+        // The third record filed under a session's name. Delete removes it
+        // with the other two; this is the one a crash left behind.
+        let declared = crate::declared::DeclaredStore::open(crate::declared::dir_in(&partition))?;
+        crate::sweep::orphan_declared(&declared, &refs)?;
 
         // Mark: every hash named by a manifest that survived that sweep.
         for id in manifests.ids()? {
@@ -78,6 +83,10 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
             }
         }
     }
+
+    // Content residue is nested under the two-character fan-out, and is the
+    // most expensive kind: a capture killed mid-write leaves whole-file bytes.
+    crate::sweep::sweep_residue(&workspace::blobs_dir(&root));
 
     // Then content, sparing anything too young to judge. A capture publishes
     // its blobs before its manifest, so a blob written moments ago may belong

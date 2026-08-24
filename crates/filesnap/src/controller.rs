@@ -62,9 +62,10 @@ struct TrackState {
     /// Agent-edited paths registered via pre-edit attach, unioned into every
     /// checkpoint scan so post-edit states keep being observed.
     ///
-    /// A cache over the persisted set, not the truth: the store holds it, so
-    /// a session resuming in a new process picks up what the last one
-    /// declared (D25).
+    /// A **fallback** for when the persisted set cannot be read, not a second
+    /// source of truth. The store holds the real one and is the only thing
+    /// that applies the turn window; unioning this in as well would keep an
+    /// aged-out path alive for the rest of the process (D25).
     extras: BTreeSet<PathBuf>,
     /// Directory whose ignore rules scope this session's captures: the
     /// workspace root when one was found, else the invocation directory.
@@ -182,14 +183,28 @@ impl SnapshotTracker {
         // instead was unbounded by construction: on a repository of any age
         // most of what is on disk is build output, which is both the bulk of
         // the cost and the least worth keeping.
-        // The persisted set is authoritative and applies the turn window; the
-        // in-memory one is this process's own additions since it last wrote.
-        let mut extras: BTreeSet<PathBuf> = self.lock_state().extras.iter().cloned().collect();
-        match self.store.declared_paths(&self.session_id) {
-            Ok(declared) => extras.extend(declared),
-            Err(err) => warn!("filesnap: declared set unreadable, using this process's: {err}"),
+        // The persisted set is the truth, and it is the only one that applies
+        // the window. Unioning the in-memory copy in as well defeated the
+        // bound in exactly the case D25 was written for — a long-lived
+        // process, where nothing ever pruned `extras`, so a path that had
+        // aged out was still re-stat'd by every capture for the rest of the
+        // session and the tracked set grew without limit. The window only
+        // took effect after a restart, which is the opposite of the point.
+        let extras: Vec<PathBuf> = match self.store.declared_paths(&self.session_id) {
+            Ok(declared) => declared.into_iter().collect(),
+            // Only now is the cache the best available answer.
+            Err(err) => {
+                warn!("filesnap: declared set unreadable, falling back to this process's: {err}");
+                self.lock_state().extras.iter().cloned().collect()
+            }
+        };
+        // Note the turn even when it declares nothing, so the window counts
+        // turns rather than "turns that declared something" — otherwise a
+        // session that declares once and then runs 500 edit-free turns ages
+        // nothing out at all.
+        if let Err(err) = self.store.note_turn(&self.session_id, turn_id) {
+            warn!("filesnap: could not record turn order for the declared set: {err}");
         }
-        let extras: Vec<PathBuf> = extras.into_iter().collect();
         let scan = tracked_files(&roots, extras, self.hidden, self.limits);
         // What the *scan* passed over is a drop too, and the capture cannot
         // see it: an over-size file never reaches the manifest at all.
@@ -572,6 +587,67 @@ mod tests {
                 .unwrap()
                 .contains(&secret.to_string_lossy().into_owned()),
             "an ignored path entered the store through the edit hook"
+        );
+    }
+
+    /// A capture in a **long-lived process** honours the window.
+    ///
+    /// The tracker kept its own copy of the declared set that nothing ever
+    /// pruned, and unioned it with the windowed one. So inside a single
+    /// process the bound did nothing: a path that had aged out was re-stat'd
+    /// and re-captured for the rest of the session, and the tracked set grew
+    /// without limit — which is exactly the growth D25 exists to stop. It
+    /// took effect only after a restart, the opposite of the point.
+    #[test]
+    fn a_capture_in_one_process_stops_watching_a_path_past_the_window() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let tracker = SnapshotTracker::maybe_new(
+            home.path(),
+            ws.path(),
+            "s1".into(),
+            SessionStart::New {
+                tracking_enabled: true,
+            },
+            HiddenFiles::Skip,
+            ScanLimits::default(),
+        )
+        .expect("tracking enabled");
+
+        // A path outside the workspace, so only the declared set can carry it
+        // — the scan partitions never will.
+        let outside = home.path().join("edited-once.cfg");
+        std::fs::write(&outside, b"before").unwrap();
+        tracker.checkpoint_turn_start("turn-0", ws.path(), &[ws.path().to_path_buf()]);
+        tracker.attach_pre_edits(
+            "turn-0",
+            vec![(outside.clone(), PreEditImage::Existed(b"before".to_vec()))],
+        );
+
+        let store = crate::WorkspaceStore::open(home.path(), ws.path()).unwrap();
+        let key = outside.to_string_lossy().into_owned();
+        let captured = |store: &crate::WorkspaceStore| {
+            store
+                .latest_manifest("s1")
+                .unwrap()
+                .is_some_and(|m| m.entries.contains_key(&key))
+        };
+
+        tracker.checkpoint_turn_start("turn-1", ws.path(), &[ws.path().to_path_buf()]);
+        assert!(captured(&store), "still inside the window");
+
+        // The same process runs out the window without touching that file.
+        for i in 2..=(crate::declared::DECLARED_WINDOW_TURNS + 2) {
+            tracker.checkpoint_turn_start(
+                &format!("turn-{i}"),
+                ws.path(),
+                &[ws.path().to_path_buf()],
+            );
+        }
+
+        assert!(
+            !captured(&store),
+            "the process's own cache kept an aged-out path alive"
         );
     }
 }

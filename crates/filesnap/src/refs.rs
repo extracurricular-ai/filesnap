@@ -400,9 +400,29 @@ impl TurnIndex {
         Ok(out)
     }
 
+    /// Whether a turn entry is old enough to judge as unreferenced. See
+    /// [`crate::sweep::settled`]; a name that is not a turn record's counts
+    /// as young, so nothing acts on it.
+    pub fn turn_file_settled(&self, turn_file: &str) -> bool {
+        crate::sweep::settled(&self.turns_root.join(turn_file))
+    }
+
     /// Remove one turn entry by its on-disk name, for the sessions a delete
     /// just removed. Missing is fine — delete is idempotent.
+    ///
+    /// Validated like every other path builder, and for the same reason as
+    /// `blob_path`: the name is derived from a `turn_id` read back out of a
+    /// log this build deserialized but never vetted, so a forged or corrupted
+    /// entry could otherwise aim `remove_file` outside the partition (D5).
     pub fn remove_turn_file(&self, turn_file: &str) -> Result<()> {
+        let Some(turn_id) = turn_file.strip_suffix(TURN_SUFFIX) else {
+            return Err(SnapshotError::InvalidId {
+                kind: "turn record",
+                id: turn_file.to_string(),
+                reason: "a turn record's name must end in `.turn`",
+            });
+        };
+        crate::id::validate_stored("turn id", turn_id)?;
         let path = self.turns_root.join(turn_file);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -421,6 +441,15 @@ impl TurnIndex {
         }
         let path = self.restore_path(thread_id)?;
         write_atomic(&path, &serde_json::to_vec_pretty(&log)?)
+    }
+
+    /// Every undo record this thread holds, oldest first.
+    ///
+    /// Delete needs all of them: reading only the top left the manifests
+    /// named by the other nineteen out of the doomed set, so the delete that
+    /// owned them never reclaimed them.
+    pub fn restore_records(&self, thread_id: &str) -> Result<Vec<RestoreRecord>> {
+        Ok(self.restore_log(thread_id)?.entries)
     }
 
     /// The most recent restore this thread has to undo, if any.
@@ -783,5 +812,43 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A turn id read back out of a log is not a proven id.
+    ///
+    /// Every other path builder validates; this one did not, and its input is
+    /// derived from a `ThreadLog` this build deserialized but never vetted.
+    /// A forged or corrupted entry could therefore aim `remove_file` outside
+    /// the partition — the same threat `blob_path` already guarded against
+    /// (D5).
+    #[test]
+    fn a_forged_turn_record_name_cannot_escape_the_turns_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
+        let outside = dir.path().join("witness.txt");
+        fs::write(&outside, b"not ours to remove").unwrap();
+
+        for forged in [
+            "../witness.txt",
+            "../../etc/passwd.turn",
+            "..",
+            "",
+            "no-suffix",
+        ] {
+            let err = turns.remove_turn_file(forged).unwrap_err();
+            assert!(
+                matches!(err, SnapshotError::InvalidId { .. }),
+                "{forged:?} was not refused: {err:?}"
+            );
+        }
+        assert!(
+            outside.exists(),
+            "a forged name reached outside the partition"
+        );
+
+        // A real one still works, or the guard would be useless.
+        turns.set_turn("turn-1", "m1").unwrap();
+        turns.remove_turn_file(&turn_file_name("turn-1")).unwrap();
+        assert_eq!(turns.manifest_for_turn("turn-1").unwrap(), None);
     }
 }
