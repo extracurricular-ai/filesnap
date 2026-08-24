@@ -28,6 +28,32 @@ use crate::refs::TurnIndex;
 use crate::sweep::collect_partition;
 use crate::workspace;
 
+/// How many bytes the shared content store holds.
+///
+/// A free function for the same reason [`collect_garbage`] is one: content
+/// belongs to no workspace. A dashboard reports it *beside* a partition's
+/// record usage rather than added to it, because a blob is named by however
+/// many manifests happen to name it and attributing it to one workspace would
+/// report the same bytes once per reference (D19, D34).
+pub fn content_disk_usage(data_dir: &Path) -> Result<u64> {
+    fn walk(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| match entry.metadata() {
+                Ok(meta) if meta.is_dir() => walk(&entry.path()),
+                Ok(meta) => meta.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+    Ok(walk(&workspace::blobs_dir(&workspace::store_root(
+        data_dir,
+    )?)))
+}
+
 /// Reclaim what nothing references, across every workspace in the store.
 ///
 /// Content liveness is a whole-store question — a blob written for one

@@ -52,7 +52,13 @@ struct Line<'a, T: Serialize> {
     payload: T,
 }
 
-/// Emit one event. `kind` is `<command>.<event>`, e.g. `capture.done`.
+/// Emit one event. `kind` is `<command>.<event>`, e.g. `capture.done` —
+/// exactly two parts, so a consumer can split on the dot and get a command
+/// and an event name rather than a variable number of pieces.
+///
+/// Payload fields are **camelCase**, matching the enum values. The first
+/// multi-word field is where a convention gets set by accident, so it is set
+/// here on purpose and pinned by a test.
 ///
 /// Failures to write are **ignored**, deliberately: a consumer that closes the
 /// pipe early (`filesnap log | head`) would otherwise turn into a broken-pipe

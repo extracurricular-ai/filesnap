@@ -56,6 +56,7 @@ pub use checkpoint::CheckpointStats;
 pub use checkpoint::DROP_SAMPLE_LIMIT;
 pub use checkpoint::capture;
 pub use collect::collect_garbage;
+pub use collect::content_disk_usage;
 pub use controller::SessionStart;
 pub use controller::SnapshotTracker;
 pub use declared::DECLARED_WINDOW_TURNS;

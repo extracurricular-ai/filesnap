@@ -720,6 +720,11 @@ impl WorkspaceStore {
     /// workspace, so attributing them to one would double-count the same
     /// bytes as many times as they are referenced. A dashboard reports the
     /// two separately for the same reason (D34).
+    /// Every session this workspace holds records for.
+    pub fn sessions(&self) -> Result<Vec<String>> {
+        self.refs.thread_ids()
+    }
+
     pub fn records_disk_usage(&self) -> Result<u64> {
         dir_size(&self.partition).map_err(|e| SnapshotError::io(&self.partition, e))
     }

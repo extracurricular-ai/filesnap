@@ -234,6 +234,24 @@ impl RefStore {
     /// here — and mapped a second time, differently, when the turn index was
     /// built — so two spellings could land on one file and a sweep could
     /// disagree with a writer about which record was which (D7).
+    /// Every session with a log in this partition.
+    ///
+    /// The id *is* the filename, since ids are validated rather than mapped
+    /// (D7), so this is a listing rather than a reconstruction.
+    pub fn thread_ids(&self) -> Result<Vec<String>> {
+        let entries = fs::read_dir(&self.root).map_err(|e| SnapshotError::io(&self.root, e))?;
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| SnapshotError::io(&self.root, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_suffix(".json") {
+                out.push(id.to_string());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     fn log_path(&self, thread_id: &str) -> Result<PathBuf> {
         crate::id::validate_stored("session id", thread_id)?;
         Ok(self.root.join(format!("{thread_id}.json")))

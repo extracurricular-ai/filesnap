@@ -80,8 +80,11 @@ enum Command {
     Log {
         #[arg(long, value_name = "ID")]
         session: String,
+        /// Show only the most recent N turns.
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
     },
 
     /// Put the workspace back to the state captured at the start of a turn.
@@ -190,6 +193,24 @@ fn main() -> std::process::ExitCode {
             cwd,
         } => match here(cwd) {
             Ok(cwd) => commands::declare::run(&mut out, &data_dir, &session, &turn, cwd, paths),
+            Err(err) => {
+                eprintln!("filesnap: cannot resolve the working directory: {err}");
+                exit::USAGE
+            }
+        },
+        Command::Log {
+            session,
+            limit,
+            cwd,
+        } => match here(cwd) {
+            Ok(cwd) => commands::log::run(&mut out, &data_dir, &cwd, &session, limit),
+            Err(err) => {
+                eprintln!("filesnap: cannot resolve the working directory: {err}");
+                exit::USAGE
+            }
+        },
+        Command::Status { cwd } => match here(cwd) {
+            Ok(cwd) => commands::status::run(&mut out, &data_dir, &cwd),
             Err(err) => {
                 eprintln!("filesnap: cannot resolve the working directory: {err}");
                 exit::USAGE
