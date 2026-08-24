@@ -22,8 +22,8 @@ it was writing the decision down and then building on top of it as though it had
 been done. Closed by `9cf889a..949a0a4`.
 
 Not yet due, because they describe the CLI or the packaging: D2, D3, D29, D32,
-D34, D35, D37. D18's lock is engine-shaped but only a CLI can race itself, so it
-waits with them.
+D34, D35, D37, and D38-D40. D18's lock is engine-shaped but only a CLI can race
+itself, so it waits with them.
 
 Where a decision below describes the state of the code, it describes the state
 when it was written. Those passages are marked.
@@ -1025,6 +1025,85 @@ repo (D2) rather than as its own package.
   moment it lands.
 
 ---
+
+## D38 · The tracker becomes stateless; parameters are the state
+
+`SnapshotTracker` held `Mutex<TrackState>` — an `extras` cache and an
+`ignore_root` — because it was written for a long-lived host. D3 makes the CLI
+stateless per invocation, and `declare` and `capture` are two separate
+processes, so anything held in memory between them is simply lost. The type
+would have to be rebuilt for every call and would live exactly as long as that
+call.
+
+**D25 already removed the reason for the state.** Once the declared set is
+persisted, nothing in `TrackState` has to be in memory: `ignore_root` is
+derivable from the arguments each call already carries, and `extras` is a
+fallback for a file that is normally readable.
+
+**`extras` goes rather than being kept as a cache.** It was the source of the
+defect the second audit found: the capture path unioned it with the windowed
+persisted set, so inside one process a path that had aged out was re-stat'd for
+the rest of the session and the bound did nothing at all. A cache whose only
+job is to disagree with the truth is not a cache.
+
+**What this buys:** one orchestration path rather than two. The alternative —
+leave the tracker for embedders and write a second orchestration inside
+`filesnap-cli` — puts the same three-partition union, the same ignore filter
+and the same declared-set handling in two places. This project has just spent
+eleven commits fixing drift of exactly that shape.
+
+**Rules out:** a `--serve` mode needing a different API. D29's fallback stays
+available, because a resident process can call the stateless functions just as
+a per-invocation one does.
+
+## D39 · JSONL is flat, `type` is `<command>.<event>`, and every line carries `v`
+
+```
+{"v":1,"type":"capture.started","session":"s1","turn":"t1"}
+{"v":1,"type":"capture.dropped","path":"/w/dump.bin","reason":"overSizeLimit"}
+{"v":1,"type":"capture.done","manifest":"a1b2c3…","reused":412,"hashed":7,"dropped":1}
+```
+
+Fields sit at the top level. Nesting the payload under `data` costs every
+consumer a level on every access and buys only collision-avoidance, which the
+dotted `type` namespace already provides.
+
+**The version is per line, not per stream.** JSONL gets `grep`ed, `tail`ed,
+`split`, and piped through filters that keep some lines and drop others; a
+version in a header line survives none of that. One integer per line is cheap,
+and it is the same reasoning VII.1 applies to records on disk — the reader must
+be able to refuse what it does not understand, and a reader here may be holding
+a single line.
+
+**Rules out:** per-command ad-hoc shapes. Without a shared envelope there is no
+contract to evolve, and adding a field could silently break a consumer — the
+exact hazard the engine spent D15 preventing for records.
+
+**This freezes on first publish.** npm has no rollback (D37), so a consumer
+pinned to a version is pinned to this shape.
+
+## D40 · Per-file failures are their own events, with a terminal summary
+
+```
+{"v":1,"type":"restore.written","path":"/w/a.txt"}
+{"v":1,"type":"restore.failed","path":"/w/locked/x","error":"permission denied"}
+{"v":1,"type":"restore.done","written":2,"deleted":0,"failed":1,"safety":"c3d4…"}
+```
+
+Exit is non-zero whenever `failed` is non-empty — D28 settles that and this
+does not reopen it.
+
+**Streaming, because a long operation must report as it goes** (D32), and
+because a failure list inside one terminal event has no bound. Every fragment
+the engine injects anywhere else has a hard cap; a per-file list that grows
+with the plan would be the one place without one.
+
+**The terminal event is `.done` even when files failed.** It carries the counts
+and the `safety` id, and it must arrive in a fixed place: that id is what makes
+the restore reversible, and C20 was precisely the case where reversibility
+existed and was out of reach at the moment it was needed. Renaming the terminal
+event on failure would also collapse "wrote two of three" and "wrote nothing",
+which call for opposite responses.
 
 ## Open
 
