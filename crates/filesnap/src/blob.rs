@@ -53,7 +53,7 @@ impl BlobStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
         }
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::sweep::tmp_name(&path);
         fs::write(&tmp, content).map_err(|e| SnapshotError::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
         Ok(hash)

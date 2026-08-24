@@ -155,6 +155,29 @@ impl WorkspaceStore {
         })
     }
 
+    /// Run `f` holding this session's lock, so a second invocation of the
+    /// same session waits rather than interleaving with it.
+    ///
+    /// **Never nest this.** `flock` is per open-file-description, so a second
+    /// acquire inside the first would block against itself until the budget
+    /// expired and then report the session busy. Public methods take the
+    /// lock; the private `*_locked` helpers they call do not.
+    fn locked<T>(&self, session_id: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self.lock_session(session_id)?;
+        f()
+    }
+
+    /// Take this session's lock and hand back the guard, for a caller that
+    /// needs to hold it across more than one expression. Same rule: never
+    /// nest it.
+    fn lock_session(&self, session_id: &str) -> Result<crate::lock::SessionGuard> {
+        crate::lock::acquire(&self.partition, session_id, crate::lock::LOCK_BUDGET)?.ok_or_else(
+            || SnapshotError::SessionBusy {
+                session: session_id.to_string(),
+            },
+        )
+    }
+
     /// Which workspace's records this reaches.
     pub fn key(&self) -> &WorkspaceKey {
         &self.key
@@ -173,7 +196,9 @@ impl WorkspaceStore {
     ) -> Result<Checkpoint> {
         crate::id::validate_external("session id", thread_id)?;
         crate::id::validate_external("turn id", turn_id)?;
-        self.checkpoint_internal(thread_id, turn_id, files)
+        self.locked(thread_id, || {
+            self.checkpoint_internal(thread_id, turn_id, files)
+        })
     }
 
     /// The capture itself, reachable with an id from the reserved namespace.
@@ -207,13 +232,15 @@ impl WorkspaceStore {
     pub fn declare_paths(&self, session_id: &str, turn_id: &str, paths: &[PathBuf]) -> Result<()> {
         crate::id::validate_external("session id", session_id)?;
         crate::id::validate_external("turn id", turn_id)?;
-        self.declared.declare(session_id, turn_id, paths)
+        self.locked(session_id, || {
+            self.declared.declare(session_id, turn_id, paths)
+        })
     }
 
     /// Record that a turn happened, so the declared set's window counts
     /// turns rather than only the turns that declared something.
     pub fn note_turn(&self, session_id: &str, turn_id: &str) -> Result<()> {
-        self.declared.note_turn(session_id, turn_id)
+        self.locked(session_id, || self.declared.note_turn(session_id, turn_id))
     }
 
     /// Paths this session declared that are still inside the window — what a
@@ -232,7 +259,7 @@ impl WorkspaceStore {
     /// the session as tracking for its whole lifetime.
     pub fn ensure_session(&self, session_id: &str) -> Result<()> {
         crate::id::validate_external("session id", session_id)?;
-        self.refs.ensure(session_id)
+        self.locked(session_id, || self.refs.ensure(session_id))
     }
 
     /// Retroactively record what `path_key` held before an edit in `turn_id`.
@@ -256,6 +283,20 @@ impl WorkspaceStore {
     ) -> Result<Option<String>> {
         crate::id::validate_external("session id", session_id)?;
         crate::id::validate_external("turn id", turn_id)?;
+        self.locked(session_id, || {
+            self.attach_pre_edit_locked(session_id, turn_id, path_key, image)
+        })
+    }
+
+    /// The body of [`Self::attach_pre_edit`], with the session lock already
+    /// held. Never call it without one.
+    fn attach_pre_edit_locked(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        path_key: &str,
+        image: &PreEditImage,
+    ) -> Result<Option<String>> {
         let thread_id = session_id;
         let latest = self.latest_manifest(thread_id)?.unwrap_or_default();
         if latest.entries.contains_key(path_key) {
@@ -469,6 +510,10 @@ impl WorkspaceStore {
         crate::id::validate_external("session id", source_thread_id)?;
         crate::id::validate_external("session id", new_thread_id)?;
         crate::id::validate_external("turn id", through_turn_id)?;
+        // The *destination* is what this writes; the source is only read, and
+        // locking both would be a wider lock than D18 allows — and a deadlock
+        // the moment two forks cross.
+        let _guard = self.lock_session(new_thread_id)?;
         let log = self.refs.load(source_thread_id)?;
         let Some(cut) = log
             .entries
@@ -554,6 +599,15 @@ impl WorkspaceStore {
         // in `target.absent` but missing from `current.entries`, and
         // `plan_restore` needs both to delete. It survived the undo in
         // silence.
+        // Held for the whole restore: the safety capture appends to this
+        // session's log, and the undo record and its `ensure` write below.
+        //
+        // It does **not** reach a destination that is not the performer.
+        // D26 records that and accepts it: a forking host creates that
+        // session immediately before the call and nothing else is using it
+        // yet. Locking both would need a canonical order to avoid two
+        // crossing restores deadlocking, for a case that does not arise.
+        let _guard = self.lock_session(thread_id)?;
         let target_manifest = self.manifests.load(&target.manifest_id)?;
         let observed = current_files
             .into_iter()
@@ -612,7 +666,7 @@ impl WorkspaceStore {
     }
 
     /// Drop a thread's snapshot log (its data becomes garbage for `gc`).
-    pub fn remove_thread(&self, thread_id: &str) -> Result<()> {
+    fn remove_thread(&self, thread_id: &str) -> Result<()> {
         self.refs.remove(thread_id)
     }
 
@@ -656,7 +710,7 @@ impl WorkspaceStore {
     /// `remove_thread` deliberately leaves alone — a thread's log and the
     /// restores handed *to* it are separate lifetimes, and only deleting the
     /// conversation ends both.
-    pub fn remove_restores(&self, thread_id: &str) -> Result<()> {
+    fn remove_restores(&self, thread_id: &str) -> Result<()> {
         self.turns.remove_restores(thread_id)
     }
 
@@ -802,6 +856,16 @@ impl WorkspaceStore {
         }
 
         for (session_id, records) in doomed {
+            // Per session, inside the loop. Locking the whole batch first
+            // would make one busy session block the rest, and would be a
+            // wider lock than D18 allows the moment the batch is two.
+            let guard = match self.lock_session(session_id) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    outcome.refused.push((session_id.clone(), err));
+                    continue;
+                }
+            };
             doomed_turns.extend(records.turns);
             doomed_manifests.extend(records.manifests);
 
@@ -823,6 +887,7 @@ impl WorkspaceStore {
                     break;
                 }
             }
+            drop(guard);
         }
 
         match crate::sweep::prune_sessions(

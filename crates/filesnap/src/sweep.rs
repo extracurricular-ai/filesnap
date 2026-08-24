@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -64,6 +65,30 @@ pub(crate) fn settled(path: &Path) -> bool {
     fs::metadata(path)
         .and_then(|meta| meta.modified())
         .is_ok_and(|written| written <= cutoff)
+}
+
+/// A temporary name for `path` that no other writer can be using.
+///
+/// **Not `path.with_extension("tmp")`.** Two writers producing the same final
+/// path — which is the ordinary case for content-addressed records, and for a
+/// turn entry two forks share — would then write the *same* temporary and race
+/// on it: one renames it into place and the other's rename fails with ENOENT,
+/// so a capture that had done all its work reports an I/O error on a file it
+/// successfully wrote. Nothing wider than a session is locked (D18), so this
+/// has to be safe without a lock rather than because of one.
+///
+/// The process id distinguishes writers across processes and the counter
+/// distinguishes them within one. Both are only needed until the rename; after
+/// it the name is gone.
+pub(crate) fn tmp_name(path: &Path) -> PathBuf {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Mark `path` as referenced now, so the grace window measures last use

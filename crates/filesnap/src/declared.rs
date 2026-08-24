@@ -224,7 +224,7 @@ impl DeclaredStore {
 
     fn save(&self, session_id: &str, file: &DeclaredFile) -> Result<()> {
         let path = self.path_for(session_id)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::sweep::tmp_name(&path);
         fs::write(&tmp, serde_json::to_vec_pretty(file)?)
             .map_err(|e| SnapshotError::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))

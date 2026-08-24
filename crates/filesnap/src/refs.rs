@@ -148,7 +148,7 @@ impl RefStore {
         let entry = SnapshotRef::chained(turn_id, manifest_id, log.entries.last());
         log.entries.push(entry);
         let path = self.log_path(thread_id)?;
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::sweep::tmp_name(&path);
         let bytes = serde_json::to_vec_pretty(&log)?;
         fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
@@ -168,7 +168,7 @@ impl RefStore {
         if path.exists() {
             return Ok(());
         }
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::sweep::tmp_name(&path);
         let bytes = serde_json::to_vec_pretty(&ThreadLog::default())?;
         fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
@@ -566,7 +566,7 @@ impl TurnIndex {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = crate::sweep::tmp_name(path);
     fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
     fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))
 }

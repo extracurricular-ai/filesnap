@@ -37,6 +37,14 @@ pub enum SnapshotError {
         found: u32,
         supported: u32,
     },
+    /// Another invocation of this same session is running.
+    ///
+    /// Not a failure of the store: the caller asked for something that would
+    /// have raced a read-modify-write and silently lost one side of it. A
+    /// retry after the other invocation finishes is the right response, and
+    /// the operation is unchanged in the meantime (D18).
+    #[error("session {session} is busy: another filesnap invocation for it is running")]
+    SessionBusy { session: String },
     /// An id cannot become a filename. Refused rather than rewritten: mapping
     /// it onto something legal is what silently merges two distinct
     /// conversations into one record (D7).

@@ -181,7 +181,7 @@ impl ManifestStore {
             crate::sweep::freshen(&path);
             return Ok(id);
         }
-        let tmp = path.with_extension("tmp");
+        let tmp = crate::sweep::tmp_name(&path);
         let bytes = serde_json::to_vec_pretty(manifest)?;
         fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
