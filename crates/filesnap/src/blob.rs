@@ -37,14 +37,25 @@ impl BlobStore {
     pub fn store_bytes(&self, content: &[u8]) -> Result<String> {
         let hash = Self::hash_bytes(content);
         let path = self.blob_path(&hash)?;
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
-            }
-            let tmp = path.with_extension("tmp");
-            fs::write(&tmp, content).map_err(|e| SnapshotError::io(&tmp, e))?;
-            fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
+        if path.exists() {
+            // Already here, so nothing is written — and that is precisely why
+            // the mtime has to be bumped. Collection ages a blob to decide
+            // whether its absence from the live set can be trusted, and
+            // without this the timestamp records when the blob was *created*,
+            // not when it was last referenced. A three-day-old blob adopted
+            // by a capture one second ago is already settled, so the grace
+            // window never sees it and the sweep can take it out from under
+            // the manifest about to name it. Git answers the same race the
+            // same way, freshening loose objects rather than locking (D18).
+            crate::sweep::freshen(&path);
+            return Ok(hash);
         }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
+        }
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, content).map_err(|e| SnapshotError::io(&tmp, e))?;
+        fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
         Ok(hash)
     }
 

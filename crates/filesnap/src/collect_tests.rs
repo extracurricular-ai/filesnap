@@ -145,3 +145,44 @@ fn an_absent_store_is_not_an_error() {
     let data = tempfile::tempdir().unwrap();
     assert_eq!(collect_garbage(data.path()).unwrap(), GcStats::default());
 }
+
+/// An old blob adopted by a new capture is not collected before the manifest
+/// naming it has landed.
+///
+/// The subtle half of the grace window. `store_bytes` writes nothing when the
+/// hash is already present, so without freshening a blob's mtime records when
+/// it was *created* — and a three-day-old blob adopted one second ago is
+/// already settled, so the window never sees it. The race is real because a
+/// capture publishes its blobs before the manifest that names them: collection
+/// running in that gap finds a settled blob nothing references.
+///
+/// Written at the store level because that gap is exactly what the public API
+/// does not let a caller stand in.
+#[test]
+fn content_reused_by_a_new_capture_survives_the_gap_before_its_manifest() {
+    let data = tempfile::tempdir().unwrap();
+    let root = crate::workspace::store_root(data.path()).unwrap();
+    let blobs = crate::BlobStore::open(crate::workspace::blobs_dir(&root)).unwrap();
+
+    blobs.store_bytes(b"shared content").unwrap();
+    age_store(data.path());
+    assert_eq!(
+        collect_garbage(data.path()).unwrap().blobs_removed,
+        1,
+        "unreferenced and settled: this one really is garbage"
+    );
+
+    // Again, and this time a second capture adopts it while it is old.
+    let hash = blobs.store_bytes(b"shared content").unwrap();
+    age_store(data.path());
+    let adopted = blobs.store_bytes(b"shared content").unwrap();
+    assert_eq!(adopted, hash, "same content, same object — nothing written");
+
+    // Collection runs in the gap before that capture's manifest lands.
+    assert_eq!(
+        collect_garbage(data.path()).unwrap().blobs_removed,
+        0,
+        "freshening is what stops the sweep judging it by its creation time"
+    );
+    assert!(blobs.contains(&hash));
+}

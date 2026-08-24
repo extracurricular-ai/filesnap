@@ -66,6 +66,24 @@ pub(crate) fn settled(path: &Path) -> bool {
         .is_ok_and(|written| written <= cutoff)
 }
 
+/// Mark `path` as referenced now, so the grace window measures last use
+/// rather than creation.
+///
+/// Both stores dedup: a write whose content is already present writes
+/// nothing. That makes an object's mtime the time it was *created*, and the
+/// window is asking a different question — whether anyone might still be in
+/// the middle of publishing something that names it. Freshening makes the
+/// timestamp answer the question actually being asked.
+///
+/// Failure is ignored. A blob that cannot be freshened is one the sweep will
+/// judge by an older timestamp; the cost is a race that was already there,
+/// and failing a capture over it would be worse.
+pub(crate) fn freshen(path: &Path) {
+    if let Ok(file) = fs::File::options().write(true).open(path) {
+        let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+}
+
 /// Whether the live set below could be built from every root there is.
 ///
 /// A record that cannot be read is not evidence that anything is dead — it is

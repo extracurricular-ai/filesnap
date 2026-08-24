@@ -159,12 +159,22 @@ impl ManifestStore {
     pub fn save(&self, manifest: &Manifest) -> Result<String> {
         let id = manifest.id()?;
         let path = self.manifest_path(&id)?;
-        if !path.exists() {
-            let tmp = path.with_extension("tmp");
-            let bytes = serde_json::to_vec_pretty(manifest)?;
-            fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
-            fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
+        if path.exists() {
+            // Manifest ids are content-addressed too, so this dedups exactly
+            // as blobs do — and carries the same hazard, which the
+            // constitution states for content only. A live session that
+            // recaptures unchanged state re-derives an existing id and writes
+            // nothing, leaving that manifest instantly collectable while it
+            // is about to become live. Its log entry would then point at a
+            // manifest that is gone and the session would stop capturing
+            // entirely. See `BlobStore::store_bytes`.
+            crate::sweep::freshen(&path);
+            return Ok(id);
         }
+        let tmp = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(manifest)?;
+        fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
+        fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
         Ok(id)
     }
 
