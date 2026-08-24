@@ -13,6 +13,23 @@ which one. Open questions are at the bottom, not mixed in.
 
 ---
 
+## Implementation status
+
+Every decision here is implemented, or is waiting on the CLI that does not exist
+yet. A [drift audit](compliance.md) on 2026-08-24 found **19 decisions recorded
+and not implemented** — the failure mode was not disagreement about what to do,
+it was writing the decision down and then building on top of it as though it had
+been done. Closed by `9cf889a..949a0a4`.
+
+Not yet due, because they describe the CLI or the packaging: D2, D3, D29, D32,
+D34, D35, D37. D18's lock is engine-shaped but only a CLI can race itself, so it
+waits with them.
+
+Where a decision below describes the state of the code, it describes the state
+when it was written. Those passages are marked.
+
+---
+
 ## D1 · filesnap is a hard copy of the codex engine, with no path back
 
 The engine was written inside a fork of OpenAI Codex and copied out on
@@ -72,7 +89,7 @@ id's characters does not prevent it at all.
 ## D5 · No path may escape the store boundary, absolute or relative
 
 Every id that becomes a filename must be proven incapable of resolving outside
-its directory. Today `/` is mapped to `_`, so `../../etc/passwd` cannot
+its directory. `/` was mapped to `_`, so `../../etc/passwd` could not
 traverse — but `..`, `.`, and the empty string survive sanitizing and resolve to
 the directory itself.
 
@@ -168,7 +185,8 @@ That coupling is inherent to a deduplicating store, not an accidental
 entanglement, and severing it would trade a disk leak for `MissingBlob` in a
 session nobody deleted.
 
-**Where the code violates this today — one weld, not two:**
+**Where the code violated this — one weld, not two.** *Closed in `9cf889a`;
+the description below is what it was.*
 `forget_sessions` → `gc_for` → `collect_garbage_for` → `live_manifest_ids`,
 which is a *query that writes*: it answers "who is still live" and, as a side
 effect, prunes the turn index. So delete's own record cleanup happens inside
@@ -176,7 +194,7 @@ gc's marking helper, and delete's result depends on what gc's marking logic
 read. That same helper is where unwhitelisted `.tmp` files enter delete's
 liveness computation (D9) — one hole, two symptoms.
 
-**Fix shape:** split it into a pure read-only `live_manifests(refs)` that both
+**Fix shape, taken:** split it into a pure read-only query that both
 call, plus explicit pruning that each operation performs for the records it
 owns. Note this does not make delete self-sufficient for content — see above —
 it makes the *query* shared rather than one operation reaching through the
@@ -213,7 +231,7 @@ remove refs/<id>.json       → interrupted → done.
 record for a session with no log — a state nothing legitimate produces, and one
 that permanently pins manifests as a GC root, because `all_restore_logs` reads
 every file under `restores/` and never checks whether the session still exists.
-Recorded as C16; **not yet fixed in code.**
+Recorded as C16; **fixed in `29ea3e4`.**
 
 **Delete does not touch `turns/`.** The turn index is a pure cache: every
 `set_turn` is paired with a `refs.append` of the same `(turn_id, manifest_id)`
@@ -295,7 +313,7 @@ configured. A parameter with a correct default is neither a user knob nor a
 tuning requirement — the bound is still a property of the mechanism; the
 mechanism is simply parameterised for whoever embeds it.
 
-**Side effect:** `RECENT_LIMIT` and `RECENT_MAX_FILE_BYTES` are currently `pub`
+**Side effect:** `RECENT_LIMIT` and `RECENT_MAX_FILE_BYTES` were `pub`
 inside a private module and therefore unreachable — dead surface of the same
 class as the closed C11. They stop being a problem by becoming the default,
 rather than by being re-exported as constants a caller has to interpret.
@@ -333,7 +351,7 @@ comparison and a restore does not touch permissions for such an entry.
 
 Two sites produce `None` today: `attach_pre_edit`, whose content arrives from an
 edit with no stat behind it, and `mode_of` on a non-unix host, which has no
-permission bits to report. Both currently invent `0o644`, and the invention is
+permission bits to report. Both invented `0o644`, and the invention was
 not inert — `plan_restore` compares mode and `apply_plan` chmods, so restoring a
 pre-edit image of an executable script strips its `+x`, and a file whose content
 already matches is rewritten anyway because the invented mode never equals the
@@ -712,7 +730,7 @@ pub struct ApplyStats {
 }
 ```
 
-Today `apply_plan` propagates the first error with `?`, so one unwritable file
+`apply_plan` propagated the first error with `?`, so one unwritable file
 strands the other 499 — and the caller receives a bare `SnapshotError::Io` with
 no record of how far it got and no way to reach the safety point, because
 `RestoreOutcome` is only constructed on success. The safety manifest is on disk
