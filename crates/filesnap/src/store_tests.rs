@@ -13,6 +13,8 @@
 
 use super::*;
 use crate::fixture::Fixture;
+use crate::fixture::no_rules;
+use crate::fixture::rules_for;
 use pretty_assertions::assert_eq;
 
 const S: &str = "session-1";
@@ -112,7 +114,7 @@ fn deleting_takes_the_undo_record_with_the_log() {
             &target,
             RestoreKind::Rewind { undo_for: Some(S) },
             fx.restore_scope(S),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert!(store.last_restore_target(S).unwrap().is_some());
@@ -165,7 +167,7 @@ fn a_full_undo_stack_forgets_the_oldest_rewind_not_the_newest() {
                 &origin,
                 RestoreKind::Rewind { undo_for: Some(S) },
                 fx.restore_scope(S),
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
     }
@@ -179,7 +181,7 @@ fn a_full_undo_stack_forgets_the_oldest_rewind_not_the_newest() {
             &undo,
             RestoreKind::Undo { spending: S },
             fx.restore_scope(S),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -365,7 +367,7 @@ fn undo_conflicts_are_empty_when_nothing_moved() {
     let store = fx.store();
 
     assert!(
-        store.undo_conflicts(S, &|_| false).unwrap().is_empty(),
+        store.undo_conflicts(S, &no_rules()).unwrap().is_empty(),
         "no rewind, nothing to conflict with"
     );
 
@@ -377,11 +379,11 @@ fn undo_conflicts_are_empty_when_nothing_moved() {
             &target,
             RestoreKind::Rewind { undo_for: Some(S) },
             fx.restore_scope(S),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
-    assert!(store.undo_conflicts(S, &|_| false).unwrap().is_empty());
+    assert!(store.undo_conflicts(S, &no_rules()).unwrap().is_empty());
 }
 
 /// A file changed after the rewind is reported, because undoing would
@@ -404,7 +406,7 @@ fn a_change_made_after_a_rewind_is_reported_as_a_conflict() {
             &target,
             RestoreKind::Rewind { undo_for: Some(S) },
             fx.restore_scope(S),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -412,12 +414,12 @@ fn a_change_made_after_a_rewind_is_reported_as_a_conflict() {
     fx.write("a.txt", "three");
 
     assert_eq!(
-        store.undo_conflicts(S, &|_| false).unwrap(),
+        store.undo_conflicts(S, &no_rules()).unwrap(),
         vec![fx.path("a.txt").to_string_lossy().into_owned()]
     );
     assert!(
         store
-            .undo_conflicts(S, &|p: &str| p.ends_with("a.txt"))
+            .undo_conflicts(S, &rules_for(fx.workspace(), "a.txt"))
             .unwrap()
             .is_empty(),
         "a protected path is not a conflict, because an undo would not touch it"

@@ -9,6 +9,7 @@
 use filesnap::PreEditImage;
 use filesnap::SnapshotError;
 use filesnap::fixture::Fixture;
+use filesnap::fixture::no_rules;
 use pretty_assertions::assert_eq;
 
 /// Ids that used to be mapped onto one filename, merging three conversations
@@ -105,7 +106,7 @@ fn turn_ids_differing_after_a_dot_stay_distinct() {
                 &target,
                 filesnap::RestoreKind::Rewind { undo_for: None },
                 fx.restore_scope("s1"),
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
         assert_eq!(fx.read("a.txt"), content, "{turn}");

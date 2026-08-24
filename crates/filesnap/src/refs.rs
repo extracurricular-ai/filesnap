@@ -99,6 +99,27 @@ impl SnapshotRef {
     }
 }
 
+/// Refuse a record this build cannot read.
+///
+/// The same guard `Manifest::load` applies, shared by the four readers that
+/// needed it. Refusing is the point: a record whose version we do not know
+/// may mean anything, and the one thing it must not do is look like a record
+/// that means something else. `RestoreLog`'s `entries` and `Manifest`'s
+/// `absent` both deserialize an absent key as empty — which reads as "this
+/// session never rewound" and "this capture looked for nothing", and the
+/// second silently voids every deletion the record had licensed.
+fn check_version(kind: &'static str, id: &str, found: u32) -> Result<()> {
+    if found == crate::workspace::FORMAT_VERSION {
+        return Ok(());
+    }
+    Err(SnapshotError::UnknownRecordVersion {
+        kind,
+        id: id.to_string(),
+        found,
+        supported: crate::workspace::FORMAT_VERSION,
+    })
+}
+
 /// What a turn's index entry is suffixed with, so the directory can be read
 /// by whitelist and `with_extension("tmp")` has an extension to replace
 /// rather than eating the id's own last dot (D5, D9).
@@ -158,7 +179,11 @@ impl RefStore {
     pub fn load(&self, thread_id: &str) -> Result<ThreadLog> {
         let path = self.log_path(thread_id)?;
         match fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let log: ThreadLog = serde_json::from_slice(&bytes)?;
+                check_version("thread log", thread_id, log.version)?;
+                Ok(log)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ThreadLog::default()),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
@@ -192,7 +217,11 @@ impl RefStore {
                 continue;
             }
             match fs::read(entry.path()).map(|b| serde_json::from_slice::<ThreadLog>(&b)) {
-                Ok(Ok(log)) => out.logs.push(log),
+                // A version this build cannot read counts as unreadable, for
+                // the same reason: it is not evidence that anything is dead.
+                Ok(Ok(log)) if log.version == crate::workspace::FORMAT_VERSION => {
+                    out.logs.push(log);
+                }
                 _ => out.incomplete = true,
             }
         }
@@ -434,7 +463,11 @@ impl TurnIndex {
     fn restore_log(&self, thread_id: &str) -> Result<RestoreLog> {
         let path = self.restore_path(thread_id)?;
         match fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let log: RestoreLog = serde_json::from_slice(&bytes)?;
+                check_version("restore log", thread_id, log.version)?;
+                Ok(log)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RestoreLog::default()),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
@@ -453,7 +486,9 @@ impl TurnIndex {
             // silence, which reads to a sweep as "this holds nothing" — and
             // its two manifests then look dead. Say so instead.
             match fs::read(entry.path()).map(|b| serde_json::from_slice::<RestoreLog>(&b)) {
-                Ok(Ok(log)) => out.logs.push(log),
+                Ok(Ok(log)) if log.version == crate::workspace::FORMAT_VERSION => {
+                    out.logs.push(log);
+                }
                 _ => out.incomplete = true,
             }
         }
@@ -683,5 +718,70 @@ mod tests {
 
         assert_eq!(turns.pop_restore("t1").unwrap(), Some(record("a")));
         assert_eq!(turns.pop_restore("t1").unwrap(), None);
+    }
+
+    /// A record from a build we do not understand is refused, not read
+    /// optimistically.
+    ///
+    /// The hazard is specific: both `ThreadLog::entries` and
+    /// `RestoreLog::entries` deserialize a missing key as empty, so a record
+    /// written by a build that spelled them differently would come back as a
+    /// session that captured nothing and never rewound — losing history
+    /// silently rather than loudly.
+    #[test]
+    fn a_record_from_an_unknown_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("refs");
+        let refs = RefStore::open(&root).unwrap();
+        refs.append("t1", "turn-1".into(), "m1".into()).unwrap();
+
+        let raw = fs::read_to_string(root.join("t1.json")).unwrap();
+        fs::write(
+            root.join("t1.json"),
+            raw.replace("\"version\": 1", "\"version\": 99"),
+        )
+        .unwrap();
+
+        let err = refs.load("t1").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::UnknownRecordVersion { kind, found: 99, .. } if *kind == "thread log"
+            ),
+            "{err:?}"
+        );
+
+        // And a sweep treats it as unreadable rather than as an empty log,
+        // so nothing it names is mistaken for garbage.
+        assert!(refs.thread_logs().unwrap().incomplete);
+    }
+
+    /// The undo record carries a version too, and refuses the same way.
+    #[test]
+    fn an_undo_record_from_an_unknown_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
+        turns
+            .push_restore(
+                "t1",
+                RestoreRecord {
+                    target_manifest_id: "target".into(),
+                    safety_manifest_id: "safety".into(),
+                },
+            )
+            .unwrap();
+
+        let path = dir.path().join("restores").join("t1.json");
+        let raw = fs::read_to_string(&path).unwrap();
+        fs::write(&path, raw.replace("\"version\": 1", "\"version\": 99")).unwrap();
+
+        let err = turns.last_restore("t1").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SnapshotError::UnknownRecordVersion { kind, found: 99, .. } if *kind == "restore log"
+            ),
+            "{err:?}"
+        );
     }
 }

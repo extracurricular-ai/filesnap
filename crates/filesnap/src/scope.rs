@@ -32,8 +32,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use ignore::WalkBuilder;
-use ignore::gitignore::Gitignore;
-use ignore::gitignore::GitignoreBuilder;
+pub use ignore::gitignore::Gitignore;
+pub use ignore::gitignore::GitignoreBuilder;
 
 /// Name of the dedicated snapshot ignore file, in gitignore syntax.
 ///
@@ -83,18 +83,39 @@ pub fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
     ignore.matched_path_or_any_parents(path, false).is_ignore()
 }
 
-/// Largest file the recency partition will pick up.
+/// What bounds the recency partition.
 ///
-/// Its job is to exclude pathological objects — media, model weights,
-/// database files — not to draw a line through text. Generated code, lock
-/// files, notebooks and fixtures routinely reach a few MB and are exactly
-/// what a user wants back, so the limit sits well above them. Git-tracked
-/// files are not subject to it: whatever the project commits is the
-/// project's own content, however large.
-pub const RECENT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// A parameter with a correct default, not a setting. IV.4 forbids a bound
+/// being a knob a user has to find, and requires the engine to be affordable
+/// where nothing is configured — both still hold. What is parameterised is
+/// the *mechanism*, for whoever embeds it; the CLI does not expose this, and
+/// overriding it is usually the wrong move.
+///
+/// It replaces two `pub const`s in a private module, which were unreachable
+/// from outside the crate — surface that looked like API and was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanLimits {
+    /// How many recently-modified files the recency partition carries.
+    pub max_files: usize,
+    /// Largest file that partition will pick up.
+    ///
+    /// Its job is to exclude pathological objects — media, model weights,
+    /// database files — not to draw a line through text. Generated code, lock
+    /// files, notebooks and fixtures routinely reach a few MB and are exactly
+    /// what a user wants back, so the limit sits well above them. Git-tracked
+    /// files are not subject to it: whatever the project commits is the
+    /// project's own content, however large.
+    pub max_file_bytes: u64,
+}
 
-/// How many recently-modified files the residue partition carries.
-pub const RECENT_LIMIT: usize = 100;
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 100,
+            max_file_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
 
 /// Directory names the recency partition never descends into.
 ///
@@ -180,6 +201,7 @@ pub fn tracked_files(
     roots: &[PathBuf],
     already_known: impl IntoIterator<Item = PathBuf>,
     hidden: HiddenFiles,
+    limits: ScanLimits,
 ) -> BTreeSet<PathBuf> {
     let ignores: Vec<Gitignore> = roots.iter().map(|root| load_ignore(root)).collect();
 
@@ -188,7 +210,7 @@ pub fn tracked_files(
         files.extend(git_tracked_files(root, ignore));
     }
     for (root, ignore) in roots.iter().zip(&ignores) {
-        let picked = recent_files(root, ignore, hidden, &files);
+        let picked = recent_files(root, ignore, hidden, &files, limits);
         files.extend(picked);
     }
     files
@@ -294,6 +316,7 @@ pub fn recent_files(
     ignore: &Gitignore,
     hidden: HiddenFiles,
     covered: &BTreeSet<PathBuf>,
+    limits: ScanLimits,
 ) -> Vec<PathBuf> {
     let walker = WalkBuilder::new(dir)
         .standard_filters(false)
@@ -317,7 +340,7 @@ pub fn recent_files(
         let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
-        if meta.len() > RECENT_MAX_FILE_BYTES {
+        if meta.len() > limits.max_file_bytes {
             continue;
         }
         let Ok(modified) = meta.modified() else {
@@ -326,7 +349,7 @@ pub fn recent_files(
         candidates.push((modified, path));
     }
     candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    candidates.truncate(RECENT_LIMIT);
+    candidates.truncate(limits.max_files);
     candidates.into_iter().map(|(_, path)| path).collect()
 }
 
@@ -416,10 +439,16 @@ mod tests {
 
         let ignore = load_ignore(root);
         let names = |hidden: HiddenFiles| -> Vec<String> {
-            let mut out: Vec<String> = recent_files(root, &ignore, hidden, &BTreeSet::new())
-                .iter()
-                .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
-                .collect();
+            let mut out: Vec<String> = recent_files(
+                root,
+                &ignore,
+                hidden,
+                &BTreeSet::new(),
+                ScanLimits::default(),
+            )
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
             out.sort();
             out
         };
@@ -449,7 +478,7 @@ mod tests {
         // source file.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        for i in 0..(RECENT_LIMIT + 20) {
+        for i in 0..(ScanLimits::default().max_files + 20) {
             touch(&root.join(format!("src{i}.rs")), "fn main() {}");
         }
         std::fs::create_dir_all(root.join("target")).unwrap();
@@ -457,14 +486,24 @@ mod tests {
         touch(&root.join("huge.bin"), "x");
         std::fs::write(
             root.join("huge.bin"),
-            vec![0u8; (RECENT_MAX_FILE_BYTES + 1) as usize],
+            vec![0u8; (ScanLimits::default().max_file_bytes + 1) as usize],
         )
         .unwrap();
 
         let ignore = load_ignore(root);
-        let picked = recent_files(root, &ignore, HiddenFiles::Skip, &BTreeSet::new());
+        let picked = recent_files(
+            root,
+            &ignore,
+            HiddenFiles::Skip,
+            &BTreeSet::new(),
+            ScanLimits::default(),
+        );
 
-        assert_eq!(picked.len(), RECENT_LIMIT, "count is capped");
+        assert_eq!(
+            picked.len(),
+            ScanLimits::default().max_files,
+            "count is capped"
+        );
         assert!(
             !picked.iter().any(|p| p.ends_with("artifact.o")),
             "churn directories are never descended into"
@@ -484,7 +523,7 @@ mod tests {
         // genuinely untracked ones off the end of the list.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        for i in 0..(RECENT_LIMIT + 5) {
+        for i in 0..(ScanLimits::default().max_files + 5) {
             touch(&root.join(format!("known{i}.rs")), "covered");
         }
         // Older than everything above, so a plain recency ranking would never
@@ -493,10 +532,16 @@ mod tests {
         set_mtime_ago(&root.join("stray.txt"), 3600);
 
         let ignore = load_ignore(root);
-        let covered: BTreeSet<PathBuf> = (0..(RECENT_LIMIT + 5))
+        let covered: BTreeSet<PathBuf> = (0..(ScanLimits::default().max_files + 5))
             .map(|i| root.join(format!("known{i}.rs")))
             .collect();
-        let picked = recent_files(root, &ignore, HiddenFiles::Skip, &covered);
+        let picked = recent_files(
+            root,
+            &ignore,
+            HiddenFiles::Skip,
+            &covered,
+            ScanLimits::default(),
+        );
 
         assert_eq!(
             picked,

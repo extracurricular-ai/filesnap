@@ -4,6 +4,7 @@
 
 use filesnap::WorkspaceStore;
 use filesnap::fixture::blob_count;
+use filesnap::fixture::no_rules;
 use pretty_assertions::assert_eq;
 
 /// Deleting every session in one workspace must not touch content another
@@ -58,7 +59,7 @@ fn deleting_a_workspace_leaves_another_workspaces_content_alone() {
         &target,
         filesnap::RestoreKind::Rewind { undo_for: None },
         vec![ws_b.path().join("shared.txt")],
-        &|_| false,
+        &no_rules(),
     )
     .expect("B can still restore its own snapshot");
     assert_eq!(

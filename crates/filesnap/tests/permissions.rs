@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use filesnap::PreEditImage;
 use filesnap::RestoreKind;
 use filesnap::fixture::Fixture;
+use filesnap::fixture::no_rules;
 use pretty_assertions::assert_eq;
 
 const SESSION: &str = "s1";
@@ -64,7 +65,7 @@ fn a_rewind_does_not_strip_an_executable_bit() {
             &target,
             RestoreKind::Rewind { undo_for: None },
             fx.restore_scope(SESSION),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -101,7 +102,7 @@ fn a_mode_only_change_is_restored() {
             &target,
             RestoreKind::Rewind { undo_for: None },
             fx.restore_scope(SESSION),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -131,7 +132,7 @@ fn nothing_is_rewritten_when_the_state_already_matches() {
             &target,
             RestoreKind::Rewind { undo_for: None },
             fx.restore_scope(SESSION),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 

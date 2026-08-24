@@ -24,6 +24,7 @@ use tempfile::TempDir;
 
 use crate::PreEditImage;
 use crate::WorkspaceStore;
+use crate::scope::Gitignore;
 use crate::scope::HiddenFiles;
 use crate::scope::is_ignored;
 use crate::scope::load_ignore;
@@ -143,11 +144,10 @@ impl Fixture {
         files
     }
 
-    /// The symmetric-ignore predicate over manifest path keys, read fresh so
-    /// the *current* rules govern.
-    pub fn protection(&self) -> impl Fn(&str) -> bool + use<> {
-        let ignore = load_ignore(self.workspace());
-        move |path: &str| is_ignored(&ignore, Path::new(path))
+    /// This workspace's ignore rules, read fresh so the *current* file
+    /// governs — newly ignoring a path protects it retroactively (II.3).
+    pub fn protection(&self) -> Gitignore {
+        load_ignore(self.workspace())
     }
 
     /// Capture a turn over everything currently in the workspace.
@@ -181,6 +181,7 @@ impl Fixture {
             &[self.workspace().to_path_buf()],
             already_known,
             HiddenFiles::Skip,
+            crate::ScanLimits::default(),
         )
         .into_iter()
         .collect()
@@ -238,4 +239,19 @@ pub fn blob_count(data_dir: &Path) -> usize {
     let mut seen = 0;
     walk(&crate::workspace::blobs_dir(&root), &mut seen);
     seen
+}
+
+/// Rules that protect nothing — the ordinary case, spelled once.
+pub fn no_rules() -> Gitignore {
+    Gitignore::empty()
+}
+
+/// Rules built **in memory** from one pattern, the way a caller adds a
+/// temporary protection without touching the user's `.filesnapignore` (D12).
+pub fn rules_for(root: &Path, pattern: &str) -> Gitignore {
+    let mut builder = crate::scope::GitignoreBuilder::new(root);
+    builder
+        .add_line(None, pattern)
+        .expect("valid ignore pattern");
+    builder.build().expect("build ignore rules")
 }

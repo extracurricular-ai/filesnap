@@ -23,9 +23,11 @@ use crate::refs::TurnIndex;
 use crate::restore::ApplyStats;
 use crate::restore::RestorePlan;
 use crate::restore::apply_plan;
+use crate::restore::is_protected;
 use crate::restore::plan_restore;
 use crate::workspace;
 use crate::workspace::WorkspaceKey;
+use ignore::gitignore::Gitignore;
 
 /// Turn-id prefix for the safety checkpoint recorded before every restore.
 ///
@@ -306,11 +308,7 @@ impl WorkspaceStore {
     /// would touch.
     ///
     /// Empty when there is nothing to undo, or when nothing has moved.
-    pub fn undo_conflicts(
-        &self,
-        thread_id: &str,
-        is_protected: &dyn Fn(&str) -> bool,
-    ) -> Result<Vec<String>> {
+    pub fn undo_conflicts(&self, thread_id: &str, rules: &Gitignore) -> Result<Vec<String>> {
         let Some(record) = self.turns.last_restore(thread_id)? else {
             return Ok(Vec::new());
         };
@@ -318,7 +316,7 @@ impl WorkspaceStore {
 
         let mut moved = Vec::new();
         for (path, entry) in &expected.entries {
-            if is_protected(path) {
+            if is_protected(rules, path) {
                 continue;
             }
             let matches = fs::read(path)
@@ -330,7 +328,7 @@ impl WorkspaceStore {
         }
         // A path the rewind removed, which is back: someone recreated it.
         for path in &expected.absent {
-            if !is_protected(path) && Path::new(path).exists() {
+            if !is_protected(rules, path) && Path::new(path).exists() {
                 moved.push(path.clone());
             }
         }
@@ -347,7 +345,7 @@ impl WorkspaceStore {
         // simultaneously what the undo is about to write over.
         let restoring = self.manifests.load(&record.safety_manifest_id)?;
         for (path, entry) in &restoring.entries {
-            if is_protected(path)
+            if is_protected(rules, path)
                 || expected.entries.contains_key(path)
                 || expected.absent.contains(path)
             {
@@ -365,7 +363,7 @@ impl WorkspaceStore {
         // tell us: only the safety manifest knows a file existing now was
         // absent then and is about to be removed.
         for path in &restoring.absent {
-            if !is_protected(path) && Path::new(path).exists() {
+            if !is_protected(rules, path) && Path::new(path).exists() {
                 moved.push(path.clone());
             }
         }
@@ -456,7 +454,7 @@ impl WorkspaceStore {
     /// Restore `session_id`'s tracked state to `target`.
     ///
     /// `current_files` is the present tracked set — it is re-captured as the
-    /// safety checkpoint first, so the restore is reversible. `is_protected`
+    /// safety checkpoint first, so the restore is reversible. `rules`
     /// is the symmetric-ignore predicate over manifest path keys, evaluated
     /// against the *current* ignore rules, so newly ignoring a path protects
     /// it retroactively.
@@ -466,7 +464,7 @@ impl WorkspaceStore {
         target: &RestoreTarget,
         kind: RestoreKind<'_>,
         current_files: impl IntoIterator<Item = PathBuf>,
-        is_protected: &dyn Fn(&str) -> bool,
+        rules: &Gitignore,
     ) -> Result<RestoreOutcome> {
         let thread_id = session_id;
         // 1. Capture what is about to be replaced, so this restore can be
@@ -506,7 +504,7 @@ impl WorkspaceStore {
         // session's history, so the outcome depends only on where the
         // workspace is and where it is going.
         let current = self.manifests.load(&safety.id)?;
-        let plan = plan_restore(&target_manifest, &current, is_protected);
+        let plan = plan_restore(&target_manifest, &current, rules);
         let stats = apply_plan(&self.blobs, &plan)?;
 
         // The undo record is filed under the session this hands the workspace

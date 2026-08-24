@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use crate::error::Result;
 use crate::scope::HiddenFiles;
+use crate::scope::ScanLimits;
 use crate::scope::is_ignored;
 use crate::scope::load_ignore;
 use crate::scope::tracked_files;
@@ -47,6 +48,9 @@ pub struct SnapshotTracker {
     store: WorkspaceStore,
     session_id: String,
     hidden: HiddenFiles,
+    /// Carried rather than read at each scan so one session's bound cannot
+    /// change under it mid-conversation (D14).
+    limits: ScanLimits,
     state: Mutex<TrackState>,
 }
 
@@ -77,6 +81,7 @@ impl SnapshotTracker {
         session_id: String,
         start: SessionStart,
         hidden: HiddenFiles,
+        limits: ScanLimits,
     ) -> Option<Arc<Self>> {
         let store = match WorkspaceStore::open(data_dir, workspace) {
             Ok(store) => store,
@@ -107,6 +112,7 @@ impl SnapshotTracker {
             store,
             session_id,
             hidden,
+            limits,
             state: Mutex::new(TrackState::default()),
         }))
     }
@@ -161,7 +167,7 @@ impl SnapshotTracker {
         // most of what is on disk is build output, which is both the bulk of
         // the cost and the least worth keeping.
         let extras: Vec<PathBuf> = self.lock_state().extras.iter().cloned().collect();
-        let files = tracked_files(&roots, extras, self.hidden);
+        let files = tracked_files(&roots, extras, self.hidden, self.limits);
         let checkpoint = self.store.checkpoint(&self.session_id, turn_id, files)?;
         info!(
             "filesnap: turn {turn_id} checkpoint {} ({} reused, {} hashed, {} skipped)",
@@ -235,7 +241,14 @@ mod tests {
         id: &str,
         start: SessionStart,
     ) -> Option<Arc<SnapshotTracker>> {
-        SnapshotTracker::maybe_new(home.path(), ws.path(), id.into(), start, HiddenFiles::Skip)
+        SnapshotTracker::maybe_new(
+            home.path(),
+            ws.path(),
+            id.into(),
+            start,
+            HiddenFiles::Skip,
+            ScanLimits::default(),
+        )
     }
 
     fn tracking(
@@ -372,7 +385,7 @@ mod tests {
         let (home, loose) = dirs();
         let ctl = tracking(&home, &loose, "t1");
 
-        for i in 0..(crate::scope::RECENT_LIMIT + 50) {
+        for i in 0..(crate::ScanLimits::default().max_files + 50) {
             std::fs::write(loose.path().join(format!("f{i}.txt")), "x").unwrap();
         }
         ctl.checkpoint_turn_start("turn-1", loose.path(), &[]);
@@ -380,7 +393,7 @@ mod tests {
         let history = ctl.store.thread_history("t1").unwrap();
         assert_eq!(
             history[0].1.entries.len(),
-            crate::scope::RECENT_LIMIT,
+            crate::ScanLimits::default().max_files,
             "no repository here, so only the recency partition contributes"
         );
     }

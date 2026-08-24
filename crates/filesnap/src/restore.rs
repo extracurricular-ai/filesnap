@@ -19,6 +19,12 @@ use crate::blob::BlobStore;
 use crate::error::Result;
 use crate::error::SnapshotError;
 use crate::manifest::Manifest;
+use ignore::gitignore::Gitignore;
+
+/// The symmetric-ignore test over a manifest's path keys.
+pub(crate) fn is_protected(rules: &Gitignore, path: &str) -> bool {
+    crate::scope::is_ignored(rules, Path::new(path))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteAction {
@@ -41,18 +47,18 @@ pub struct RestorePlan {
 /// found nothing. Leaving an extra file behind is recoverable; deleting one
 /// the system never observed is not.
 ///
-/// `is_protected` is the symmetric-ignore predicate over manifest path keys.
-/// Both directions honour it, so an ignored path is neither written nor
-/// removed.
-pub fn plan_restore(
-    target: &Manifest,
-    current: &Manifest,
-    is_protected: &dyn Fn(&str) -> bool,
-) -> RestorePlan {
+/// `rules` are the ignore rules themselves, applied symmetrically: an ignored
+/// path is neither written nor removed. They are data rather than a closure
+/// on purpose (D12) — the protection can then be logged and shown ("these
+/// four paths were protected and not written"), and it is the same concept as
+/// the ignore file rather than a second one. A caller wanting a temporary
+/// rule appends it in memory with `GitignoreBuilder::add_line`; the user's
+/// `.filesnapignore` is theirs and is never written to.
+pub fn plan_restore(target: &Manifest, current: &Manifest, rules: &Gitignore) -> RestorePlan {
     let mut plan = RestorePlan::default();
 
     for (path, entry) in &target.entries {
-        if is_protected(path) {
+        if is_protected(rules, path) {
             continue;
         }
         // Mode counts only when both sides observed one. An entry whose
@@ -76,7 +82,7 @@ pub fn plan_restore(
     // target — a capture only ever sees what it was asked about, so absence
     // from `entries` alone says nothing about whether the file existed.
     for path in current.entries.keys() {
-        if !is_protected(path) && target.absent.contains(path) {
+        if !is_protected(rules, path) && target.absent.contains(path) {
             plan.deletes.push(path.clone());
         }
     }
@@ -185,7 +191,7 @@ mod tests {
         let target = manifest(&[("/a", "h-old"), ("/b", "h-b")]);
         let current = manifest(&[("/a", "h-new")]);
 
-        let plan = plan_restore(&target, &current, &|_| false);
+        let plan = plan_restore(&target, &current, &Gitignore::empty());
         let paths: Vec<&str> = plan.writes.iter().map(|w| w.path.as_str()).collect();
         assert_eq!(paths, vec!["/a", "/b"]);
     }
@@ -193,7 +199,10 @@ mod tests {
     #[test]
     fn identical_states_need_no_work() {
         let m = manifest(&[("/a", "h")]);
-        assert_eq!(plan_restore(&m, &m, &|_| false), RestorePlan::default());
+        assert_eq!(
+            plan_restore(&m, &m, &Gitignore::empty()),
+            RestorePlan::default()
+        );
     }
 
     #[test]
@@ -205,7 +214,7 @@ mod tests {
         let target = manifest(&[("/kept", "h-k")]);
         let current = manifest(&[("/kept", "h-k"), ("/added", "h-a")]);
 
-        let plan = plan_restore(&target, &current, &|_| false);
+        let plan = plan_restore(&target, &current, &Gitignore::empty());
         assert!(
             plan.deletes.is_empty(),
             "missing from the target says nothing on its own"
@@ -214,7 +223,7 @@ mod tests {
         // Recorded as looked-for-and-absent, it says everything.
         let mut target = target;
         target.absent.insert("/added".to_string());
-        let plan = plan_restore(&target, &current, &|_| false);
+        let plan = plan_restore(&target, &current, &Gitignore::empty());
         assert_eq!(plan.deletes, vec!["/added"]);
         assert!(plan.writes.is_empty());
     }
@@ -224,7 +233,11 @@ mod tests {
         let target = manifest(&[("/secret/a", "h-1"), ("/ok", "h-ok")]);
         let current = manifest(&[("/secret/b", "h-2")]);
 
-        let protect = |p: &str| p.starts_with("/secret/");
+        // Built in memory, which is the point of D12: a temporary rule never
+        // touches the user's own `.filesnapignore`.
+        let mut builder = crate::scope::GitignoreBuilder::new("/");
+        builder.add_line(None, "/secret/**").unwrap();
+        let protect = builder.build().unwrap();
         let plan = plan_restore(&target, &current, &protect);
         let write_paths: Vec<&str> = plan.writes.iter().map(|w| w.path.as_str()).collect();
         assert_eq!(
@@ -246,8 +259,8 @@ mod tests {
         let target = manifest(&[("/a", "h-old")]);
         let current = manifest(&[("/a", "h-new")]);
 
-        let first = plan_restore(&target, &current, &|_| false);
-        let after_undo = plan_restore(&target, &current, &|_| false);
+        let first = plan_restore(&target, &current, &Gitignore::empty());
+        let after_undo = plan_restore(&target, &current, &Gitignore::empty());
         assert_eq!(first, after_undo);
     }
 }

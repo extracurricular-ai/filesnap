@@ -12,6 +12,8 @@ use filesnap::PreEditImage;
 use filesnap::RestoreKind;
 use filesnap::SNAPSHOT_IGNORE_FILENAME;
 use filesnap::WorkspaceStore;
+use filesnap::fixture::no_rules;
+use filesnap::fixture::rules_for;
 use filesnap::is_ignored;
 use filesnap::load_ignore;
 use filesnap::tracked_files;
@@ -128,8 +130,7 @@ fn full_rewind_redo_gc_scenario() {
     };
 
     // Rewind to turn 1. Protection = current ignore rules.
-    let ignore = load_ignore(&ws);
-    let protect = move |path: &str| is_ignored(&ignore, Path::new(path));
+    let protect = load_ignore(&ws);
     let outcome = store
         .restore_to(
             THREAD,
@@ -167,8 +168,7 @@ fn full_rewind_redo_gc_scenario() {
     );
 
     // Redo: restore the safety checkpoint → pre-rewind state returns.
-    let ignore2 = load_ignore(&ws);
-    let protect2 = move |path: &str| is_ignored(&ignore2, Path::new(path));
+    let protect2 = load_ignore(&ws);
     store
         .restore_to(
             THREAD,
@@ -249,7 +249,7 @@ fn restore_preserves_permissions() {
                 undo_for: Some(BRANCH),
             },
             all_files(&ws),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -365,7 +365,7 @@ fn thread_marker_and_pre_edit_attach() {
                 undo_for: Some(BRANCH),
             },
             all_files(&ws).into_iter().chain([outside.clone()]),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert_eq!(read(&outside), "pre-edit state");
@@ -455,7 +455,7 @@ fn rewinding_twice_still_restores() {
                 undo_for: Some(BRANCH),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert_eq!(read(&ws.join("a.txt")), "v1", "first rewind");
@@ -468,7 +468,7 @@ fn rewinding_twice_still_restores() {
             &safety,
             RestoreKind::Undo { spending: BRANCH },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert_eq!(
@@ -488,7 +488,7 @@ fn rewinding_twice_still_restores() {
                 undo_for: Some(BRANCH),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert_eq!(
@@ -524,31 +524,38 @@ fn an_undo_reports_what_moved_since_the_rewind() {
                 undo_for: Some(BRANCH),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
     // Nothing has moved yet.
     assert!(
-        store.undo_conflicts(BRANCH, &|_| false).unwrap().is_empty(),
+        store
+            .undo_conflicts(BRANCH, &no_rules())
+            .unwrap()
+            .is_empty(),
         "the workspace still looks like what the rewind left"
     );
 
     // Someone else edits a file the undo would overwrite.
     fs::write(ws.join("kept.txt"), "theirs").unwrap();
-    let conflicts = store.undo_conflicts(BRANCH, &|_| false).unwrap();
+    let conflicts = store.undo_conflicts(BRANCH, &no_rules()).unwrap();
     assert_eq!(conflicts.len(), 1);
     assert!(conflicts[0].ends_with("kept.txt"));
 
     // Ignored paths are not reported: the restore would not touch them.
-    let noisy = ws.join("build.log").to_string_lossy().into_owned();
     fs::write(ws.join("build.log"), "changed too").unwrap();
-    let protect = move |path: &str| path == noisy;
+    let protect = rules_for(&ws, "build.log");
     let conflicts = store.undo_conflicts(BRANCH, &protect).unwrap();
     assert_eq!(conflicts.len(), 1, "only the path the undo would write");
 
     // A thread with nothing to undo has nothing to report.
-    assert!(store.undo_conflicts(THREAD, &|_| false).unwrap().is_empty());
+    assert!(
+        store
+            .undo_conflicts(THREAD, &no_rules())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -573,7 +580,7 @@ fn a_restore_with_no_destination_leaves_no_undo() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind { undo_for: None },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -608,7 +615,7 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
                 undo_for: Some("branch-a"),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -621,7 +628,7 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
                 undo_for: Some("branch-b"),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -640,7 +647,7 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
                 spending: "branch-b",
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert!(store.last_restore_target("branch-b").unwrap().is_none());
@@ -679,7 +686,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
                     undo_for: Some(BRANCH),
                 },
                 scan(),
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
     };
@@ -691,7 +698,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
                 &target,
                 RestoreKind::Undo { spending: BRANCH },
                 scan(),
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
     };
@@ -736,9 +743,14 @@ fn a_capture_covers_every_configured_root() {
 
     let roots = vec![a.clone(), b.clone()];
     let scan = || {
-        tracked_files(&roots, [], HiddenFiles::Skip)
-            .into_iter()
-            .collect::<Vec<_>>()
+        tracked_files(
+            &roots,
+            [],
+            HiddenFiles::Skip,
+            filesnap::ScanLimits::default(),
+        )
+        .into_iter()
+        .collect::<Vec<_>>()
     };
     let cp1 = store.checkpoint(THREAD, "turn-1", scan()).unwrap();
     assert_eq!(cp1.manifest.entries.len(), 2, "both roots captured");
@@ -765,7 +777,7 @@ fn a_capture_covers_every_configured_root() {
                 undo_for: Some(BRANCH),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -832,7 +844,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
                 undo_for: Some(BRANCH),
             },
             current,
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
@@ -870,7 +882,7 @@ fn undo_walks_back_through_successive_rewinds() {
                     undo_for: Some(BRANCH),
                 },
                 scan(),
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
     };
@@ -882,7 +894,7 @@ fn undo_walks_back_through_successive_rewinds() {
                 &target,
                 RestoreKind::Undo { spending: BRANCH },
                 scan(),
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
     };
@@ -936,7 +948,7 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
                 undo_for: Some(BRANCH),
             },
             scan(),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert!(store.last_restore_target(BRANCH).unwrap().is_some());
@@ -1053,7 +1065,7 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
                 undo_for: Some(BRANCH),
             },
             source_scope,
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert!(!script.exists(), "still deleted; the target never saw it");
@@ -1069,7 +1081,7 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
             &outcome.safety,
             RestoreKind::Undo { spending: BRANCH },
             all_files(&ws),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert!(
@@ -1162,19 +1174,22 @@ fn the_undo_warning_covers_what_it_will_delete() {
                 undo_for: Some(BRANCH),
             },
             all_files(&ws),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
 
     assert!(
-        store.undo_conflicts(BRANCH, &|_| false).unwrap().is_empty(),
+        store
+            .undo_conflicts(BRANCH, &no_rules())
+            .unwrap()
+            .is_empty(),
         "nothing has moved yet"
     );
 
     // The user writes it back. The undo will delete it again.
     fs::write(&scratch, "written after the rewind").unwrap();
     assert_eq!(
-        store.undo_conflicts(BRANCH, &|_| false).unwrap(),
+        store.undo_conflicts(BRANCH, &no_rules()).unwrap(),
         vec![scratch.to_string_lossy().into_owned()],
         "a file the undo is about to remove must be reported, not just the \
          ones it will overwrite"
@@ -1212,7 +1227,7 @@ fn the_undo_warning_covers_files_the_rewind_never_touched() {
                 undo_for: Some(BRANCH),
             },
             all_files(&ws),
-            &|_| false,
+            &no_rules(),
         )
         .unwrap();
     assert_eq!(
@@ -1221,14 +1236,17 @@ fn the_undo_warning_covers_files_the_rewind_never_touched() {
         "the rewind leaves a path its target never mentioned"
     );
     assert!(
-        store.undo_conflicts(BRANCH, &|_| false).unwrap().is_empty(),
+        store
+            .undo_conflicts(BRANCH, &no_rules())
+            .unwrap()
+            .is_empty(),
         "and while it still matches, there is nothing to warn about"
     );
 
     // Someone edits it. The undo will write the old bytes back over this.
     fs::write(&bystander, "edited after the rewind").unwrap();
     assert_eq!(
-        store.undo_conflicts(BRANCH, &|_| false).unwrap(),
+        store.undo_conflicts(BRANCH, &no_rules()).unwrap(),
         vec![bystander.to_string_lossy().into_owned()],
         "a path the undo will overwrite must be reported even though the \
          rewind's target has never heard of it"

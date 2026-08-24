@@ -54,9 +54,14 @@ pub use restore::apply_plan;
 pub use restore::plan_restore;
 pub use scope::HiddenFiles;
 pub use scope::SNAPSHOT_IGNORE_FILENAME;
+pub use scope::ScanLimits;
 pub use scope::find_workspace_root;
 pub use scope::git_tracked_files;
 pub use scope::is_ignored;
+// D13: consumers name `Gitignore` in our signatures, so they get the type
+// from us rather than adding their own dependency on `ignore`.
+pub use ignore::gitignore::Gitignore;
+pub use ignore::gitignore::GitignoreBuilder;
 pub use scope::load_ignore;
 pub use scope::recent_files;
 pub use scope::tracked_files;

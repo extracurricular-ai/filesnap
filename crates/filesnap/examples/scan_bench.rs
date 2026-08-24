@@ -39,7 +39,13 @@ fn main() {
         // what the exclusion is worth on this tree.
         let covered: std::collections::BTreeSet<_> = git.iter().cloned().collect();
         let t = std::time::Instant::now();
-        let recent = filesnap::recent_files(p, &ignore, filesnap::HiddenFiles::Skip, &covered);
+        let recent = filesnap::recent_files(
+            p,
+            &ignore,
+            filesnap::HiddenFiles::Skip,
+            &covered,
+            filesnap::ScanLimits::default(),
+        );
         report("recent (residue)", &recent, t.elapsed());
 
         let blind = filesnap::recent_files(
@@ -47,6 +53,7 @@ fn main() {
             &ignore,
             filesnap::HiddenFiles::Skip,
             &std::collections::BTreeSet::new(),
+            filesnap::ScanLimits::default(),
         );
         let wasted = blind.iter().filter(|f| covered.contains(*f)).count();
         println!(

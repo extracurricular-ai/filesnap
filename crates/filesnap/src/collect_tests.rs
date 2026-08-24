@@ -13,6 +13,7 @@ use super::*;
 use crate::WorkspaceStore;
 use crate::fixture::age_store;
 use crate::fixture::blob_count;
+use crate::fixture::no_rules;
 use pretty_assertions::assert_eq;
 
 /// A workspace with one captured file, sharing `data` with any other.
@@ -78,7 +79,7 @@ fn collecting_leaves_every_workspace_able_to_restore() {
                 &target,
                 crate::RestoreKind::Rewind { undo_for: None },
                 vec![ws.path().join(rel)],
-                &|_| false,
+                &no_rules(),
             )
             .unwrap();
         assert_eq!(
