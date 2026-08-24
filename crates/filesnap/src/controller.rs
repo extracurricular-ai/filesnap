@@ -51,6 +51,9 @@ pub struct SnapshotTracker {
     /// Carried rather than read at each scan so one session's bound cannot
     /// change under it mid-conversation (D14).
     limits: ScanLimits,
+    /// The directory this session is bound to (D4), and the fallback the
+    /// ignore filter uses before any capture has run — see `ignore_root`.
+    workspace: PathBuf,
     state: Mutex<TrackState>,
 }
 
@@ -65,8 +68,17 @@ struct TrackState {
     extras: BTreeSet<PathBuf>,
     /// Directory whose ignore rules scope this session's captures: the
     /// workspace root when one was found, else the invocation directory.
-    /// Recorded by the turn-start checkpoint, which always precedes tool
-    /// execution within a turn.
+    /// Recorded by the turn-start checkpoint.
+    ///
+    /// `None` until then, which used to mean the edit hook's filter matched
+    /// nothing at all — `None.is_some_and(..)` is `false`. The ordering that
+    /// saved it ("the turn-start checkpoint always precedes tool execution")
+    /// was a promise about a caller in another crate, with nothing here to
+    /// enforce it, and the cost of it not holding is an ignored file — a
+    /// `.env`, a key — entering the blob store and then being kept by every
+    /// later capture, since the path is registered as an extra. II.3 requires
+    /// the rule to hold from the first operation, so the session's bound
+    /// directory is the fallback (C6).
     ignore_root: Option<PathBuf>,
 }
 
@@ -116,6 +128,7 @@ impl SnapshotTracker {
             session_id,
             hidden,
             limits,
+            workspace: workspace.to_path_buf(),
             state: Mutex::new(TrackState::default()),
         }))
     }
@@ -213,13 +226,17 @@ impl SnapshotTracker {
         // the path as an extra, so every later checkpoint would capture it as
         // well — bypassing the scan's own ignore filter. The rules are read
         // fresh so the current ignore file governs.
-        let ignore = self.lock_state().ignore_root.as_deref().map(load_ignore);
+        // Never `None`: an unfiltered edit hook is how an ignored file gets
+        // into the store permanently (C6).
+        let root = self
+            .lock_state()
+            .ignore_root
+            .clone()
+            .unwrap_or_else(|| self.workspace.clone());
+        let ignore = load_ignore(&root);
         let mut declared = Vec::new();
         for (path, image) in pre_images {
-            if ignore
-                .as_ref()
-                .is_some_and(|rules| is_ignored(rules, &path))
-            {
+            if is_ignored(&ignore, &path) {
                 continue;
             }
             // The edit-touched partition. Bounded by a rolling window of
@@ -508,6 +525,53 @@ mod tests {
             last.entries
                 .contains_key(&outside.to_string_lossy().into_owned()),
             "extras are unioned into later checkpoints"
+        );
+    }
+
+    /// An edit that lands before any capture is still filtered.
+    ///
+    /// `ignore_root` is `None` until the turn-start checkpoint records it,
+    /// and the filter was `None.is_some_and(..)` — which is `false`, so
+    /// nothing was ignored. The ordering that saved it was a promise about a
+    /// caller in another crate. The cost of it not holding is an ignored file
+    /// entering the blob store and then being kept by every later capture,
+    /// because the path is registered as an extra (C6, II.3).
+    #[test]
+    fn the_edit_hook_filters_before_the_first_capture_has_run() {
+        let home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join(crate::SNAPSHOT_IGNORE_FILENAME), ".env\n").unwrap();
+        let secret = ws.path().join(".env");
+        std::fs::write(&secret, "TOKEN=hunter2").unwrap();
+
+        let tracker = SnapshotTracker::maybe_new(
+            home.path(),
+            ws.path(),
+            "s1".into(),
+            SessionStart::New {
+                tracking_enabled: true,
+            },
+            HiddenFiles::Skip,
+            ScanLimits::default(),
+        )
+        .expect("tracking enabled");
+
+        // No checkpoint yet, so nothing has recorded an ignore root.
+        tracker.attach_pre_edits(
+            "turn-1",
+            vec![(
+                secret.clone(),
+                PreEditImage::Existed(b"TOKEN=hunter2".to_vec()),
+            )],
+        );
+
+        let store = crate::WorkspaceStore::open(home.path(), ws.path()).unwrap();
+        assert!(
+            !store
+                .tracked_paths("s1")
+                .unwrap()
+                .contains(&secret.to_string_lossy().into_owned()),
+            "an ignored path entered the store through the edit hook"
         );
     }
 }

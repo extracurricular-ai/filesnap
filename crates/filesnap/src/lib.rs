@@ -9,6 +9,24 @@
 //! appears only as one source of file *names*, and a directory that has
 //! never seen `git init` is a first-class workspace.
 //!
+//! # What is covered, and what is not
+//!
+//! A file enters the tracked set three ways: the project's git index lists
+//! it, a recency walk finds it, or an edit declares it. Only the third is
+//! unbounded, and the first two have shapes worth knowing:
+//!
+//! - the index cannot see an untracked file;
+//! - the recency walk skips hidden directories and a fixed list of build
+//!   directories, drops files over [`ScanLimits::max_file_bytes`], and keeps
+//!   at most [`ScanLimits::max_files`] paths per root.
+//!
+//! So a file created by a shell command inside `target/`, inside a dotted
+//! directory, over the size limit, or beyond the recency budget on a busy
+//! turn is covered **only** if it also flowed through the host's edit API.
+//! This is a real gap and it is stated rather than implied: total coverage is
+//! not promised, and [`scan_report`] answers "what in my project is not
+//! protected" for any particular workspace.
+//!
 //! The rules this crate is built to keep, and the places it does not yet
 //! keep them, are in `.specify/memory/constitution.md` and
 //! `.specify/memory/compliance.md`.

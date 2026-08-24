@@ -190,3 +190,49 @@ fn a_file_that_cannot_be_written_does_not_strand_the_others() {
         "the safety point is reachable, which is what makes this recoverable"
     );
 }
+
+/// A mode-only change made by someone else is reported as a conflict.
+///
+/// `undo_conflicts` compared content hashes only, while `plan_restore` treats
+/// a mode difference as a write. So another session's `chmod +x` was reverted
+/// by an undo and never reported — in the one code path that stands between a
+/// concurrent edit and silent loss (C7, III.5).
+#[test]
+fn a_mode_change_after_a_rewind_is_reported_as_a_conflict() {
+    let fx = Fixture::new();
+    fx.write("script.sh", "#!/bin/sh\n");
+    chmod(&fx, "script.sh", 0o644);
+    fx.capture(SESSION, "turn-1");
+
+    fx.write("script.sh", "#!/bin/sh\necho changed\n");
+    let store = fx.store();
+    let target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            SESSION,
+            &target,
+            RestoreKind::Rewind {
+                undo_for: Some(SESSION),
+            },
+            fx.restore_scope(SESSION),
+            &no_rules(),
+        )
+        .unwrap();
+    assert!(
+        store
+            .undo_conflicts(SESSION, &no_rules())
+            .unwrap()
+            .is_empty()
+    );
+
+    // Someone else makes it executable. Content is untouched.
+    chmod(&fx, "script.sh", 0o755);
+
+    let conflicts = store.undo_conflicts(SESSION, &no_rules()).unwrap();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "an undo would revert this and say nothing"
+    );
+    assert!(conflicts[0].ends_with("script.sh"));
+}

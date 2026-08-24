@@ -323,6 +323,31 @@ impl WorkspaceStore {
             }))
     }
 
+    /// Whether `path` on disk is still what `entry` recorded.
+    ///
+    /// Content **and** mode, because `plan_restore` treats a mode difference
+    /// as a write — so comparing content alone let another session's
+    /// `chmod +x` be reverted by an undo and never reported (C7, III.5). The
+    /// crate re-reads mode even on a stat-cache hit for the same reason:
+    /// chmod does not move mtime.
+    ///
+    /// Content is hashed rather than compared by fingerprint. The fast path
+    /// can miss a same-length rewrite inside one timestamp tick, and here a
+    /// false "unchanged" means overwriting someone's work.
+    fn still_matches(path: &str, entry: &crate::manifest::FileEntry) -> bool {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if let (Some(recorded), Some(now)) = (entry.mode, crate::manifest::mode_of(&meta))
+            && recorded != now
+        {
+            return false;
+        }
+        fs::read(path)
+            .map(|bytes| BlobStore::hash_bytes(&bytes) == entry.hash)
+            .unwrap_or(false)
+    }
+
     /// Paths that have moved since the restore `thread_id` would undo.
     ///
     /// A rewind records the state it left the workspace in. If a path no
@@ -350,10 +375,7 @@ impl WorkspaceStore {
             if is_protected(rules, path) {
                 continue;
             }
-            let matches = fs::read(path)
-                .map(|bytes| BlobStore::hash_bytes(&bytes) == entry.hash)
-                .unwrap_or(false);
-            if !matches {
+            if !Self::still_matches(path, entry) {
                 moved.push(path.clone());
             }
         }
@@ -382,10 +404,7 @@ impl WorkspaceStore {
             {
                 continue;
             }
-            let matches = fs::read(path)
-                .map(|bytes| BlobStore::hash_bytes(&bytes) == entry.hash)
-                .unwrap_or(false);
-            if !matches {
+            if !Self::still_matches(path, entry) {
                 moved.push(path.clone());
             }
         }

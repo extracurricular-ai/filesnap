@@ -114,9 +114,19 @@ pub struct Manifest {
     /// covered.
     ///
     /// Recording the observation directly costs one set and needs no premise.
-    /// Every path the capture was asked about either has an entry or appears
-    /// here, whether it came from the index, from recency, or from an edit
-    /// that created a file where none was.
+    /// A path the capture was asked about and found *missing* appears here,
+    /// whether it came from the index, from recency, or from an edit that
+    /// created a file where none was.
+    ///
+    /// **Not every path the capture was asked about is accounted for**, and
+    /// the earlier wording here said it was. Three branches record neither an
+    /// entry nor a tombstone: a stat error that is not `NotFound`, a
+    /// non-regular file, and a read failure. That is exactly right — II.4
+    /// requires it, because a failed read verifies nothing and a tombstone is
+    /// a licence to delete — but II.1's deletion rule reads off this comment,
+    /// so an auditor checking the stronger claim would be verifying something
+    /// the code does not promise (C10, VII.4). Those paths are counted in
+    /// [`crate::CheckpointStats::dropped`] instead.
     /// `default` is safe here only because `version` is checked first. An
     /// empty set is omitted from the JSON, so reading has to tolerate the key
     /// being absent — and without the version guard that same tolerance would
