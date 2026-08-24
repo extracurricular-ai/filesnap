@@ -233,12 +233,24 @@ that permanently pins manifests as a GC root, because `all_restore_logs` reads
 every file under `restores/` and never checks whether the session still exists.
 Recorded as C16; **fixed in `29ea3e4`.**
 
-**Delete does not touch `turns/`.** The turn index is a pure cache: every
-`set_turn` is paired with a `refs.append` of the same `(turn_id, manifest_id)`
-(store.rs:125→134, 185→192, 219→228), so for any turn the answer is the last log
-entry carrying it. A stale entry is an orphan record, which by D8 is gc's
-territory. An earlier version of D10 gave delete a per-turn removal; there is no
-such operation and there should not be.
+**~~Delete does not touch `turns/`.~~ Superseded — see D10 and C12.** The
+argument was that the turn index is a pure cache, so a stale entry is an orphan
+and by D8 gc's territory. It is wrong on the premise that matters: a turn entry
+is the *name* by which a state is reachable, so leaving a deleted session's
+entry in place leaves its snapshots restorable by id — which is exactly the
+unreachability VIII.3 says delete provides, and provides immediately. D10's
+table gives delete "the turn entries whose turn ids no surviving log holds",
+and C12's fix made that removal scoped to the doomed sessions rather than
+global. `TurnIndex::remove_turn_file` is the per-turn removal this paragraph
+said should not exist, and it does exist, deliberately.
+
+The same correction applies to **"exactly two files per session"** above: it is
+three now. D25 added the declared set, and delete removes it with the log and
+the undo record.
+
+*Also superseded:* this decision's closing "the bytes only it held are
+reclaimed". D19 re-cut that line — delete reclaims records, gc reclaims
+content, and delete frees no bytes at all.
 
 **Reclamation is outside delete's success criterion.** It is idempotent,
 resumable, and may fail without making the delete partial — the session is

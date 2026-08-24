@@ -400,13 +400,6 @@ impl TurnIndex {
         Ok(out)
     }
 
-    /// Whether a turn entry is old enough to judge as unreferenced. See
-    /// [`crate::sweep::settled`]; a name that is not a turn record's counts
-    /// as young, so nothing acts on it.
-    pub fn turn_file_settled(&self, turn_file: &str) -> bool {
-        crate::sweep::settled(&self.turns_root.join(turn_file))
-    }
-
     /// Remove one turn entry by its on-disk name, for the sessions a delete
     /// just removed. Missing is fine — delete is idempotent.
     ///

@@ -99,11 +99,15 @@ fn a_prune_touches_nothing_the_doomed_sessions_did_not_name() {
     let doomed_manifests = BTreeSet::from([doomed_id.clone()]);
     s.refs.remove("doomed").unwrap();
 
-    // Fresh records are spared, even here. `save` dedups, so a live session
-    // that re-derives an existing manifest writes nothing and appends its log
-    // entry afterwards — a delete whose liveness read fell in that gap would
-    // unlink a manifest that session is about to name.
-    let spared = prune_sessions(
+    // The two halves are gated differently, on purpose. A turn entry is the
+    // *name* by which a state is reachable, so it goes at once — sparing a
+    // fresh one would leave a deleted session restorable by id, which is the
+    // unreachability delete promises and promises *now*. A manifest has no
+    // such name, so it waits: `save` dedups, and a live session that
+    // re-derives an existing manifest writes nothing and appends its log
+    // entry afterwards, so a delete whose liveness read fell in that gap
+    // would unlink a manifest that session is about to name.
+    let first = prune_sessions(
         &s.refs,
         &s.turns,
         &s.manifests,
@@ -111,16 +115,15 @@ fn a_prune_touches_nothing_the_doomed_sessions_did_not_name() {
         &doomed_manifests,
     )
     .unwrap();
-    assert_eq!(spared.manifests_removed, 0, "too young to judge");
+    assert_eq!(
+        s.turns.manifest_for_turn("turn-doomed").unwrap(),
+        None,
+        "unreachable immediately"
+    );
+    assert_eq!(first.manifests_removed, 0, "the manifest is too young");
     assert!(s.manifests.load(&doomed_id).is_ok());
 
     age_out(&s.manifests.path_for(&doomed_id).unwrap());
-    age_out(
-        &s.dir
-            .path()
-            .join("turns")
-            .join(crate::refs::turn_file_name("turn-doomed")),
-    );
     age_out(&s.manifests.path_for(&bystander_id).unwrap());
 
     let stats = prune_sessions(

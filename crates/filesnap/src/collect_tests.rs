@@ -186,3 +186,48 @@ fn content_reused_by_a_new_capture_survives_the_gap_before_its_manifest() {
     );
     assert!(blobs.contains(&hash));
 }
+
+/// **An unreadable manifest must not cost another one its content.**
+///
+/// The mark phase skipped a manifest it could not load, with a comment saying
+/// that kept what it named alive. It does the opposite: the hashes are never
+/// marked, so every blob only that manifest named looks unreferenced and is
+/// removed once settled — while the manifest itself survives, because a live
+/// log names it. The result is an intact, still-referenced record pointing at
+/// content that is gone, reachable from a transient EIO as readily as from
+/// real corruption.
+#[test]
+fn an_unreadable_manifest_does_not_cost_the_others_their_content() {
+    let data = tempfile::tempdir().unwrap();
+    let ws = workspace(data.path(), "s", &[("a.txt", "kept")]);
+    let store = WorkspaceStore::open(data.path(), ws.path()).unwrap();
+
+    // A second session with content of its own.
+    std::fs::write(ws.path().join("b.txt"), "also kept").unwrap();
+    store
+        .checkpoint("other", "turn-other", vec![ws.path().join("b.txt")])
+        .unwrap();
+    let before = blob_count(data.path());
+
+    // Corrupt one manifest. Its log still names it, so the record sweep keeps
+    // it — only the *mark* fails.
+    let root = crate::workspace::store_root(data.path()).unwrap();
+    let key = crate::WorkspaceKey::of(ws.path()).unwrap();
+    let manifests = crate::workspace::partition_dir(&root, &key).join("manifests");
+    let victim = std::fs::read_dir(&manifests)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .next()
+        .unwrap();
+    std::fs::write(&victim, b"{ truncated").unwrap();
+
+    age_store(data.path());
+    let stats = collect_garbage(data.path()).unwrap();
+
+    assert_eq!(
+        stats.blobs_removed, 0,
+        "an incomplete answer removed content anyway"
+    );
+    assert_eq!(blob_count(data.path()), before);
+}

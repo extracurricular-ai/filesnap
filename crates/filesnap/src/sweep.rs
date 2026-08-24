@@ -171,10 +171,20 @@ pub(crate) fn prune_sessions(
     // Turn entries first. A doomed session's turn entry names a doomed
     // manifest, so leaving it in place until after the liveness question
     // would have it answer that question in its own favour.
+    // Turn entries go immediately, with no age gate — unlike the manifests
+    // below. A turn entry is the *name* by which a state is reachable, so
+    // sparing a fresh one leaves a deleted session's snapshots restorable by
+    // id, which is precisely the unreachability delete promises and promises
+    // now (VIII.3). A manifest has no such name: nothing outside a log or the
+    // turn index can reach it, so delaying its removal costs only disk.
+    //
+    // The cost accepted here is a narrow race with `inherit_log`: a fork that
+    // copies these turn ids into its own log after this read loses them. A
+    // grace window does not fix that — an inherited turn's file was written
+    // at the original capture and is long settled — so the window would buy
+    // nothing while breaking the promise above.
     for turn_file in doomed_turns {
-        // Same gate, same reason: a fork's `inherit_log` may have landed
-        // after the liveness read, which is C12's shape on the delete path.
-        if !live_turns.contains(turn_file) && turns.turn_file_settled(turn_file) {
+        if !live_turns.contains(turn_file) {
             turns.remove_turn_file(turn_file)?;
         }
     }

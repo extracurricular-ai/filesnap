@@ -361,10 +361,21 @@ pub fn recent_files(
         })
         .build();
 
-    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     let mut dropped: Vec<Drop> = Vec::new();
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            // A directory is not a candidate and never was. A symlink,
+            // socket or device *is* something in the project the scan
+            // declines to store, so it is named rather than passed over in
+            // silence — the same bare `continue` D23 was written against,
+            // one class along.
+            if entry.file_type().is_some_and(|t| !t.is_dir()) {
+                let path = entry.into_path();
+                if !is_ignored(ignore, &path) {
+                    dropped.push((path, DropReason::NotARegularFile));
+                }
+            }
             continue;
         }
         let path = entry.into_path();
@@ -417,7 +428,25 @@ pub struct Recent {
 /// as it stood at some past turn — which is the question someone asking it
 /// actually has.
 pub fn scan_report(roots: &[PathBuf], hidden: HiddenFiles, limits: ScanLimits) -> Vec<Drop> {
-    let mut dropped = tracked_files(roots, [], hidden, limits).dropped;
+    let scan = tracked_files(roots, [], hidden, limits);
+    let mut dropped = scan.dropped;
+
+    // A readability probe the per-turn path deliberately does not pay for.
+    // `recent_files` only ever *stats* a candidate, and the commonest way to
+    // be unreadable — the file exists, `stat` succeeds, `read` is denied —
+    // passes a stat cleanly. Without this the diagnostic could never name a
+    // `.pem` or a root-owned file, which is most of what someone asking "what
+    // is not protected" wants to hear about. This also covers the git-index
+    // partition, which contributes no drops of its own.
+    //
+    // One `open` per tracked file is affordable here precisely because this
+    // is asked for rather than run every turn.
+    for path in &scan.files {
+        if fs::File::open(path).is_err() {
+            dropped.push((path.clone(), DropReason::Unreadable));
+        }
+    }
+
     dropped.sort();
     dropped.dedup();
     dropped
@@ -642,6 +671,52 @@ mod tests {
         );
         assert!(
             !names.iter().any(|n| n == "ordinary.rs"),
+            "a file that made it in is not a drop"
+        );
+    }
+
+    /// All three reasons are reachable from the report.
+    ///
+    /// Two of them used not to be. `recent_files` only ever *stats* a
+    /// candidate, so a mode-000 file passed cleanly, and a symlink was a bare
+    /// `continue` — the same shape D23 was written against, one class along.
+    /// The query promised "everything the scan would leave out" and could say
+    /// only "too big", which is the least of the three that someone asking
+    /// "what in my project is not protected" wants to hear about.
+    #[cfg(unix)]
+    #[test]
+    fn the_report_can_name_all_three_reasons() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("fine.rs"), "kept");
+        std::fs::write(
+            root.join("huge.bin"),
+            vec![0u8; (ScanLimits::default().max_file_bytes + 1) as usize],
+        )
+        .unwrap();
+        touch(&root.join("secret.pem"), "key material");
+        fs::set_permissions(root.join("secret.pem"), fs::Permissions::from_mode(0o000)).unwrap();
+        std::os::unix::fs::symlink(root.join("fine.rs"), root.join("link.rs")).unwrap();
+
+        let report = scan_report(
+            &[root.to_path_buf()],
+            HiddenFiles::Skip,
+            ScanLimits::default(),
+        );
+        // Reopen before asserting, so a panic cannot leave the temp directory
+        // undeletable.
+        fs::set_permissions(root.join("secret.pem"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        let says = |name: &str, why: DropReason| {
+            report.iter().any(|(p, w)| p.ends_with(name) && *w == why)
+        };
+        assert!(says("huge.bin", DropReason::OverSizeLimit), "{report:?}");
+        assert!(says("secret.pem", DropReason::Unreadable), "{report:?}");
+        assert!(says("link.rs", DropReason::NotARegularFile), "{report:?}");
+        assert!(
+            !report.iter().any(|(p, _)| p.ends_with("fine.rs")),
             "a file that made it in is not a drop"
         );
     }

@@ -47,6 +47,9 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
     // records before content is what stops that, and it is why collection
     // owns orphaned records rather than only unreferenced bytes (D8).
     let mut live_blobs = BTreeSet::new();
+    // Whether every manifest in the store could be read. Content is removed
+    // only on a complete answer.
+    let mut complete = true;
     for key in workspace::all_partitions(&root)? {
         let partition = workspace::partition_dir(&root, &key);
         let refs = RefStore::open(partition.join("refs"))?;
@@ -71,11 +74,22 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
         // Mark: every hash named by a manifest that survived that sweep.
         for id in manifests.ids()? {
             // A manifest that cannot be read is not evidence that its content
-            // is dead — it is evidence of nothing at all. Skipping it keeps
-            // whatever it named alive, which is the safe direction: the cost
-            // is retained bytes, and the alternative is deleting content a
-            // readable manifest may still name.
+            // is dead — it is evidence of nothing at all, so no blob may be
+            // removed on the strength of an answer that is missing it.
+            //
+            // Skipping it does **not** keep what it named alive, which is
+            // what this said and what makes the bug worth naming: its hashes
+            // are simply never marked, so every blob only it named falls out
+            // of `live_blobs` and, once settled, is removed. The manifest
+            // itself survives — the record sweep keeps it, because a live log
+            // names it — so the result is an intact, still-referenced record
+            // pointing at content that has been destroyed. A transient EIO or
+            // EMFILE reaches that outcome as readily as real corruption.
+            //
+            // This is the guard the record sweep already has as
+            // `Coverage::Partial`, on the phase that lacked it.
             let Ok(manifest) = manifests.load(&id) else {
+                complete = false;
                 continue;
             };
             for entry in manifest.entries.values() {
@@ -88,9 +102,17 @@ pub fn collect_garbage(data_dir: &Path) -> Result<GcStats> {
     // most expensive kind: a capture killed mid-write leaves whole-file bytes.
     crate::sweep::sweep_residue(&workspace::blobs_dir(&root));
 
-    // Then content, sparing anything too young to judge. A capture publishes
-    // its blobs before its manifest, so a blob written moments ago may belong
-    // to a manifest that has not landed yet.
+    // Then content — but only if the mark above saw everything. An
+    // under-approximated live set is not a smaller sweep, it is a wrong one:
+    // every blob the unread manifests named looks unreferenced.
+    if !complete {
+        stats.blobs_kept += blobs.hashes()?.len();
+        return Ok(stats);
+    }
+
+    // Sparing anything too young to judge. A capture publishes its blobs
+    // before its manifest, so a blob written moments ago may belong to a
+    // manifest that has not landed yet.
     for hash in blobs.hashes()? {
         // Unprovable age keeps it, and so does an id we cannot even build a
         // path for: a sweep removes only what it can show is both unreachable
