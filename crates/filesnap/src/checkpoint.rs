@@ -323,8 +323,11 @@ mod tests {
         fs::write(&a, b"v1").unwrap();
         let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
 
-        // Rewrite with identical size and forge the old fingerprint, exactly
-        // what a same-tick write looks like.
+        // `cp1` captured a file written moments earlier, so what it stored is
+        // `RACY_FINGERPRINT` — not a real mtime. Setting the file to match it
+        // therefore does not forge a stat hit: `stat_matches` refuses the
+        // sentinel outright, and that refusal is what forces the re-read.
+        // The genuine-match path is covered by the test above.
         let key = a.to_string_lossy().into_owned();
         let stale = cp1.manifest.entries[&key].clone();
         fs::write(&a, b"v2").unwrap();

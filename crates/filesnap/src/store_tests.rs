@@ -684,7 +684,63 @@ fn one_file_has_one_key_whichever_spelling_reaches_it() {
         "the same file was recorded under two keys"
     );
 
-    // The consequence that matters: the second capture reused the first's
-    // hash rather than re-reading, which only happens if the key matched.
-    assert_eq!(store.thread_history(S).unwrap().len(), 2);
+    // Which spelling wins, not merely that one does. The equality above
+    // would hold just as well if both captures had been recorded under the
+    // link, and a key that follows whichever path the caller happened to use
+    // is the defect itself.
+    assert_eq!(
+        keys("turn-link"),
+        vec![fx.key("real/a.txt")],
+        "the key is the real spelling, not the one the caller reached it by"
+    );
+}
+
+/// A session another invocation is holding is **refused** — left exactly as
+/// it was — while the rest of the batch is deleted.
+///
+/// This lives here rather than in `tests/concurrency.rs` because holding a
+/// lock across a `delete_sessions` call is not something the public API can
+/// express: every operation that takes a session lock releases it before it
+/// returns. Reaching `crate::lock` directly is the only way to construct the
+/// contention, and a test that cannot construct it can only pretend to.
+///
+/// It costs `LOCK_BUDGET` of wall clock, which is the point twice over: the
+/// refusal is what `refused` promises, and the bound is what stops a busy
+/// session from hanging a delete forever.
+#[test]
+fn deleting_refuses_a_session_another_invocation_is_using() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture("held", "turn-1");
+    fx.capture("free", "turn-2");
+    let store = fx.store();
+
+    let guard = crate::lock::acquire(&store.partition, "held", crate::lock::LOCK_BUDGET)
+        .unwrap()
+        .expect("the lock was free");
+    assert!(
+        guard.is_enforced(),
+        "this filesystem does not lock, so the refusal under test cannot happen"
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = store.delete_sessions(&["held".to_string(), "free".to_string()]);
+    let waited = started.elapsed();
+    drop(guard);
+
+    assert_eq!(
+        outcome
+            .refused
+            .iter()
+            .map(|(session, _)| session.clone())
+            .collect::<Vec<_>>(),
+        vec!["held".to_string()]
+    );
+    assert!(outcome.incomplete.is_empty(), "{:?}", outcome.incomplete);
+    assert!(store.session_exists("held"), "a refused session is intact");
+    assert!(!store.session_exists("free"), "the rest of the batch went");
+    assert!(
+        waited < crate::lock::LOCK_BUDGET * 3,
+        "the wait is meant to be bounded by LOCK_BUDGET, and took {waited:?}"
+    );
 }

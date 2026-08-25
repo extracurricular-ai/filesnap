@@ -88,9 +88,11 @@ impl SessionGuard {
     /// Whether the kernel is actually holding anything. False on a filesystem
     /// with no locking, where the operation went ahead unprotected.
     ///
-    /// For `status` and `doctor` to report, once they exist: a store on a
-    /// filesystem that cannot lock is a fact about the user's setup, and one
-    /// they should be able to see rather than infer.
+    /// A store on a filesystem that cannot lock is a fact about the user's
+    /// setup, and one they should be able to see rather than infer — so this
+    /// is what `doctor` would report. It does not yet, which is why the
+    /// allow is still here; the only caller is the test that would otherwise
+    /// assert a refusal on a filesystem incapable of producing one.
     #[allow(dead_code)]
     pub(crate) fn is_enforced(&self) -> bool {
         self._file.is_some()

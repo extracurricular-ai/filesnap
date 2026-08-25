@@ -41,6 +41,14 @@ fn deleting_a_workspace_leaves_another_workspaces_content_alone() {
 
     a.delete_sessions(&["s-a".to_string()]);
 
+    // Delete reclaims no content — `sweep::prune_sessions` takes no
+    // `BlobStore`, so the assertion below could not fail on its own. What
+    // makes the sequence dangerous is what comes *after*: A's records are
+    // gone, and the collector now has to decide liveness for a blob whose
+    // only remaining claim is in another partition. Neither this test nor
+    // `collect_tests` covered that seam.
+    filesnap::collect_garbage(data.path()).expect("collect");
+
     assert_eq!(
         blob_count(data.path()),
         before,

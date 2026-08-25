@@ -560,24 +560,40 @@ mod tests {
         // at a file that does not exist. `/dev/null` would do it on Unix and
         // fail on Windows, and these tests are expected to run everywhere.
         let absent_config = root.join("no-such-gitconfig");
-        let git = |args: &[&str]| -> bool {
+        let git = |args: &[&str]| -> std::io::Result<std::process::Output> {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&root)
                 .env("GIT_CONFIG_GLOBAL", &absent_config)
                 .env("GIT_CONFIG_SYSTEM", &absent_config)
                 .output()
-                .is_ok_and(|out| out.status.success())
         };
-        if !git(&["init", "--quiet"]) {
-            return None;
-        }
+        // A missing git is the one honest reason to skip. A git that is
+        // present and *fails* is a broken fixture, and returning `None` for
+        // it removes this partition's entire coverage without saying so —
+        // every consumer just returns, having asserted nothing.
+        let init = match git(&["init", "--quiet"]) {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("git could not be run: {e}"),
+        };
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
         for rel in paths {
             let path = root.join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             touch(&path, "content");
         }
-        git(&["add", "-A"]).then_some((root, dir))
+        let add = git(&["add", "-A"]).expect("git could not be run");
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        Some((root, dir))
     }
 
     #[test]

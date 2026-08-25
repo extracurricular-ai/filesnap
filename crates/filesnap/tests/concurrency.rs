@@ -138,44 +138,34 @@ fn a_restore_does_not_deadlock_against_its_own_safety_capture() {
     );
 }
 
-/// Deleting takes each session's lock in turn, so a session held by another
-/// invocation is refused rather than deleted out from under it — and the rest
-/// of the batch is unaffected.
+/// Deleting takes each session's lock in turn, so the sessions in one batch
+/// are handled independently.
+///
+/// The refusal itself — a session another invocation is holding — needs a
+/// lock held *across* the call, which no public API can do: every operation
+/// that takes a session lock also releases it before returning. An earlier
+/// version of this test spawned a thread and synchronised on barriers to
+/// suggest otherwise, but the holder's capture had already finished by the
+/// time the barrier opened, and a lock failure lands in `refused` rather
+/// than `incomplete`, which was the only field asserted. It passed with
+/// session locking removed entirely.
+///
+/// The refusal is covered in
+/// `store_tests::deleting_refuses_a_session_another_invocation_is_using`,
+/// which reaches the lock directly.
 #[test]
-fn deleting_refuses_a_session_another_invocation_is_using() {
+fn deleting_handles_each_session_in_a_batch_independently() {
     let fx = Fixture::new();
     fx.write("a.txt", "one");
-    fx.capture("held", "turn-1");
-    fx.capture("free", "turn-2");
+    fx.capture("one", "turn-1");
+    fx.capture("two", "turn-2");
 
-    let data = fx.data_dir().to_path_buf();
-    let ws = fx.workspace().to_path_buf();
-    let gate = Arc::new(Barrier::new(2));
-    let release = Arc::new(Barrier::new(2));
-
-    let holder = {
-        let (data, ws, gate, release) = (data, ws, Arc::clone(&gate), Arc::clone(&release));
-        // Worse here than above: the test's *own* main thread waits on this
-        // barrier, so a panic in the child would hang the test itself.
-        let store = WorkspaceStore::open(&data, &ws).unwrap();
-        std::thread::spawn(move || {
-            // A long capture stands in for any operation holding the lock.
-            let files = vec![ws.join("a.txt")];
-            let _ = store.checkpoint("held", "turn-long", files);
-            gate.wait();
-            release.wait();
-        })
-    };
-
-    gate.wait();
-    // The holder's checkpoint has finished, so this exercises the ordinary
-    // path; what is asserted is that both sessions are handled independently.
     let outcome = fx
         .store()
-        .delete_sessions(&["held".to_string(), "free".to_string()]);
-    release.wait();
-    holder.join().unwrap();
+        .delete_sessions(&["one".to_string(), "two".to_string()]);
 
+    assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
     assert!(outcome.incomplete.is_empty(), "{:?}", outcome.incomplete);
-    assert!(!fx.store().session_exists("free"));
+    assert!(!fx.store().session_exists("one"));
+    assert!(!fx.store().session_exists("two"));
 }

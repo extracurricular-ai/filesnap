@@ -80,6 +80,12 @@ fn a_restore_can_replace_a_file_marked_read_only() {
 /// it was thrown away in both directions, and a rewind silently made a
 /// read-only file writable. `mode` carries it now, mapped onto `0o444` /
 /// `0o644` so a mode recorded on unix still reads as "writable or not".
+///
+/// Note what is *not* being tested: the destination's own attributes never
+/// survive a restore, because `write_one` renames a fresh sibling over it.
+/// The bit set on the destination mid-test is not a candidate to carry over
+/// — the recorded mode alone decides what the replacement gets, which is
+/// what an inverted `0o444`/`0o644` mapping would break.
 #[test]
 fn a_rewind_puts_the_read_only_bit_back() {
     let fx = Fixture::new();
@@ -199,5 +205,36 @@ fn a_deep_store_path_still_works() {
         .checkpoint("s1", "t1", vec![ws.path().join("a.txt")])
         .unwrap();
 
+    // The premise, stated rather than assumed. Nothing here measures a path
+    // on its own, so a shorter TMP or a flatter store layout would quietly
+    // turn this into an ordinary round-trip that proves nothing.
+    let deepest = longest_path_under(&deep);
+    assert!(
+        deepest.as_os_str().len() > 260,
+        "only {} characters, so the limit was never approached: {}",
+        deepest.as_os_str().len(),
+        deepest.display()
+    );
     assert!(store.manifest(&checkpoint.id).is_ok());
+}
+
+/// The longest path the store actually built underneath `root`.
+fn longest_path_under(root: &std::path::Path) -> std::path::PathBuf {
+    let mut best = root.to_path_buf();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.as_os_str().len() > best.as_os_str().len() {
+                best = path.clone();
+            }
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    best
 }

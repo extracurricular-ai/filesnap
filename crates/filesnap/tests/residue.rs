@@ -89,6 +89,12 @@ fn a_restore_clears_the_residue_in_the_directories_it_writes() {
 
 /// A real file that merely ends in the suffix is not residue if it is not
 /// old, and the sweep never touches anything else at all.
+///
+/// The age half is the one that matters here. `residue_in`'s grace window is
+/// covered by `residue_still_in_use_is_not_reported`, but that is the
+/// *reporting* path; this is the restore's own per-directory sweep, and a
+/// concurrent restore's half-written temp file sits in exactly the directory
+/// this one is about to clear.
 #[test]
 fn nothing_but_residue_is_removed() {
     let fx = Fixture::new();
@@ -96,6 +102,10 @@ fn nothing_but_residue_is_removed() {
     fx.write("keep.txt", "mine");
     fx.capture(SESSION, "turn-1");
     fx.write("a.txt", "after");
+
+    // Suffixed, and deliberately not aged: another restore may be writing it
+    // at this instant.
+    let fresh = strand(&fx, "b.txt");
 
     let store = fx.store();
     let target = store.target_for_turn("turn-1").unwrap().unwrap();
@@ -111,4 +121,9 @@ fn nothing_but_residue_is_removed() {
 
     assert!(fx.exists("keep.txt"));
     assert_eq!(fx.read("keep.txt"), "mine");
+    assert!(
+        fresh.exists(),
+        "a stray younger than the grace window was swept out from under \
+         whatever is writing it"
+    );
 }
