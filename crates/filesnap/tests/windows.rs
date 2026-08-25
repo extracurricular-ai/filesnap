@@ -5,8 +5,11 @@
 //! and every scenario below is constructible. An untested platform-specific
 //! branch is a branch nobody has ever run.
 //!
-//! The unix equivalents live in `tests/permissions.rs`; the two files together
-//! are the whole of what a restore does to permissions.
+//! The unix equivalents live in `tests/permissions.rs`. Read as a pair: each
+//! file covers what a restore does to file attributes on its platform, and
+//! each carries one degradation test that reaches `write_one`'s failure
+//! branch through a blocker the other platform does not have — denied
+//! directory permissions on unix, an occupied destination here.
 
 #![cfg(windows)]
 #![allow(clippy::unwrap_used)]
@@ -115,40 +118,63 @@ fn a_rewind_does_not_invent_a_read_only_bit() {
     assert!(!readonly(&fx, "ordinary.txt"));
 }
 
-/// **A file held open cannot be replaced, and that is reported per file
-/// rather than losing the rest of the restore.**
+/// **A destination that cannot be replaced is reported per file, and the
+/// rest of the restore still lands.**
 ///
-/// `MoveFileExW` fails with a sharing violation when a handle to the
-/// destination is open without `FILE_SHARE_DELETE` — the ordinary state of a
-/// file open in an editor, or being scanned at that instant. Unix has no such
-/// rule: the old inode simply lives on for existing readers.
+/// The unix half of this (`tests/permissions.rs`) denies write permission on
+/// the containing directory. Windows has no equivalent — permission to
+/// replace a file does not live on its directory there — so without this test
+/// the `write_one` failure branch is never executed on Windows at all.
 ///
-/// This is a real limitation and not a defect, so what is asserted is that it
-/// degrades the way D28 requires: the file that could be written is written,
-/// the one that could not is named, and the exit is not a success.
+/// The blocker here is a destination whose name is occupied by a non-empty
+/// directory: what a workspace looks like after a module has been turned into
+/// a package. Nothing renames a file over that, on any Windows version or
+/// filesystem, and nothing does on unix either.
+///
+/// Two more obvious constructions do not work, and are deliberately not used:
+///
+/// - Marking the destination read-only. `write_one` clears it itself, one
+///   line before the rename, on purpose.
+/// - Holding a handle open. `std::fs::File::open` shares read, write **and**
+///   delete, so it holds nothing — which is why the first version of this
+///   test asserted a failure that never happened. Opening without
+///   `FILE_SHARE_DELETE` does block the rename, but `std` re-raises the
+///   original `ERROR_ACCESS_DENIED` and discards the sharing violation, and
+///   whether the `FILE_RENAME_FLAG_POSIX_SEMANTICS` retry refuses such a
+///   target is not documented anywhere primary. There is nothing
+///   deterministic to assert, and a probably-fails test is a flaky one.
+///
+/// What is asserted is the D28 degradation contract: the file that could be
+/// written is written, the one that could not is named, and the outcome does
+/// not read as success.
 #[test]
-fn a_file_held_open_is_reported_and_does_not_strand_the_others() {
+fn a_destination_that_cannot_be_replaced_is_reported_and_does_not_strand_the_others() {
     let fx = Fixture::new();
-    fx.write("open.txt", "before");
-    fx.write("closed.txt", "before");
+    fx.write("blocked.txt", "before");
+    fx.write("ordinary.txt", "before");
     fx.capture(SESSION, "turn-1");
 
-    fx.write("open.txt", "after");
-    fx.write("closed.txt", "after");
+    fx.write("ordinary.txt", "after");
+    fx.remove("blocked.txt");
+    fx.write("blocked.txt/inner.txt", "occupied");
 
-    // A plain `File::open` on Windows shares read and write but not delete,
-    // which is what an editor holding a file looks like.
-    let held = std::fs::File::open(fx.path("open.txt")).unwrap();
     let outcome = rewind(&fx, "turn-1");
-    drop(held);
 
+    assert_eq!(outcome.stats.written, 1, "the writable file did not land");
     assert_eq!(
-        fx.read("closed.txt"),
+        fx.read("ordinary.txt"),
         "before",
-        "one unreplaceable file stranded the rest"
+        "one unreplaceable destination stranded the rest"
     );
-    assert_eq!(outcome.stats.failed.len(), 1, "{:?}", outcome.stats.failed);
-    assert!(outcome.stats.failed[0].0.ends_with("open.txt"));
+    assert_eq!(
+        outcome.stats.failed.len(),
+        1,
+        "a restore that could not write a file must not read as success: {:?}",
+        outcome.stats.failed
+    );
+    assert!(outcome.stats.failed[0].0.ends_with("blocked.txt"));
+    // Untouched, not half-replaced.
+    assert_eq!(fx.read("blocked.txt/inner.txt"), "occupied");
     // The point it can be reversed to is still reported.
     assert!(fx.store().manifest(outcome.safety.manifest_id()).is_ok());
 }
