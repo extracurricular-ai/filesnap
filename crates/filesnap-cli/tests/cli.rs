@@ -679,37 +679,35 @@ fn undoing_with_nothing_to_undo_is_a_usage_error() {
 /// **One unwritable file does not strand the rest, and does not read as
 /// success** (D28, D40). Each failure is its own event; the terminal event
 /// still carries the counts and the safety id.
+///
+/// The blocker is a destination occupied by a non-empty directory rather
+/// than a directory with writes denied, so this runs everywhere. The
+/// permission version was `#[cfg(unix)]`, which left `exit::PARTIAL` — the
+/// difference between a restore that worked and one that did not — executed
+/// on no Windows or macOS-with-a-different-umask machine anywhere. The
+/// errno is not asserted, only the degradation, because it differs by
+/// platform: `EISDIR` on unix, an access denial on Windows.
 #[test]
-#[cfg(unix)]
 fn a_restore_that_cannot_write_everything_reports_per_file_and_exits_nonzero() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (data, ws) = workspace();
     let cwd = ws.path().to_string_lossy().into_owned();
-    std::fs::create_dir(ws.path().join("locked")).unwrap();
-    std::fs::write(ws.path().join("locked/inside.txt"), "before").unwrap();
+    std::fs::write(ws.path().join("blocked.txt"), "before").unwrap();
     filesnap(
         data.path(),
         &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
     );
 
     std::fs::write(ws.path().join("a.txt"), "changed").unwrap();
-    std::fs::write(ws.path().join("locked/inside.txt"), "changed").unwrap();
-    std::fs::set_permissions(
-        ws.path().join("locked"),
-        std::fs::Permissions::from_mode(0o500),
-    )
-    .unwrap();
+    // The destination this restore must put back is now a non-empty
+    // directory: what a workspace looks like after a module became a package.
+    std::fs::remove_file(ws.path().join("blocked.txt")).unwrap();
+    std::fs::create_dir(ws.path().join("blocked.txt")).unwrap();
+    std::fs::write(ws.path().join("blocked.txt").join("inner.txt"), "occupied").unwrap();
 
     let run = filesnap(
         data.path(),
         &["restore", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
     );
-    std::fs::set_permissions(
-        ws.path().join("locked"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
 
     assert_eq!(run.code, 1, "a partial restore read as success");
     assert_eq!(run.find("restore.done")["failed"], 1);
@@ -717,7 +715,7 @@ fn a_restore_that_cannot_write_everything_reports_per_file_and_exits_nonzero() {
         run.find("restore.failed")["path"]
             .as_str()
             .unwrap()
-            .ends_with("inside.txt")
+            .ends_with("blocked.txt")
     );
     assert_eq!(
         std::fs::read_to_string(ws.path().join("a.txt")).unwrap(),
