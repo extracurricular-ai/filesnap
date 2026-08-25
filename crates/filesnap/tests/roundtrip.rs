@@ -67,6 +67,10 @@ fn full_rewind_redo_gc_scenario() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     // Workspace: two files, one ignored log, the (versioned) ignore file.
@@ -229,6 +233,10 @@ fn restore_preserves_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     let script = ws.join("run.sh");
@@ -263,6 +271,10 @@ fn thread_marker_and_pre_edit_attach() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     // Log existence is the session-scoped "tracking on" marker.
@@ -277,7 +289,7 @@ fn thread_marker_and_pre_edit_attach() {
 
     // Agent edits a file OUTSIDE the workspace scan: pre-image attaches
     // retroactively under the same turn.
-    let outside = dir.path().join("outside.cfg");
+    let outside = filesnap::canonical_key(dir.path()).join("outside.cfg");
     let attached = store
         .attach_pre_edit(
             THREAD,
@@ -379,12 +391,16 @@ fn turn_resolution_and_fork_inheritance() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
     // Supplemental attach under the same turn: resolution must pick it.
-    let outside = dir.path().join("ext.cfg");
+    let outside = filesnap::canonical_key(dir.path()).join("ext.cfg");
     let supplemental = store
         .attach_pre_edit(
             THREAD,
@@ -439,6 +455,10 @@ fn rewinding_twice_still_restores() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
@@ -510,6 +530,10 @@ fn an_undo_reports_what_moved_since_the_rewind() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
@@ -570,6 +594,10 @@ fn a_restore_with_no_destination_leaves_no_undo() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
@@ -601,6 +629,10 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
@@ -670,6 +702,10 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
@@ -735,7 +771,10 @@ fn a_capture_covers_every_configured_root() {
     // to one guessed root would leave the others unprotected while the sandbox
     // happily lets the agent write to them.
     let dir = tempfile::tempdir().unwrap();
-    let (a, b) = (dir.path().join("svc-a"), dir.path().join("svc-b"));
+    let (a, b) = (
+        filesnap::canonical_key(dir.path()).join("svc-a"),
+        filesnap::canonical_key(dir.path()).join("svc-b"),
+    );
     fs::create_dir_all(&a).unwrap();
     fs::create_dir_all(&b).unwrap();
     fs::write(a.join("main.rs"), "fn a() {}").unwrap();
@@ -805,7 +844,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
     // never looked there — so the only thing that can license removing it is
     // the tombstone written when the edit created it.
     let dir = tempfile::tempdir().unwrap();
-    let outer = dir.path().join("project");
+    let outer = filesnap::canonical_key(dir.path()).join("project");
     let cwd = outer.join("inner");
     fs::create_dir_all(&cwd).unwrap();
     // The session belongs to the project; the scan for this turn covers only
@@ -868,6 +907,10 @@ fn undo_walks_back_through_successive_rewinds() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
     let scan = || all_files(&ws);
 
@@ -996,6 +1039,10 @@ fn deleting_what_was_never_tracked_is_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     let outcome = store.delete_sessions(&["never-tracked".to_string()]);
@@ -1022,7 +1069,7 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     // needs both to delete — so it silently survived.
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
-    let outside = dir.path().join("elsewhere");
+    let outside = filesnap::canonical_key(dir.path()).join("elsewhere");
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(&outside).unwrap();
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
@@ -1104,7 +1151,7 @@ fn a_turn_reports_what_it_cannot_put_back() {
     // is invisible, so it has to be said out loud.
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
-    let outside = dir.path().join("elsewhere");
+    let outside = filesnap::canonical_key(dir.path()).join("elsewhere");
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(&outside).unwrap();
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
@@ -1154,6 +1201,10 @@ fn the_undo_warning_covers_what_it_will_delete() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     fs::write(ws.join("kept.txt"), "v1").unwrap();
@@ -1211,6 +1262,10 @@ fn the_undo_warning_covers_files_the_rewind_never_touched() {
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
+    // Canonical: a capture records canonical keys, and on macOS the temp
+    // directory is under `/var`, a symlink to `/private/var`. Comparing a raw
+    // temp path against a recorded key compares two names for one file.
+    let ws = filesnap::canonical_key(&ws);
     let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();

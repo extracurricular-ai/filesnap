@@ -31,8 +31,21 @@ use crate::scope::load_ignore;
 
 /// A host data directory and a workspace, both real on disk.
 pub struct Fixture {
-    data: TempDir,
-    workspace: TempDir,
+    // Held so the directories outlive the fixture; the canonical spellings
+    // below are what anything reads.
+    _data: TempDir,
+    _workspace: TempDir,
+    /// The canonical spellings, resolved once.
+    ///
+    /// A capture records canonical paths, so a fixture handing out the raw
+    /// temp-dir spelling would make every assertion compare two names for one
+    /// file. That is not hypothetical: on macOS `TMPDIR` is under `/var`,
+    /// which is a symlink to `/private/var`, and on Windows the temp path
+    /// arrives in 8.3 short form (`RUNNER~1`). Both are the ordinary case on
+    /// their platform, and neither appears on Linux — so tests written here
+    /// passed and CI did not.
+    data_real: PathBuf,
+    workspace_real: PathBuf,
 }
 
 impl Default for Fixture {
@@ -43,18 +56,22 @@ impl Default for Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        let data = TempDir::new().expect("temp data dir");
+        let workspace = TempDir::new().expect("temp workspace");
         Self {
-            data: TempDir::new().expect("temp data dir"),
-            workspace: TempDir::new().expect("temp workspace"),
+            data_real: crate::scope::canonical_key(data.path()),
+            workspace_real: crate::scope::canonical_key(workspace.path()),
+            _data: data,
+            _workspace: workspace,
         }
     }
 
     pub fn data_dir(&self) -> &Path {
-        self.data.path()
+        &self.data_real
     }
 
     pub fn workspace(&self) -> &Path {
-        self.workspace.path()
+        &self.workspace_real
     }
 
     /// A store open on this fixture's workspace.

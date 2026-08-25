@@ -298,6 +298,14 @@ impl WorkspaceStore {
         image: &PreEditImage,
     ) -> Result<Option<String>> {
         let thread_id = session_id;
+        // **The second place a manifest key is minted**, and it has to agree
+        // with the first. `capture` records canonical keys; storing the
+        // caller's spelling here would give one file two keys again — and a
+        // tombstone under the wrong spelling is a tombstone `plan_restore`
+        // can never match, so the file it licensed removing is never removed.
+        let path_key = &crate::scope::canonical_key(std::path::Path::new(path_key))
+            .to_string_lossy()
+            .into_owned();
         let latest = self.latest_manifest(thread_id)?.unwrap_or_default();
         if latest.entries.contains_key(path_key) {
             return Ok(None);

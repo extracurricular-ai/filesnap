@@ -94,11 +94,17 @@ pub fn load_ignore(root: &Path) -> Gitignore {
 /// parent is canonicalized and the final component kept, which is the most
 /// that can be resolved without inventing the file.
 pub fn canonical_key(path: &Path) -> PathBuf {
-    if let Ok(real) = path.canonicalize() {
+    // `dunce`, not `std`: on Windows `fs::canonicalize` returns an
+    // extended-length path — `\\?\C:\…` — and that prefix would reach every
+    // manifest key and every event this crate prints, so a caller comparing
+    // against its own path would never match. `dunce` strips it where the
+    // path does not need it and keeps it where it does, including the UNC
+    // case that a naive strip gets wrong. Elsewhere it is `fs::canonicalize`.
+    if let Ok(real) = dunce::canonicalize(path) {
         return real;
     }
     match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => match parent.canonicalize() {
+        (Some(parent), Some(name)) => match dunce::canonicalize(parent) {
             Ok(real) => real.join(name),
             Err(_) => path.to_path_buf(),
         },

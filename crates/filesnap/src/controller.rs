@@ -167,6 +167,29 @@ impl SnapshotTracker {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    /// A temp directory that reports its **canonical** path.
+    ///
+    /// A capture records canonical keys, so a test comparing against the raw
+    /// temp spelling compares two names for one file — `/var` against
+    /// `/private/var` on macOS, `RUNNER~1` against `runneradmin` on Windows.
+    /// Both are the ordinary case on their platform and neither exists on
+    /// Linux, which is why these tests passed here and failed there.
+    struct CanonicalDir {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl CanonicalDir {
+        fn of(dir: tempfile::TempDir) -> Self {
+            let path = crate::scope::canonical_key(dir.path());
+            Self { _dir: dir, path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
     use super::*;
 
     /// A data directory and a workspace, both real on disk.
@@ -174,13 +197,19 @@ mod tests {
     /// The workspace has to exist before a tracker can be built now: a
     /// session's records live in its workspace's partition, so there is no
     /// tracker without a workspace to key it on.
-    fn dirs() -> (tempfile::TempDir, tempfile::TempDir) {
-        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    fn dirs() -> (CanonicalDir, CanonicalDir) {
+        // Both canonical: several tests put an "outside the workspace" file
+        // under the data directory, and comparing that raw path against a
+        // recorded key is the same two-names-for-one-file mistake.
+        (
+            CanonicalDir::of(tempfile::tempdir().unwrap()),
+            CanonicalDir::of(tempfile::tempdir().unwrap()),
+        )
     }
 
     fn tracker(
-        home: &tempfile::TempDir,
-        ws: &tempfile::TempDir,
+        home: &CanonicalDir,
+        ws: &CanonicalDir,
         id: &str,
         start: SessionStart,
     ) -> Option<Arc<SnapshotTracker>> {
@@ -194,11 +223,7 @@ mod tests {
         )
     }
 
-    fn tracking(
-        home: &tempfile::TempDir,
-        ws: &tempfile::TempDir,
-        id: &str,
-    ) -> Arc<SnapshotTracker> {
+    fn tracking(home: &CanonicalDir, ws: &CanonicalDir, id: &str) -> Arc<SnapshotTracker> {
         tracker(
             home,
             ws,
@@ -259,7 +284,7 @@ mod tests {
     #[test]
     fn a_session_id_does_not_reach_across_workspaces() {
         let (home, ws) = dirs();
-        let other = tempfile::tempdir().unwrap();
+        let other = CanonicalDir::of(tempfile::tempdir().unwrap());
 
         std::fs::write(ws.path().join("a.txt"), "x").unwrap();
         tracking(&home, &ws, "shared-id").checkpoint_turn_start("turn-1", ws.path(), &[]);
@@ -408,7 +433,7 @@ mod tests {
 
         // Paths registered via pre-edit attach are observed by later
         // checkpoints, wherever they live.
-        let loose = tempfile::tempdir().unwrap();
+        let loose = CanonicalDir::of(tempfile::tempdir().unwrap());
         std::fs::write(loose.path().join("note.md"), "n1").unwrap();
         let ctl2 = tracking(&home, &loose, "t2");
         ctl2.checkpoint_turn_start("turn-1", loose.path(), &[]);
@@ -447,8 +472,8 @@ mod tests {
     /// because the path is registered as an extra (C6, II.3).
     #[test]
     fn the_edit_hook_filters_before_the_first_capture_has_run() {
-        let home = tempfile::tempdir().unwrap();
-        let ws = tempfile::tempdir().unwrap();
+        let home = CanonicalDir::of(tempfile::tempdir().unwrap());
+        let ws = CanonicalDir::of(tempfile::tempdir().unwrap());
         std::fs::write(ws.path().join(crate::SNAPSHOT_IGNORE_FILENAME), ".env\n").unwrap();
         let secret = ws.path().join(".env");
         std::fs::write(&secret, "TOKEN=hunter2").unwrap();
@@ -495,8 +520,8 @@ mod tests {
     /// took effect only after a restart, the opposite of the point.
     #[test]
     fn a_capture_in_one_process_stops_watching_a_path_past_the_window() {
-        let home = tempfile::tempdir().unwrap();
-        let ws = tempfile::tempdir().unwrap();
+        let home = CanonicalDir::of(tempfile::tempdir().unwrap());
+        let ws = CanonicalDir::of(tempfile::tempdir().unwrap());
         let tracker = SnapshotTracker::maybe_new(
             home.path(),
             ws.path(),

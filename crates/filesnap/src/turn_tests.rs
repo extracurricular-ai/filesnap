@@ -14,21 +14,33 @@ const S: &str = "s1";
 /// to avoid.
 #[test]
 fn unrelated_roots_are_dropped_and_cwd_stands_in() {
+    // Real directories, because `scan_roots` canonicalizes what it returns.
+    // Invented absolute paths cannot be resolved, and `/work` turned out to
+    // exist on the Windows runner — so the test was asserting against
+    // whatever that machine happened to have.
+    let base = tempfile::tempdir().unwrap();
+    let base = crate::scope::canonical_key(base.path());
+    let work = base.join("work");
+    let project = work.join("project");
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
     let scope = TurnScope {
-        cwd: PathBuf::from("/work/project"),
-        roots: vec![PathBuf::from("/elsewhere"), PathBuf::from("/work")],
+        cwd: project.clone(),
+        roots: vec![elsewhere.clone(), work.clone()],
         hidden: HiddenFiles::Skip,
         limits: ScanLimits::default(),
     };
-    assert_eq!(scope.scan_roots(), vec![PathBuf::from("/work")]);
+    assert_eq!(scope.scan_roots(), vec![work]);
 
     let orphan = TurnScope {
-        roots: vec![PathBuf::from("/elsewhere")],
+        roots: vec![elsewhere],
         ..scope
     };
     assert_eq!(
         orphan.scan_roots(),
-        vec![PathBuf::from("/work/project")],
+        vec![project],
         "nothing to go on, so the turn's own directory scopes it"
     );
 }
@@ -40,8 +52,10 @@ fn unrelated_roots_are_dropped_and_cwd_stands_in() {
 /// had run (C6).
 #[test]
 fn the_ignore_root_is_available_before_anything_has_been_captured() {
-    let scope = TurnScope::at("/work/project");
-    assert_eq!(scope.ignore_root(), PathBuf::from("/work/project"));
+    let dir = tempfile::tempdir().unwrap();
+    let root = crate::scope::canonical_key(dir.path());
+    let scope = TurnScope::at(&root);
+    assert_eq!(scope.ignore_root(), root);
 }
 
 /// A capture and a declare share no state, which is the whole of D38: two

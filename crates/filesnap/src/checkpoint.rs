@@ -265,6 +265,12 @@ mod tests {
         let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
         let ws = dir.path().join("ws");
         fs::create_dir_all(&ws).unwrap();
+        // Canonical, because a capture records canonical keys: on macOS the
+        // temp dir is under `/var`, a symlink to `/private/var`, and on
+        // Windows it arrives in 8.3 short form. Comparing against the raw
+        // spelling means comparing two names for one file — and neither
+        // platform's quirk exists on Linux, so it passes here and not there.
+        let ws = crate::scope::canonical_key(&ws);
         Fixture {
             _dir: dir,
             blobs,

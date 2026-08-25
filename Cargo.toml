@@ -24,6 +24,10 @@ rust-version = "1.89"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+# Canonicalization without Windows' `\\?\` extended-length prefix. `std`'s
+# `canonicalize` returns one, and it would otherwise reach every manifest key
+# and every event this crate prints. Kept when the path genuinely needs it.
+dunce = "1.0.5"
 clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
 gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
 ignore = "0.4.23"
