@@ -341,12 +341,13 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
     // Results are still anchored on `root` rather than on the workdir: manifest
     // keys are absolute path strings, so two spellings of one file would be two
     // separate entries, captured twice and restored inconsistently.
-    let root_real = root.canonicalize();
-    let workdir_real = workdir.canonicalize();
-    let relative = match (&root_real, &workdir_real) {
-        (Ok(root_real), Ok(workdir_real)) => root_real.strip_prefix(workdir_real).ok(),
-        _ => root.strip_prefix(workdir).ok(),
-    };
+    // Through `canonical_key`, like everywhere else — see its doc for why
+    // `Path::canonicalize` alone is wrong on Windows. It falls back to the
+    // path as given when resolution fails, so there is no second arm here.
+    let relative = canonical_key(root)
+        .strip_prefix(canonical_key(workdir))
+        .map(Path::to_path_buf)
+        .ok();
     // Discovery found the repository by walking up from `root`, so the workdir
     // is always an ancestor. If it somehow is not, this session's scope is not
     // inside this repository and the partition has nothing to say.
@@ -920,6 +921,31 @@ mod tests {
                 repo.join("app").join("deep").join("util.rs"),
             ],
             "a nested session root sees its own subtree, not nothing"
+        );
+    }
+
+    /// A canonical key never carries Windows' verbatim prefix.
+    ///
+    /// `Path::canonicalize` returns `\\?\C:\…` there, and that prefix would
+    /// become part of every manifest key and every event this crate prints —
+    /// while every other producer spelled the same file without it, so one
+    /// file would have two keys again. The guard is here rather than in a
+    /// reviewer's memory because the mistake is a one-word difference:
+    /// `path.canonicalize()` instead of `canonical_key(path)`.
+    #[test]
+    fn a_canonical_key_is_a_path_a_caller_could_have_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = canonical_key(dir.path());
+        let shown = key.to_string_lossy();
+
+        assert!(
+            !shown.starts_with(r"\\?\"),
+            "the verbatim prefix reached a key: {shown}"
+        );
+        assert_eq!(
+            canonical_key(&key),
+            key,
+            "resolving an already-resolved path must not change it"
         );
     }
 

@@ -60,9 +60,12 @@ impl WorkspaceKey {
     /// directory two partitions, each with its own history, and neither
     /// would be wrong enough to notice.
     pub fn of(workspace: &Path) -> Result<Self> {
-        let canonical = workspace
-            .canonicalize()
-            .map_err(|e| SnapshotError::io(workspace, e))?;
+        // `dunce`, so the partition key does not depend on Windows' verbatim
+        // `\\?\` prefix — it hashes the path, and two spellings must not give
+        // two partitions. It fails exactly as `Path::canonicalize` does, which
+        // is what the no-fallback rule above needs.
+        let canonical =
+            dunce::canonicalize(workspace).map_err(|e| SnapshotError::io(workspace, e))?;
         Ok(Self::of_canonical(&canonical))
     }
 

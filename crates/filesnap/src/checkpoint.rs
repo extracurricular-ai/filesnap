@@ -151,11 +151,13 @@ fn capture_at(
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return path;
         };
-        let real = resolved.entry(parent.to_path_buf()).or_insert_with(|| {
-            parent
-                .canonicalize()
-                .unwrap_or_else(|_| parent.to_path_buf())
-        });
+        // `canonical_key`, never `Path::canonicalize` directly: on Windows the
+        // latter returns an extended-length `\\?\C:\…` path, and that prefix
+        // would become part of every manifest key while every other producer
+        // spelled the same file without it.
+        let real = resolved
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| crate::scope::canonical_key(parent));
         real.join(name)
     });
 
