@@ -84,7 +84,21 @@ pub fn mode_of(meta: &fs::Metadata) -> Option<u32> {
         use std::os::unix::fs::PermissionsExt;
         Some(meta.permissions().mode() & 0o7777)
     }
-    #[cfg(not(unix))]
+    // Windows has exactly one observable permission — `FILE_ATTRIBUTE_READONLY`
+    // — so that is what `mode` records there. Mapping it onto `0o444` / `0o644`
+    // is lossy in one direction and exact in the other: everything Windows can
+    // tell us survives, and a mode written on unix still reads as "writable or
+    // not" here. `None` would have thrown the bit away in both directions,
+    // which is how a restore silently made a read-only file writable.
+    #[cfg(windows)]
+    {
+        Some(if meta.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = meta;
         None

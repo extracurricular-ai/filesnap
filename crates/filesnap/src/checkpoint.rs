@@ -35,7 +35,18 @@ use crate::manifest::mtime_parts;
 /// entry itself (below). Judging it later — "is this file young *now*" —
 /// would only cover the first couple of seconds, and a second write in the
 /// original tick would be trusted forever after that.
-const RACY_WINDOW: Duration = Duration::from_secs(2);
+///
+/// **Wider than the coarsest timestamp granularity we can land on**, which is
+/// what sets the number. It was two seconds, which is exactly FAT32 and exFAT
+/// granularity and one second above HFS+: on such a volume a recorded mtime
+/// can sit a full tick *before* the write it describes, so a file written
+/// moments before the capture already looked two seconds old and its
+/// fingerprint was trusted. The guard was silently off on precisely the
+/// removable and network volumes where two writes inside one tick are most
+/// likely. Three seconds clears the widest tick with a margin; the cost of
+/// being generous is one extra re-read of a file captured seconds after it
+/// changed.
+const RACY_WINDOW: Duration = Duration::from_secs(3);
 
 /// The fingerprint stored for an entry captured too soon after its own last
 /// write to be sure we read the final bytes.
@@ -481,6 +492,44 @@ mod tests {
             cp.manifest.absent,
             Default::default(),
             "a read that failed is not evidence the file was gone"
+        );
+    }
+
+    /// A file whose mtime a coarse-granularity filesystem rounded *down* is
+    /// still treated as racy.
+    ///
+    /// FAT32 and exFAT tick every two seconds and HFS+ every one, so a
+    /// recorded mtime can sit a full tick before the write it describes. With
+    /// the window at exactly two seconds, a file written moments before the
+    /// capture already looked old enough to trust — the guard was off on
+    /// exactly the removable and network volumes where two writes inside one
+    /// tick are most likely.
+    ///
+    /// Simulated rather than requiring such a volume: the timestamp is what
+    /// the filesystem would have recorded, and the capture instant is
+    /// injected.
+    #[test]
+    fn a_timestamp_rounded_down_by_a_coarse_filesystem_is_still_racy() {
+        let f = fixture();
+        let a = f.ws.join("a.txt");
+        fs::write(&a, b"first").unwrap();
+
+        // The write happened "now"; a 2-second-granularity volume records it
+        // as up to two seconds earlier.
+        let now = SystemTime::now();
+        let recorded = now - Duration::from_secs(2);
+        let file = fs::File::options().write(true).open(&a).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(recorded))
+            .unwrap();
+        drop(file);
+
+        let cp = capture_at(&f.blobs, &f.manifests, vec![a.clone()], None, now).unwrap();
+
+        let entry = &cp.manifest.entries[&a.to_string_lossy().into_owned()];
+        assert_eq!(
+            (entry.mtime_secs, entry.mtime_nanos),
+            RACY_FINGERPRINT,
+            "a fingerprint from within one filesystem tick was trusted"
         );
     }
 }

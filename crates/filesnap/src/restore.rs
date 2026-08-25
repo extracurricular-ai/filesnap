@@ -160,6 +160,8 @@ fn write_one(blobs: &BlobStore, write: &WriteAction, path: &Path) -> Result<()> 
     // change made by omission — the same executable bit lost by a different
     // route.
     set_mode(&tmp, write.mode.or_else(|| current_mode(path)))?;
+    #[cfg(windows)]
+    clear_readonly(path);
     fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))
 }
 
@@ -241,11 +243,39 @@ fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(|e| SnapshotError::io(path, e))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // The one bit Windows has. Owner-write decides it, so a mode recorded
+        // on unix restores sensibly here too.
+        let mut perms = fs::metadata(path)
+            .map_err(|e| SnapshotError::io(path, e))?
+            .permissions();
+        perms.set_readonly(mode & 0o200 == 0);
+        fs::set_permissions(path, perms).map_err(|e| SnapshotError::io(path, e))?;
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, mode);
     }
     Ok(())
+}
+
+/// Make `path` replaceable, on a platform where being read-only stops that.
+///
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` has to delete the
+/// destination, and it refuses to delete a read-only file — so restoring over
+/// one failed with access denied, on exactly the files a user had marked as
+/// not-to-be-changed. Unix has no equivalent: permission to replace a file
+/// lives on its directory, not on the file.
+#[cfg(windows)]
+fn clear_readonly(path: &Path) {
+    if let Ok(meta) = fs::metadata(path)
+        && meta.permissions().readonly()
+    {
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(path, perms);
+    }
 }
 
 /// Every stray restore temporary under `root`, wherever a restore reached.
