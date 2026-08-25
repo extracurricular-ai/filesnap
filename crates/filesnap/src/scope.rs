@@ -802,6 +802,12 @@ mod tests {
         .unwrap();
         touch(&root.join("secret.pem"), "key material");
         fs::set_permissions(root.join("secret.pem"), fs::Permissions::from_mode(0o000)).unwrap();
+        // One of the three reasons is a permission bit, which root ignores.
+        assert!(
+            fs::read(root.join("secret.pem")).is_err(),
+            "mode-000 left the file readable, so `Unreadable` cannot arise \
+             for this user — run this as non-root"
+        );
         std::os::unix::fs::symlink(root.join("fine.rs"), root.join("link.rs")).unwrap();
 
         let report = scan_report(

@@ -489,6 +489,16 @@ mod tests {
         fs::write(&inside, b"also secret").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
+        // Both routes are permission bits, and root ignores permission bits.
+        // Left unsaid, this test fails claiming the capture recorded a file
+        // it should have skipped — which would be a real defect, and is not
+        // what happened.
+        assert!(
+            fs::read(&denied).is_err() && fs::metadata(&inside).is_err(),
+            "mode-000 did not deny anything, so neither route to unreadable \
+             exists for this user — run this as non-root"
+        );
+
         let cp = capture(&f.blobs, &f.manifests, vec![denied.clone(), inside], None);
 
         // Reopen before asserting: a panic must not leave the temp directory

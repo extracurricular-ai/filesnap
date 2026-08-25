@@ -162,6 +162,14 @@ fn a_file_that_cannot_be_written_does_not_strand_the_others() {
     }
     // Deny writes in the directory, so only that one file's rename fails.
     chmod(&fx, "locked", 0o500);
+    // Root ignores permission bits, and this whole test is a permission bit.
+    // Without this it fails as `written: 3, expected 2`, which says nothing
+    // about the cause.
+    assert!(
+        std::fs::write(fx.path("locked").join(".probe"), b"x").is_err(),
+        "a mode-0500 directory accepted a write, so the blocker this test \
+         depends on does not exist for this user — run it as non-root"
+    );
 
     let store = fx.store();
     let target = store.target_for_turn("turn-1").unwrap().unwrap();
