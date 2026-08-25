@@ -93,6 +93,7 @@ pub use turn::DeclareOutcome;
 pub use turn::TurnScope;
 pub use turn::capture_turn;
 pub use turn::declare_edits;
+pub use turn::restore_scope;
 // D13: consumers name `Gitignore` in our signatures, so they get the type
 // from us rather than adding their own dependency on `ignore`.
 pub use ignore::gitignore::Gitignore;

@@ -459,8 +459,23 @@ impl WorkspaceStore {
         // And what the undo will *delete*, which the target likewise cannot
         // tell us: only the safety manifest knows a file existing now was
         // absent then and is about to be removed.
+        //
+        // Same guard as above, and it is load-bearing. Without it, a path the
+        // rewind *recreated* — absent at the safety capture, present now
+        // because the rewind put it back — was reported as a conflict on
+        // every ordinary round trip. That is the undo doing exactly what it
+        // is for, and calling it a conflict trains the reader to ignore the
+        // warning, which is worse than not warning at all. When the target
+        // has an opinion about the path, the loops above have already
+        // compared against it.
         for path in &restoring.absent {
-            if !is_protected(rules, path) && Path::new(path).exists() {
+            if is_protected(rules, path)
+                || expected.entries.contains_key(path)
+                || expected.absent.contains(path)
+            {
+                continue;
+            }
+            if Path::new(path).exists() {
                 moved.push(path.clone());
             }
         }

@@ -216,6 +216,32 @@ fn main() -> std::process::ExitCode {
                 exit::USAGE
             }
         },
+        Command::Restore {
+            session,
+            turn,
+            undo_for,
+            cwd,
+        } => match here(cwd) {
+            Ok(cwd) => commands::restore::restore(
+                &mut out,
+                &data_dir,
+                &cwd,
+                &session,
+                &turn,
+                undo_for.as_deref(),
+            ),
+            Err(err) => {
+                eprintln!("filesnap: cannot resolve the working directory: {err}");
+                exit::USAGE
+            }
+        },
+        Command::Undo { session, cwd } => match here(cwd) {
+            Ok(cwd) => commands::restore::undo(&mut out, &data_dir, &cwd, &session),
+            Err(err) => {
+                eprintln!("filesnap: cannot resolve the working directory: {err}");
+                exit::USAGE
+            }
+        },
         _ => {
             eprintln!("filesnap: not implemented yet");
             exit::FAILED

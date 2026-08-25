@@ -147,6 +147,43 @@ pub fn capture_turn(
     Ok(checkpoint)
 }
 
+/// What a restore must be asked to look at.
+///
+/// The workspace as it stands **plus every path this session has observed**.
+/// The second half is not optional and is easy to leave out: a file the agent
+/// deleted is on no walk of the directory, so without it the safety capture
+/// cannot record that it was gone, and a later undo could never take it away
+/// again.
+///
+/// `restore_to` additionally folds in the target's own paths, which makes the
+/// safety capture sufficient by construction rather than by the caller having
+/// got this right. This is still the supported way to build the argument —
+/// the alternative is every caller rediscovering the deleted-file case.
+pub fn restore_scope(
+    store: &WorkspaceStore,
+    session_id: &str,
+    scope: &TurnScope,
+) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = tracked_files(
+        &scope.scan_roots(),
+        store.declared_paths(session_id)?,
+        scope.hidden,
+        scope.limits,
+    )
+    .files
+    .into_iter()
+    .collect();
+    files.extend(
+        store
+            .tracked_paths(session_id)?
+            .into_iter()
+            .map(PathBuf::from),
+    );
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 /// What a declare did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct DeclareOutcome {

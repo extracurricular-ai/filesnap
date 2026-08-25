@@ -493,3 +493,76 @@ fn deleting_a_session_drops_its_declared_set() {
     store.delete_sessions(&[S.to_string()]);
     assert_eq!(store.declared_paths(S).unwrap(), Default::default());
 }
+
+/// **An ordinary rewind-then-undo reports no conflicts.**
+///
+/// A file the rewind *recreated* is absent in the safety capture and present
+/// now, which the conflict check read as "someone put this back" — on every
+/// round trip, for the file the undo was about to remove on purpose. Crying
+/// wolf trains the reader to ignore the warning, and then the one real
+/// conflict is ignored too, which is worse than not warning at all.
+#[test]
+fn a_clean_round_trip_reports_nothing_moved() {
+    let fx = Fixture::new();
+    fx.write("kept.txt", "v1");
+    fx.write("deleted-later.txt", "here");
+    fx.capture(S, "turn-1");
+
+    // The agent's turn: change one file, remove another, add a third.
+    fx.write("kept.txt", "v2");
+    fx.remove("deleted-later.txt");
+    fx.write("added.txt", "new");
+
+    let store = fx.store();
+    let target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            S,
+            &target,
+            RestoreKind::Rewind { undo_for: Some(S) },
+            fx.restore_scope(S),
+            &no_rules(),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.read("deleted-later.txt"),
+        "here",
+        "the rewind put it back"
+    );
+
+    assert_eq!(
+        store.undo_conflicts(S, &no_rules()).unwrap(),
+        Vec::<String>::new(),
+        "nothing moved; the rewind's own work was reported as a conflict"
+    );
+}
+
+/// And the check still fires on a real one: a file the rewind recreated, which
+/// somebody then edited.
+#[test]
+fn editing_what_the_rewind_recreated_is_a_real_conflict() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "original");
+    fx.capture(S, "turn-1");
+    fx.remove("a.txt");
+
+    let store = fx.store();
+    let target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            S,
+            &target,
+            RestoreKind::Rewind { undo_for: Some(S) },
+            fx.restore_scope(S),
+            &no_rules(),
+        )
+        .unwrap();
+
+    // Somebody edits the file the rewind put back. An undo would delete it.
+    fx.write("a.txt", "someone else's work");
+
+    assert_eq!(
+        store.undo_conflicts(S, &no_rules()).unwrap(),
+        vec![fx.path("a.txt").to_string_lossy().into_owned()]
+    );
+}

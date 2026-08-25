@@ -504,3 +504,228 @@ fn wire_field_names_are_camel_case() {
         }
     }
 }
+
+// --- restore and undo ---
+
+/// A rewind puts the workspace back, and hands back the point it can be
+/// reversed to. That id arriving in a fixed place is the whole of C20.
+#[test]
+fn a_restore_puts_files_back_and_reports_its_safety_point() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    std::fs::write(ws.path().join("gone-later.txt"), "here").unwrap();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+
+    std::fs::write(ws.path().join("a.txt"), "changed").unwrap();
+    std::fs::remove_file(ws.path().join("gone-later.txt")).unwrap();
+
+    let run = filesnap(
+        data.path(),
+        &[
+            "restore",
+            "--session",
+            "s1",
+            "--turn",
+            "t1",
+            "--undo-for",
+            "s1",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("gone-later.txt")).unwrap(),
+        "here",
+        "a file the turn had is put back"
+    );
+    assert!(run.find("restore.done")["safety"].as_str().unwrap().len() == 64);
+}
+
+/// The round trip, and it must be quiet: an ordinary undo of an ordinary
+/// rewind reports nothing moved and exits clean.
+#[test]
+fn an_undo_reverses_the_rewind_without_crying_wolf() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    std::fs::write(ws.path().join("gone-later.txt"), "here").unwrap();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+
+    std::fs::write(ws.path().join("a.txt"), "changed").unwrap();
+    std::fs::remove_file(ws.path().join("gone-later.txt")).unwrap();
+    filesnap(
+        data.path(),
+        &[
+            "restore",
+            "--session",
+            "s1",
+            "--turn",
+            "t1",
+            "--undo-for",
+            "s1",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    let run = filesnap(data.path(), &["undo", "--session", "s1", "--cwd", &cwd]);
+
+    assert_eq!(
+        run.code,
+        0,
+        "an ordinary round trip reported a conflict: {:?}",
+        run.kinds()
+    );
+    assert!(!run.kinds().contains(&"undo.conflict"));
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+        "changed"
+    );
+    assert!(!ws.path().join("gone-later.txt").exists(), "removed again");
+}
+
+/// A change made after the rewind is reported, and the exit says so — an undo
+/// that quietly overwrote someone's work would be the failure `undo_conflicts`
+/// exists to prevent.
+#[test]
+fn an_undo_that_would_overwrite_a_change_says_so() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+    std::fs::write(ws.path().join("a.txt"), "changed").unwrap();
+    filesnap(
+        data.path(),
+        &[
+            "restore",
+            "--session",
+            "s1",
+            "--turn",
+            "t1",
+            "--undo-for",
+            "s1",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    // Somebody else edits the file the rewind just wrote.
+    std::fs::write(ws.path().join("a.txt"), "someone else's work").unwrap();
+
+    let run = filesnap(data.path(), &["undo", "--session", "s1", "--cwd", &cwd]);
+
+    assert_eq!(run.code, 1, "a conflicting undo read as a clean success");
+    assert!(
+        run.find("undo.conflict")["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("a.txt")
+    );
+    // It still happened, and the work is recoverable from the safety point.
+    assert!(run.find("restore.done")["safety"].as_str().unwrap().len() == 64);
+}
+
+/// A turn that was never captured is a usage error, not a store failure:
+/// nothing was attempted and the caller should fix the call.
+#[test]
+fn restoring_an_unknown_turn_is_a_usage_error() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    let run = filesnap(
+        data.path(),
+        &[
+            "restore",
+            "--session",
+            "s1",
+            "--turn",
+            "never-happened",
+            "--cwd",
+            &cwd,
+        ],
+    );
+    assert_eq!(run.code, 3);
+    assert!(run.out.is_empty());
+}
+
+#[test]
+fn undoing_with_nothing_to_undo_is_a_usage_error() {
+    let (data, ws) = workspace();
+    let run = filesnap(
+        data.path(),
+        &[
+            "undo",
+            "--session",
+            "s1",
+            "--cwd",
+            &ws.path().to_string_lossy(),
+        ],
+    );
+    assert_eq!(run.code, 3);
+}
+
+/// **One unwritable file does not strand the rest, and does not read as
+/// success** (D28, D40). Each failure is its own event; the terminal event
+/// still carries the counts and the safety id.
+#[test]
+#[cfg(unix)]
+fn a_restore_that_cannot_write_everything_reports_per_file_and_exits_nonzero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    std::fs::create_dir(ws.path().join("locked")).unwrap();
+    std::fs::write(ws.path().join("locked/inside.txt"), "before").unwrap();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+
+    std::fs::write(ws.path().join("a.txt"), "changed").unwrap();
+    std::fs::write(ws.path().join("locked/inside.txt"), "changed").unwrap();
+    std::fs::set_permissions(
+        ws.path().join("locked"),
+        std::fs::Permissions::from_mode(0o500),
+    )
+    .unwrap();
+
+    let run = filesnap(
+        data.path(),
+        &["restore", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+    std::fs::set_permissions(
+        ws.path().join("locked"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    assert_eq!(run.code, 1, "a partial restore read as success");
+    assert_eq!(run.find("restore.done")["failed"], 1);
+    assert!(
+        run.find("restore.failed")["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("inside.txt")
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+        "one",
+        "the file that could be written still was"
+    );
+    assert!(
+        run.find("restore.done")["safety"].as_str().unwrap().len() == 64,
+        "the point it can be reversed to is reported even on a partial restore"
+    );
+}
