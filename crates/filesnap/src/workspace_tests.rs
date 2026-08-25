@@ -1,6 +1,17 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+
+/// The version directory this build owns, and one above it. Derived rather
+/// than spelled, so bumping the format does not need a test rewrite — and so
+/// a test cannot go on asserting a version nothing writes any more.
+fn ours() -> String {
+    format!("v{FORMAT_VERSION}")
+}
+
+fn newer() -> String {
+    format!("v{}", FORMAT_VERSION + 1)
+}
 use pretty_assertions::assert_eq;
 
 /// Two spellings of one directory must be one partition. This is the case
@@ -55,7 +66,7 @@ fn a_missing_workspace_is_an_error_rather_than_a_guess() {
 fn the_store_root_is_created_under_a_version_directory() {
     let home = tempfile::tempdir().unwrap();
     let root = store_root(home.path()).unwrap();
-    assert_eq!(root, home.path().join("filesnap").join("v1"));
+    assert_eq!(root, home.path().join("filesnap").join(ours()));
     assert!(root.is_dir());
     // Opening again finds the same root rather than making a second one.
     assert_eq!(store_root(home.path()).unwrap(), root);
@@ -67,20 +78,19 @@ fn the_store_root_is_created_under_a_version_directory() {
 #[test]
 fn a_store_only_a_newer_build_understands_is_refused() {
     let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("filesnap").join("v2")).unwrap();
+    std::fs::create_dir_all(home.path().join("filesnap").join(newer())).unwrap();
 
-    let err = store_root(home.path()).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            SnapshotError::UnknownStoreVersion {
-                found: 2,
-                supported: 1,
-                ..
-            }
-        ),
-        "expected a refusal naming both versions, got {err:?}"
-    );
+    // Destructured rather than matched against literals: a pattern cannot
+    // hold a constant, and spelling the numbers is how a test ends up
+    // asserting a version the code stopped using.
+    match store_root(home.path()).unwrap_err() {
+        SnapshotError::UnknownStoreVersion {
+            found, supported, ..
+        } => {
+            assert_eq!((found, supported), (FORMAT_VERSION + 1, FORMAT_VERSION));
+        }
+        other => panic!("expected a refusal naming both versions, got {other:?}"),
+    }
 }
 
 /// Our own version alongside a newer one is not a conflict — this build reads
@@ -88,12 +98,12 @@ fn a_store_only_a_newer_build_understands_is_refused() {
 #[test]
 fn a_newer_version_beside_our_own_is_not_an_error() {
     let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("filesnap").join("v1")).unwrap();
-    std::fs::create_dir_all(home.path().join("filesnap").join("v2")).unwrap();
+    std::fs::create_dir_all(home.path().join("filesnap").join(ours())).unwrap();
+    std::fs::create_dir_all(home.path().join("filesnap").join(newer())).unwrap();
 
     assert_eq!(
         store_root(home.path()).unwrap(),
-        home.path().join("filesnap").join("v1")
+        home.path().join("filesnap").join(ours())
     );
 }
 

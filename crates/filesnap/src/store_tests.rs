@@ -21,7 +21,12 @@ const S: &str = "session-1";
 
 /// Where a session's log lives. Only a test that must damage one needs this.
 fn log_path(store: &WorkspaceStore, session: &str) -> PathBuf {
-    store.partition.join("refs").join(format!("{session}.json"))
+    // The digest, not the id: records are named for the hash of their id so
+    // that two ids differing only in case cannot share one file.
+    store
+        .partition
+        .join("refs")
+        .join(format!("{}.json", crate::id::record_name(session)))
 }
 
 /// A session whose log cannot be read is left **exactly as it was**, and one
@@ -565,4 +570,73 @@ fn editing_what_the_rewind_recreated_is_a_real_conflict() {
         store.undo_conflicts(S, &no_rules()).unwrap(),
         vec![fx.path("a.txt").to_string_lossy().into_owned()]
     );
+}
+
+/// **Two ids differing only in case are two sessions, on every filesystem.**
+///
+/// Records are named for the hash of their id rather than for the id, because
+/// APFS and NTFS are case-insensitive by default: `Session-A` and `session-a`
+/// were one file there and two on ext4, so two conversations shared one log
+/// and one undo stack on two of the three platforms — and deleting either
+/// destroyed the other's history. That is the collision D7 says a *mapping*
+/// must never cause, arriving by way of the filesystem instead.
+///
+/// The digest is lowercase hex, so ids that differ only in case produce names
+/// that differ in more than case. This passes on Linux either way; it is the
+/// other two platforms it exists for, and CI runs there.
+#[test]
+fn ids_differing_only_in_case_do_not_share_a_record() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    let store = fx.store();
+
+    store
+        .checkpoint("Session-A", "Turn-1", fx.all_files())
+        .unwrap();
+    fx.write("a.txt", "two");
+    store
+        .checkpoint("session-a", "turn-1", fx.all_files())
+        .unwrap();
+
+    assert_eq!(store.thread_history("Session-A").unwrap().len(), 1);
+    assert_eq!(store.thread_history("session-a").unwrap().len(), 1);
+
+    let mut sessions = store.sessions().unwrap();
+    sessions.sort();
+    assert_eq!(
+        sessions,
+        vec!["Session-A".to_string(), "session-a".to_string()]
+    );
+
+    // And the turns are distinct too, which is what a rewind resolves.
+    let upper = store.target_for_turn("Turn-1").unwrap().unwrap();
+    let lower = store.target_for_turn("turn-1").unwrap().unwrap();
+    assert_ne!(upper, lower, "one turn resolved to the other's state");
+
+    // Deleting one leaves the other whole. This was the destructive half.
+    store.delete_sessions(&["session-a".to_string()]);
+    assert!(!store.session_exists("session-a"));
+    assert!(
+        store.session_exists("Session-A"),
+        "deleting one case destroyed the other's history"
+    );
+}
+
+/// The id is in the record, so enumeration reports what a caller can use.
+///
+/// With the filename a digest, a listing of the directory says nothing. Had
+/// `sessions()` kept deriving ids from filenames it would have reported
+/// hashes — names no other API accepts.
+#[test]
+fn sessions_are_reported_by_id_not_by_the_name_on_disk() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    let store = fx.store();
+    store
+        .checkpoint("my.session-1", "turn-1", fx.all_files())
+        .unwrap();
+
+    assert_eq!(store.sessions().unwrap(), vec!["my.session-1".to_string()]);
+    // The reported id round-trips through the API that consumes it.
+    assert_eq!(store.thread_history("my.session-1").unwrap().len(), 1);
 }

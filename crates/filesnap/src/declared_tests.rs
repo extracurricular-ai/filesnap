@@ -125,9 +125,19 @@ fn a_record_from_an_unknown_build_is_refused() {
     let (dir, store) = store();
     store.declare(S, "turn-1", &[p("a.rs")]).unwrap();
 
-    let path = dir.path().join("declared").join(format!("{S}.json"));
+    let path = dir
+        .path()
+        .join("declared")
+        .join(format!("{}.json", crate::id::record_name(S)));
     let raw = fs::read_to_string(&path).unwrap();
-    fs::write(&path, raw.replace("\"version\": 1", "\"version\": 99")).unwrap();
+    fs::write(
+        &path,
+        raw.replace(
+            &format!("\"version\": {}", crate::workspace::FORMAT_VERSION),
+            "\"version\": 99",
+        ),
+    )
+    .unwrap();
 
     assert!(matches!(
         store.active(S),

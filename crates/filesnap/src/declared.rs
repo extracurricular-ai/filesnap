@@ -68,6 +68,9 @@ struct Declaration {
 struct DeclaredFile {
     /// Format version of this record — see [`crate::manifest::Manifest`].
     version: u32,
+    /// Whose declarations these are; see [`crate::refs::ThreadLog::session`].
+    #[serde(default)]
+    session: String,
     /// Turn ids in the order this session first saw them, so an ordinal can
     /// be assigned without the host supplying one (D6: we never mint ids, but
     /// the *order* is ours).
@@ -79,6 +82,7 @@ impl Default for DeclaredFile {
     fn default() -> Self {
         Self {
             version: crate::workspace::FORMAT_VERSION,
+            session: String::new(),
             turns: Vec::new(),
             entries: Vec::new(),
         }
@@ -188,9 +192,15 @@ impl DeclaredStore {
         let entries = fs::read_dir(&self.root).map_err(|e| SnapshotError::io(&self.root, e))?;
         let mut out = Vec::new();
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".json") {
-                out.push(id.to_string());
+            if !entry.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            // From inside the record: the filename is a digest.
+            if let Ok(bytes) = fs::read(entry.path())
+                && let Ok(file) = serde_json::from_slice::<DeclaredFile>(&bytes)
+                && !file.session.is_empty()
+            {
+                out.push(file.session);
             }
         }
         Ok(out)
@@ -223,6 +233,9 @@ impl DeclaredStore {
     }
 
     fn save(&self, session_id: &str, file: &DeclaredFile) -> Result<()> {
+        let mut file = file.clone();
+        file.session = session_id.to_string();
+        let file = &file;
         let path = self.path_for(session_id)?;
         let tmp = crate::sweep::tmp_name(&path);
         fs::write(&tmp, serde_json::to_vec_pretty(file)?)
@@ -232,7 +245,9 @@ impl DeclaredStore {
 
     fn path_for(&self, session_id: &str) -> Result<PathBuf> {
         crate::id::validate_stored("session id", session_id)?;
-        Ok(self.root.join(format!("{session_id}.json")))
+        Ok(self
+            .root
+            .join(format!("{}.json", crate::id::record_name(session_id))))
     }
 }
 

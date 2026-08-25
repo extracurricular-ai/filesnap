@@ -25,14 +25,14 @@ impl Store {
         self.dir
             .path()
             .join("refs")
-            .join(format!("{thread_id}.json"))
+            .join(format!("{}.json", crate::id::record_name(thread_id)))
     }
 
     fn restore_path(&self, thread_id: &str) -> PathBuf {
         self.dir
             .path()
             .join("restores")
-            .join(format!("{thread_id}.json"))
+            .join(format!("{}.json", crate::id::record_name(thread_id)))
     }
 }
 

@@ -220,7 +220,11 @@ pub(crate) fn acquire(
     crate::id::validate_stored("session id", session_id)?;
     let dir = dir_in(partition);
     std::fs::create_dir_all(&dir).map_err(|e| SnapshotError::io(&dir, e))?;
-    let path = dir.join(format!("{session_id}.lock"));
+    // Named for the digest like every other record, so two ids differing only
+    // in case cannot share one sentinel on a case-insensitive filesystem —
+    // which would serialize two unrelated sessions against each other, the
+    // one thing D18 says is never done.
+    let path = dir.join(format!("{}.lock", crate::id::record_name(session_id)));
 
     let deadline = Instant::now() + budget;
     let mut backoff = Duration::from_millis(2);

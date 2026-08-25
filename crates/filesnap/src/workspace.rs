@@ -40,7 +40,7 @@ const STORE_DIR: &str = "filesnap";
 /// A store is a directory named for its version, so a build that meets a
 /// version it does not know simply does not open it — there is nothing to
 /// misread. Bumping this is a deliberate, migrating act.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Identifies one workspace's partition.
 ///

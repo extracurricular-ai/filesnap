@@ -130,7 +130,11 @@ fn a_lock_dies_with_the_process_holding_it() {
 fn the_sentinel_outlives_the_lock() {
     let dir = store();
     drop(acquire(dir.path(), "s1", LOCK_BUDGET).unwrap());
-    assert!(dir_in(dir.path()).join("s1.lock").exists());
+    assert!(
+        dir_in(dir.path())
+            .join(format!("{}.lock", crate::id::record_name("s1")))
+            .exists()
+    );
 }
 
 /// An id that could escape its directory is refused before a path is built,

@@ -125,7 +125,15 @@ fn half_written_content_is_reclaimed() {
     fx.capture("s", "turn-1");
 
     // What a process killed between the temp write and the rename leaves.
-    let blobs = fx.data_dir().join("filesnap/v1/blobs/ab");
+    // Derived from the constant, not spelled: a format bump must not leave a
+    // test planting residue in a directory nothing writes to any more, where
+    // it would pass by finding nothing to clean.
+    let blobs = fx
+        .data_dir()
+        .join("filesnap")
+        .join(format!("v{}", filesnap::FORMAT_VERSION))
+        .join("blobs")
+        .join("ab");
     std::fs::create_dir_all(&blobs).unwrap();
     let stray = blobs.join("cdef.tmp");
     std::fs::write(&stray, vec![0u8; 4096]).unwrap();

@@ -52,6 +52,15 @@ pub struct SnapshotRef {
 pub struct ThreadLog {
     /// Format version of this record — see [`crate::manifest::Manifest`].
     pub version: u32,
+    /// Whose log this is.
+    ///
+    /// In the record because it is no longer in the filename: the file is
+    /// named for the *hash* of the id, so that two ids differing only in case
+    /// cannot share one file on a case-insensitive filesystem. Enumerating
+    /// sessions therefore means reading the records rather than listing a
+    /// directory — see [`RefStore::thread_ids`].
+    #[serde(default)]
+    pub session: String,
     pub entries: Vec<SnapshotRef>,
 }
 
@@ -70,6 +79,7 @@ impl Default for ThreadLog {
     fn default() -> Self {
         Self {
             version: crate::workspace::FORMAT_VERSION,
+            session: String::new(),
             entries: Vec::new(),
         }
     }
@@ -145,6 +155,7 @@ impl RefStore {
     /// can.
     pub fn append(&self, thread_id: &str, turn_id: String, manifest_id: String) -> Result<()> {
         let mut log = self.load(thread_id)?;
+        log.session = thread_id.to_string();
         let entry = SnapshotRef::chained(turn_id, manifest_id, log.entries.last());
         log.entries.push(entry);
         let path = self.log_path(thread_id)?;
@@ -169,7 +180,10 @@ impl RefStore {
             return Ok(());
         }
         let tmp = crate::sweep::tmp_name(&path);
-        let bytes = serde_json::to_vec_pretty(&ThreadLog::default())?;
+        let bytes = serde_json::to_vec_pretty(&ThreadLog {
+            session: thread_id.to_string(),
+            ..ThreadLog::default()
+        })?;
         fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
         fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
         Ok(())
@@ -243,9 +257,17 @@ impl RefStore {
         let mut out = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.root, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".json") {
-                out.push(id.to_string());
+            if !entry.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            // The filename is a digest, so the id comes from inside. A record
+            // that will not parse is skipped rather than reported under a name
+            // derived from its hash, which would be a name nobody can use.
+            if let Ok(bytes) = fs::read(entry.path())
+                && let Ok(log) = serde_json::from_slice::<ThreadLog>(&bytes)
+                && !log.session.is_empty()
+            {
+                out.push(log.session);
             }
         }
         out.sort();
@@ -254,7 +276,9 @@ impl RefStore {
 
     fn log_path(&self, thread_id: &str) -> Result<PathBuf> {
         crate::id::validate_stored("session id", thread_id)?;
-        Ok(self.root.join(format!("{thread_id}.json")))
+        Ok(self
+            .root
+            .join(format!("{}.json", crate::id::record_name(thread_id))))
     }
 }
 
@@ -292,6 +316,9 @@ pub struct RestoreRecord {
 pub struct RestoreLog {
     /// Format version of this record — see [`crate::manifest::Manifest`].
     pub version: u32,
+    /// Whose undo stack this is; see [`ThreadLog::session`].
+    #[serde(default)]
+    pub session: String,
     pub entries: Vec<RestoreRecord>,
 }
 
@@ -303,9 +330,22 @@ impl Default for RestoreLog {
     fn default() -> Self {
         Self {
             version: crate::workspace::FORMAT_VERSION,
+            session: String::new(),
             entries: Vec::new(),
         }
     }
+}
+
+/// What a turn resolved to, and which turn it was.
+///
+/// A bare manifest id on disk before: the filename carried the turn id, and
+/// nothing carried a format version — the one durable record with neither.
+/// Now the filename is a digest, so both live here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TurnRecord {
+    version: u32,
+    turn: String,
+    manifest: String,
 }
 
 /// Undo records across a partition, and whether any could not be read.
@@ -349,13 +389,24 @@ impl TurnIndex {
     /// a supplemental pre-edit attach extends that turn's capture.
     pub fn set_turn(&self, turn_id: &str, manifest_id: &str) -> Result<()> {
         let path = self.turn_path(turn_id)?;
-        write_atomic(&path, manifest_id.as_bytes())
+        write_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&TurnRecord {
+                version: crate::workspace::FORMAT_VERSION,
+                turn: turn_id.to_string(),
+                manifest: manifest_id.to_string(),
+            })?,
+        )
     }
 
     pub fn manifest_for_turn(&self, turn_id: &str) -> Result<Option<String>> {
         let path = self.turn_path(turn_id)?;
-        match fs::read_to_string(&path) {
-            Ok(id) => Ok(Some(id.trim().to_string())),
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let record: TurnRecord = serde_json::from_slice(&bytes)?;
+                check_version("turn record", turn_id, record.version)?;
+                Ok(Some(record.manifest))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
@@ -375,11 +426,11 @@ impl TurnIndex {
             if !entry.file_name().to_string_lossy().ends_with(TURN_SUFFIX) {
                 continue;
             }
-            match fs::read_to_string(entry.path()) {
-                Ok(id) => {
-                    out.ids.insert(id.trim().to_string());
+            match fs::read(entry.path()).map(|b| serde_json::from_slice::<TurnRecord>(&b)) {
+                Ok(Ok(record)) if record.version == crate::workspace::FORMAT_VERSION => {
+                    out.ids.insert(record.manifest);
                 }
-                Err(_) => out.incomplete = true,
+                _ => out.incomplete = true,
             }
         }
         let logs = self.all_restore_logs()?;
@@ -405,14 +456,26 @@ impl TurnIndex {
             .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(thread_id) = name.strip_suffix(".json") else {
+            if !entry.file_name().to_string_lossy().ends_with(".json") {
+                continue;
+            }
+            // The id comes from inside the record now, since the filename is a
+            // digest. A record that will not parse is left alone: it is not
+            // evidence that a session is gone, and removing it would be acting
+            // on an answer we do not have.
+            let Ok(bytes) = fs::read(entry.path()) else {
                 continue;
             };
+            let Ok(log) = serde_json::from_slice::<RestoreLog>(&bytes) else {
+                continue;
+            };
+            if log.session.is_empty() {
+                continue;
+            }
             // Grace-gated like every other reclamation: a rewind writes the
             // undo record under a session whose own log may be moments away.
-            if !refs.exists(thread_id) && crate::sweep::settled(&entry.path()) {
-                out.push(thread_id.to_string());
+            if !refs.exists(&log.session) && crate::sweep::settled(&entry.path()) {
+                out.push(log.session);
             }
         }
         Ok(out)
@@ -426,14 +489,17 @@ impl TurnIndex {
     /// log this build deserialized but never vetted, so a forged or corrupted
     /// entry could otherwise aim `remove_file` outside the partition (D5).
     pub fn remove_turn_file(&self, turn_file: &str) -> Result<()> {
-        let Some(turn_id) = turn_file.strip_suffix(TURN_SUFFIX) else {
+        let Some(digest) = turn_file.strip_suffix(TURN_SUFFIX) else {
             return Err(SnapshotError::InvalidId {
                 kind: "turn record",
                 id: turn_file.to_string(),
                 reason: "a turn record's name must end in `.turn`",
             });
         };
-        crate::id::validate_stored("turn id", turn_id)?;
+        // The name is a digest, so it is checked as one. Same reason as
+        // before: this is derived from a `turn_id` read out of a log that was
+        // deserialized but never vetted, and it is handed to `remove_file`.
+        crate::id::validate_object("turn record", digest)?;
         let path = self.turns_root.join(turn_file);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -444,6 +510,7 @@ impl TurnIndex {
 
     pub fn push_restore(&self, thread_id: &str, record: RestoreRecord) -> Result<()> {
         let mut log = self.restore_log(thread_id)?;
+        log.session = thread_id.to_string();
         log.entries.push(record);
         // Undo reaches back one step, so a long tail only pins storage.
         if log.entries.len() > MAX_RESTORE_HISTORY {
@@ -574,12 +641,14 @@ impl TurnIndex {
     /// makes the whitelist D9 asks for possible here at all.
     fn turn_path(&self, turn_id: &str) -> Result<PathBuf> {
         crate::id::validate_stored("turn id", turn_id)?;
-        Ok(self.turns_root.join(format!("{turn_id}{TURN_SUFFIX}")))
+        Ok(self.turns_root.join(turn_file_name(turn_id)))
     }
 
     fn restore_path(&self, thread_id: &str) -> Result<PathBuf> {
         crate::id::validate_stored("session id", thread_id)?;
-        Ok(self.restores_root.join(format!("{thread_id}.json")))
+        Ok(self
+            .restores_root
+            .join(format!("{}.json", crate::id::record_name(thread_id))))
     }
 }
 
@@ -593,7 +662,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// filename-safe character set.
 /// What a turn's index entry is named, given an id already proven storable.
 pub(crate) fn turn_file_name(turn_id: &str) -> String {
-    format!("{turn_id}{TURN_SUFFIX}")
+    format!("{}{TURN_SUFFIX}", crate::id::record_name(turn_id))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -775,10 +844,14 @@ mod tests {
         let refs = RefStore::open(&root).unwrap();
         refs.append("t1", "turn-1".into(), "m1".into()).unwrap();
 
-        let raw = fs::read_to_string(root.join("t1.json")).unwrap();
+        let name = format!("{}.json", crate::id::record_name("t1"));
+        let raw = fs::read_to_string(root.join(&name)).unwrap();
         fs::write(
-            root.join("t1.json"),
-            raw.replace("\"version\": 1", "\"version\": 99"),
+            root.join(&name),
+            raw.replace(
+                &format!("\"version\": {}", crate::workspace::FORMAT_VERSION),
+                "\"version\": 99",
+            ),
         )
         .unwrap();
 
@@ -811,9 +884,19 @@ mod tests {
             )
             .unwrap();
 
-        let path = dir.path().join("restores").join("t1.json");
+        let path = dir
+            .path()
+            .join("restores")
+            .join(format!("{}.json", crate::id::record_name("t1")));
         let raw = fs::read_to_string(&path).unwrap();
-        fs::write(&path, raw.replace("\"version\": 1", "\"version\": 99")).unwrap();
+        fs::write(
+            &path,
+            raw.replace(
+                &format!("\"version\": {}", crate::workspace::FORMAT_VERSION),
+                "\"version\": 99",
+            ),
+        )
+        .unwrap();
 
         let err = turns.last_restore("t1").unwrap_err();
         assert!(

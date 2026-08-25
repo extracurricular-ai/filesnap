@@ -98,6 +98,29 @@ pub(crate) fn validate_external(kind: &'static str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The filename a record about `id` lives under: the hex SHA-256 of the id.
+///
+/// **Not the id itself.** The id being its own filename was the readable
+/// choice and it does not survive contact with a case-insensitive filesystem:
+/// APFS and NTFS are case-insensitive by default, so `Session-A` and
+/// `session-a` are one file there and two on ext4. Two distinct conversations
+/// would share one log and one undo stack on two of the three platforms —
+/// exactly the collision [`validate_external`] refuses to let a *mapping*
+/// cause, arriving instead by way of the filesystem.
+///
+/// Narrowing ids to lowercase would have fixed it by refusing perfectly
+/// ordinary host ids — an uppercase UUID is not a mistake. Hashing keeps every
+/// id acceptable and makes the collision impossible: the digest is lowercase
+/// hex, so two ids that differ only in case produce two names that differ in
+/// more than case.
+///
+/// The id itself is stored *inside* the record, so nothing is lost but the
+/// ability to read a directory listing — and a listing was never the supported
+/// way to ask what a store holds.
+pub(crate) fn record_name(id: &str) -> String {
+    crate::blob::BlobStore::hash_bytes(id.as_bytes())
+}
+
 /// Whether `name` is the shape of a content-addressed object: 64 lowercase
 /// hex characters.
 ///
