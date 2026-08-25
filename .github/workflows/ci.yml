@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, because the things this catches do not arrive with a commit: a new
+  # clippy lint, a dependency that raised its own MSRV, a runner image change.
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing here and is the difference between a useful
+  # failure and a second run to reproduce it.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting and lints once, on the cheapest runner. They are
+  # platform-independent, so running them three times would only slow the
+  # matrix down.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # `--all-targets` so tests and examples are linted too. The workspace
+      # denies a long list of lints; this is where that list is enforced.
+      - run: cargo clippy --workspace --all-targets --features filesnap/test-support -- -D warnings
+
+  test:
+    strategy:
+      # Do not cancel the other platforms when one fails. The whole point of
+      # this matrix is that the failures differ, and seeing one of them is
+      # worth less than seeing all three.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `git` is read for the tracked-file partition, and a test fixture
+      # shells out to it. Present on every runner image, asserted so a
+      # missing one fails here rather than inside a test.
+      - run: git --version
+      - run: cargo test --workspace --features filesnap/test-support
+
+  # The declared MSRV, actually checked. Without this the `rust-version` field
+  # is a claim nothing holds up: it was derived by reading stabilization
+  # versions, and a dependency can raise its own floor without us noticing.
+  #
+  # `cargo check` rather than `cargo test`: the dev-dependencies are free to
+  # need something newer, and holding them to the MSRV would be a promise we
+  # never made to consumers.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
+
+  # What a consumer actually receives. `cargo test` in the workspace says
+  # nothing about whether the *packaged* crate is coherent — the engine's
+  # integration tests are deliberately excluded from it, and a file left out
+  # by accident would only surface here.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package -p filesnap
+      - run: cargo package -p filesnap-cli
+      - name: The packaged engine builds and tests on its own
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          tar xzf target/package/filesnap-*.crate -C "$dir"
+          cd "$dir"/filesnap-*
+          cargo test
