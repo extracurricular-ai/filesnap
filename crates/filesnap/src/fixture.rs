@@ -109,6 +109,19 @@ impl Fixture {
         self.workspace().join(rel)
     }
 
+    /// The **manifest key** for `rel`: the canonical spelling the store
+    /// records, as a string.
+    ///
+    /// Use this rather than `fx.path(rel).to_string_lossy()` wherever a test
+    /// compares against a recorded key. Building the string by hand states a
+    /// spelling instead of the contract, and the two part company on the
+    /// platforms nobody develops on: a literal `/` inside `join` stays a `/`
+    /// on Windows, where the key has backslashes, so the strings differ while
+    /// the paths are equal.
+    pub fn key(&self, rel: &str) -> String {
+        key_of(&self.path(rel))
+    }
+
     /// Every regular file in the workspace that the ignore rules admit,
     /// skipping dot-entries.
     ///
@@ -272,4 +285,11 @@ pub fn rules_for(root: &Path, pattern: &str) -> Gitignore {
         .add_line(None, pattern)
         .expect("valid ignore pattern");
     builder.build().expect("build ignore rules")
+}
+
+/// The manifest key for an absolute path — see [`Fixture::key`].
+pub fn key_of(path: &Path) -> String {
+    crate::scope::canonical_key(path)
+        .to_string_lossy()
+        .into_owned()
 }

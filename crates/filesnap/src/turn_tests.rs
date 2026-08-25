@@ -88,7 +88,7 @@ fn a_declare_and_a_capture_share_only_the_store() {
         checkpoint
             .manifest
             .entries
-            .contains_key(&outside.to_string_lossy().into_owned()),
+            .contains_key(&crate::fixture::key_of(&outside)),
         "the declared path was not picked up by a later process"
     );
 }
@@ -123,7 +123,7 @@ fn a_declare_reports_what_the_ignore_rules_excluded() {
         !fx.store()
             .tracked_paths(S)
             .unwrap()
-            .contains(&secret.to_string_lossy().into_owned()),
+            .contains(&crate::fixture::key_of(&secret)),
         "an ignored path reached the store through the edit API"
     );
 }

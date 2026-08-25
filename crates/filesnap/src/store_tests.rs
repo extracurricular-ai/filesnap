@@ -299,7 +299,7 @@ fn tracked_paths_includes_what_was_looked_for_and_not_found() {
         .unwrap();
 
     let paths = fx.store().tracked_paths(S).unwrap();
-    assert!(paths.contains(&fx.path("present.txt").to_string_lossy().into_owned()));
+    assert!(paths.contains(&fx.key("present.txt")));
     assert!(
         paths.contains(&gone),
         "a tombstone is an observation, and the safety scope needs it"
@@ -420,7 +420,7 @@ fn a_change_made_after_a_rewind_is_reported_as_a_conflict() {
 
     assert_eq!(
         store.undo_conflicts(S, &no_rules()).unwrap(),
-        vec![fx.path("a.txt").to_string_lossy().into_owned()]
+        vec![fx.key("a.txt")]
     );
     assert!(
         store
@@ -568,7 +568,7 @@ fn editing_what_the_rewind_recreated_is_a_real_conflict() {
 
     assert_eq!(
         store.undo_conflicts(S, &no_rules()).unwrap(),
-        vec![fx.path("a.txt").to_string_lossy().into_owned()]
+        vec![fx.key("a.txt")]
     );
 }
 

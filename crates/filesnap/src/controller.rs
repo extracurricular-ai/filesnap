@@ -313,8 +313,12 @@ mod tests {
 
         std::fs::create_dir_all(ws.path().join(".git")).unwrap();
         std::fs::write(ws.path().join(".env"), "SECRET=1").unwrap();
-        std::fs::create_dir_all(ws.path().join(".github/workflows")).unwrap();
-        std::fs::write(ws.path().join(".github/workflows/ci.yml"), "on: push").unwrap();
+        std::fs::create_dir_all(ws.path().join(".github").join("workflows")).unwrap();
+        std::fs::write(
+            ws.path().join(".github").join("workflows").join("ci.yml"),
+            "on: push",
+        )
+        .unwrap();
         std::fs::write(ws.path().join("src.rs"), "code").unwrap();
 
         ctl.checkpoint_turn_start("turn-1", ws.path(), &[]);
@@ -342,7 +346,11 @@ mod tests {
 
         // An edited hidden file is a different matter: it is work product,
         // so the edit hook tracks it and a rewind can restore it.
-        let workflow = ws.path().join(".github/workflows/ci.yml");
+        // Chained joins, not a literal `/` inside one. `join` appends its
+        // argument verbatim, so `".github/workflows/ci.yml"` gives a
+        // mixed-separator path on Windows — equal to the real one as a
+        // `Path`, and different from it as the *string* a manifest key is.
+        let workflow = ws.path().join(".github").join("workflows").join("ci.yml");
         ctl.attach_pre_edits(
             "turn-1",
             ws.path(),
@@ -355,7 +363,7 @@ mod tests {
             ctl.store
                 .tracked_paths("t1")
                 .unwrap()
-                .contains(&workflow.to_string_lossy().into_owned()),
+                .contains(&crate::fixture::key_of(&workflow)),
             "explicitly edited hidden files must remain restorable"
         );
     }
@@ -393,13 +401,13 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(ws.path().join("secrets")).unwrap();
-        std::fs::write(ws.path().join("secrets/key.pem"), "private").unwrap();
+        std::fs::write(ws.path().join("secrets").join("key.pem"), "private").unwrap();
         std::fs::write(ws.path().join("src.rs"), "code").unwrap();
 
         // Turn-start scan establishes the ignore scope for the session.
         ctl.checkpoint_turn_start("turn-1", ws.path(), &[]);
 
-        let secret = ws.path().join("secrets/key.pem");
+        let secret = ws.path().join("secrets").join("key.pem");
         let tracked = ws.path().join("src.rs");
         ctl.attach_pre_edits(
             "turn-1",
@@ -413,10 +421,10 @@ mod tests {
 
         let paths = ctl.store.tracked_paths("t1").unwrap();
         assert!(
-            !paths.contains(&secret.to_string_lossy().into_owned()),
+            !paths.contains(&crate::fixture::key_of(&secret)),
             "ignored path must never reach the store, not even via the edit hook: {paths:?}"
         );
-        assert!(paths.contains(&tracked.to_string_lossy().into_owned()));
+        assert!(paths.contains(&crate::fixture::key_of(&tracked)));
     }
 
     #[test]
@@ -449,15 +457,14 @@ mod tests {
         let history = ctl2.store.thread_history("t2").unwrap();
         // turn-1 scan + turn-1 supplemental attach + turn-2 scan.
         assert_eq!(history.len(), 3);
-        let outside_key = outside.to_string_lossy().into_owned();
+        let outside_key = crate::fixture::key_of(&outside);
         assert!(
             !history[0].1.entries.contains_key(&outside_key),
             "a path nothing had pointed at yet is simply not observed"
         );
         let last = &history[2].1;
         assert!(
-            last.entries
-                .contains_key(&outside.to_string_lossy().into_owned()),
+            last.entries.contains_key(&crate::fixture::key_of(&outside)),
             "extras are unioned into later checkpoints"
         );
     }
@@ -505,7 +512,7 @@ mod tests {
             !store
                 .tracked_paths("s1")
                 .unwrap()
-                .contains(&secret.to_string_lossy().into_owned()),
+                .contains(&crate::fixture::key_of(&secret)),
             "an ignored path entered the store through the edit hook"
         );
     }
@@ -546,7 +553,7 @@ mod tests {
         );
 
         let store = crate::WorkspaceStore::open(home.path(), ws.path()).unwrap();
-        let key = outside.to_string_lossy().into_owned();
+        let key = crate::fixture::key_of(&outside);
         let captured = |store: &crate::WorkspaceStore| {
             store
                 .latest_manifest("s1")
