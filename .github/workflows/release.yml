@@ -31,6 +31,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +41,7 @@ jobs:
   publish:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Must match the "Environment name" configured on crates.io for both
     # crates. Its value here is that a protection rule on the environment —
     # a required reviewer — stops a publish even if something unwanted has

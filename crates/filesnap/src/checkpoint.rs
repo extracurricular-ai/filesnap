@@ -123,6 +123,31 @@ fn capture_at(
     let mut manifest = Manifest::default();
     let mut stats = CheckpointStats::default();
 
+    // **One spelling per file, decided here.** This is the single place a
+    // manifest key is minted, so normalising anywhere else would leave a
+    // producer able to spell a key a second way — and keys are compared as
+    // strings, so one file with two keys means the stat cache never hits, a
+    // restore rewrites content that already matches, and `undo_conflicts`
+    // fails to warn about a file it is about to overwrite.
+    //
+    // Memoised by parent directory: a capture's files share few parents, so
+    // this costs about one `canonicalize` per directory rather than per file.
+    // That matters — `canonicalize` resolves every component, and a capture
+    // already stats thousands of files.
+    let mut resolved: std::collections::HashMap<PathBuf, PathBuf> =
+        std::collections::HashMap::new();
+    let files = files.into_iter().map(|path| {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return path;
+        };
+        let real = resolved.entry(parent.to_path_buf()).or_insert_with(|| {
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf())
+        });
+        real.join(name)
+    });
+
     for path in files {
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,

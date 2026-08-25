@@ -640,3 +640,51 @@ fn sessions_are_reported_by_id_not_by_the_name_on_disk() {
     // The reported id round-trips through the API that consumes it.
     assert_eq!(store.thread_history("my.session-1").unwrap().len(), 1);
 }
+
+/// **One file has one manifest key, however the caller spelled the path.**
+///
+/// The partition key is canonicalized so two spellings of a directory are one
+/// partition — `/var` → `/private/var` is the ordinary case on macOS, not an
+/// exotic one. The contents were not, so the partition was
+/// spelling-independent while its keys were not: the same file reached through
+/// a symlinked root got two keys, and since keys are compared as strings the
+/// stat cache never hit across a change of spelling, a restore rewrote content
+/// that already matched, and `undo_conflicts` could not warn about a file it
+/// was about to overwrite.
+#[cfg(unix)]
+#[test]
+fn one_file_has_one_key_whichever_spelling_reaches_it() {
+    let fx = Fixture::new();
+    let real = fx.path("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("a.txt"), "one").unwrap();
+    let linked = fx.path("linked");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+
+    let store = fx.store();
+    store
+        .checkpoint(S, "turn-real", vec![real.join("a.txt")])
+        .unwrap();
+    store
+        .checkpoint(S, "turn-link", vec![linked.join("a.txt")])
+        .unwrap();
+
+    let keys = |turn: &str| {
+        let target = store.target_for_turn(turn).unwrap().unwrap();
+        store
+            .manifest(target.manifest_id())
+            .unwrap()
+            .entries
+            .into_keys()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys("turn-real"),
+        keys("turn-link"),
+        "the same file was recorded under two keys"
+    );
+
+    // The consequence that matters: the second capture reused the first's
+    // hash rather than re-reading, which only happens if the key matched.
+    assert_eq!(store.thread_history(S).unwrap().len(), 2);
+}

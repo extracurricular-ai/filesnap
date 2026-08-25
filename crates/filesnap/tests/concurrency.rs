@@ -33,8 +33,14 @@ fn concurrent_captures_for_one_session_keep_every_turn() {
     let mut handles = Vec::new();
     for i in 0..WRITERS {
         let (data, ws, gate) = (data.clone(), ws.clone(), Arc::clone(&gate));
+        // Opened *before* the thread, so a failure here fails the test.
+        // Inside the closure it would panic one thread while the other seven
+        // blocked on a `Barrier` that can never be reached — and a `Barrier`
+        // has no timeout and no poisoning, so the test would hang rather than
+        // fail. With no `timeout-minutes` that used to cost the CI default of
+        // 360 minutes per platform instead of a red X.
+        let store = WorkspaceStore::open(&data, &ws).unwrap();
         handles.push(std::thread::spawn(move || {
-            let store = WorkspaceStore::open(&data, &ws).unwrap();
             let files = vec![ws.join("a.txt")];
             gate.wait();
             store.checkpoint("s1", &format!("turn-{i}"), files)
@@ -81,8 +87,9 @@ fn different_sessions_do_not_wait_on_each_other() {
     let mut handles = Vec::new();
     for i in 0..SESSIONS {
         let (data, ws, gate) = (data.clone(), ws.clone(), Arc::clone(&gate));
+        // See above: nothing fallible inside the closure before the barrier.
+        let store = WorkspaceStore::open(&data, &ws).unwrap();
         handles.push(std::thread::spawn(move || {
-            let store = WorkspaceStore::open(&data, &ws).unwrap();
             let files = vec![ws.join("a.txt")];
             gate.wait();
             store.checkpoint(&format!("s{i}"), "turn-1", files)
@@ -148,8 +155,10 @@ fn deleting_refuses_a_session_another_invocation_is_using() {
 
     let holder = {
         let (data, ws, gate, release) = (data, ws, Arc::clone(&gate), Arc::clone(&release));
+        // Worse here than above: the test's *own* main thread waits on this
+        // barrier, so a panic in the child would hang the test itself.
+        let store = WorkspaceStore::open(&data, &ws).unwrap();
         std::thread::spawn(move || {
-            let store = WorkspaceStore::open(&data, &ws).unwrap();
             // A long capture stands in for any operation holding the lock.
             let files = vec![ws.join("a.txt")];
             let _ = store.checkpoint("held", "turn-long", files);

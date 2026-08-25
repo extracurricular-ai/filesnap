@@ -86,6 +86,7 @@ pub use scope::Recent;
 pub use scope::SNAPSHOT_IGNORE_FILENAME;
 pub use scope::Scan;
 pub use scope::ScanLimits;
+pub use scope::canonical_key;
 pub use scope::find_workspace_root;
 pub use scope::git_tracked_files;
 pub use scope::is_ignored;

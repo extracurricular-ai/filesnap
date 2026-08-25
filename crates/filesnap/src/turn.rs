@@ -26,6 +26,7 @@ use crate::checkpoint::Checkpoint;
 use crate::error::Result;
 use crate::scope::HiddenFiles;
 use crate::scope::ScanLimits;
+use crate::scope::canonical_key;
 use crate::scope::is_ignored;
 use crate::scope::load_ignore;
 use crate::scope::tracked_files;
@@ -78,11 +79,14 @@ impl TurnScope {
             .filter(|root| self.cwd.starts_with(root) || root.starts_with(&self.cwd))
             .cloned()
             .collect();
-        if related.is_empty() {
+        let roots = if related.is_empty() {
             vec![self.cwd.clone()]
         } else {
             related
-        }
+        };
+        // Canonical, so the keys a walk produces do not depend on how the
+        // caller spelled the root — see [`crate::scope::canonical_key`].
+        roots.iter().map(|r| canonical_key(r)).collect()
     }
 
     /// The directory whose ignore rules govern this turn.
@@ -213,6 +217,9 @@ pub fn declare_edits(
     let mut outcome = DeclareOutcome::default();
 
     for (path, image) in pre_images {
+        // Same spelling rule as the scan partitions produce, so an edit and a
+        // scan of one file agree on its key.
+        let path = canonical_key(&path);
         if is_ignored(&rules, &path) {
             outcome.ignored.push(path);
             continue;

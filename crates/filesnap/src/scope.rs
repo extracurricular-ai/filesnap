@@ -78,6 +78,34 @@ pub fn load_ignore(root: &Path) -> Gitignore {
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
+/// One spelling of a path, so a manifest key does not depend on how the
+/// caller happened to write it.
+///
+/// The partition key is already `canonicalize`d — deliberately, so that two
+/// spellings of one directory are one partition, with `/var` → `/private/var`
+/// on macOS named as the ordinary case. The *contents* were not, so the
+/// partition was spelling-independent while its keys were not: the same file
+/// reached through a symlinked root got two manifest keys, the stat cache
+/// never hit across a change of spelling, and `plan_restore` saw a file whose
+/// content already matched as one it had to write.
+///
+/// A path that does not exist cannot be canonicalized, and those matter here —
+/// a tombstone records a path precisely because it is *not* there. So the
+/// parent is canonicalized and the final component kept, which is the most
+/// that can be resolved without inventing the file.
+pub fn canonical_key(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(real) => real.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Symmetric protection check: is `path` invisible to snapshot operations?
 ///
 /// **A path the rules cannot address is not ignored.** `matched_path_or_any_parents`
