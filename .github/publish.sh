@@ -8,11 +8,19 @@
 # nobody can execute outside CI.
 #
 #   .github/publish.sh filesnap            # publishes
-#   DRY_RUN=true .github/publish.sh filesnap   # rehearses
+#
+# Rehearsal is deliberately *not* here, and is not per-crate:
+#
+#   cargo publish --workspace --dry-run
+#
+# `cargo publish -p filesnap-cli --dry-run` resolves `filesnap` from the
+# registry, and in a rehearsal the engine's new version exists only locally —
+# so the CLI's rehearsal fails on the very version the real run publishes one
+# step earlier. The real run works crate by crate precisely because that step
+# really happened.
 set -euo pipefail
 
 crate="${1:?usage: publish.sh <crate>}"
-dry_run="${DRY_RUN:-false}"
 
 version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 echo "==> $crate $version"
@@ -30,12 +38,6 @@ existing=$(curl -sS --max-time 30 \
 
 if printf '%s' "$existing" | grep -q "\"num\":\"${version}\""; then
   echo "    already on crates.io — nothing to do"
-  exit 0
-fi
-
-if [ "$dry_run" = "true" ]; then
-  echo "    rehearsal: packaging and verifying, not uploading"
-  cargo publish -p "$crate" --dry-run
   exit 0
 fi
 

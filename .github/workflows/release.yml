@@ -78,6 +78,15 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
+      # A rehearsal cannot go crate by crate, which is why it is one step
+      # rather than a flag threaded through the two below. `cargo publish -p
+      # filesnap-cli --dry-run` resolves `filesnap` from the registry, and in
+      # a rehearsal the engine's new version exists only locally — so the CLI
+      # would fail on the version the real run publishes one step earlier.
+      - name: Rehearse
+        if: inputs.dry_run
+        run: cargo publish --workspace --dry-run
+
       # Published in dependency order: `filesnap-cli` depends on `filesnap`,
       # and cargo resolves that from the registry, so the engine has to be
       # there first. `cargo publish` waits for the index to catch up before
@@ -89,13 +98,13 @@ jobs:
       # that already succeeded — and with no rollback, being unable to
       # re-run is how a release ends up finished by hand.
       - name: Publish filesnap
+        if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          DRY_RUN: ${{ inputs.dry_run }}
         run: .github/publish.sh filesnap
 
       - name: Publish filesnap-cli
+        if: ${{ !inputs.dry_run }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          DRY_RUN: ${{ inputs.dry_run }}
         run: .github/publish.sh filesnap-cli
