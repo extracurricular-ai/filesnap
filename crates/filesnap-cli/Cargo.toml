@@ -16,7 +16,7 @@ workspace = true
 [dependencies]
 # The engine. A path *and* a version, so the workspace builds against the
 # local copy while a published `filesnap-cli` resolves the crates.io one.
-filesnap = { path = "../filesnap", version = "0.1.0" }
+filesnap = { path = "../filesnap", version = "0.2.0" }
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 # A version as well as a path: `filesnap` is published *before* this crate, so
 # by the time this manifest reaches the registry the dependency resolves — and
 # the tests therefore ship and run, unlike the engine's own (see its manifest).
-filesnap = { path = "../filesnap", version = "0.1.0", features = ["test-support"] }
+filesnap = { path = "../filesnap", version = "0.2.0", features = ["test-support"] }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 
