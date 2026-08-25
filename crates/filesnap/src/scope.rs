@@ -174,7 +174,7 @@ impl Default for ScanLimits {
 /// default, which is why this list stays short. What is left is the
 /// ecosystems that, like node, vendor their dependencies into the project in
 /// plain sight.
-const RECENT_SKIP_DIRS: &[&str] = &[
+pub(crate) const RECENT_SKIP_DIRS: &[&str] = &[
     // Dependencies installed in-tree.
     "node_modules",     // npm / yarn / pnpm
     "bower_components", // bower

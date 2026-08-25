@@ -242,10 +242,21 @@ fn main() -> std::process::ExitCode {
                 exit::USAGE
             }
         },
-        _ => {
-            eprintln!("filesnap: not implemented yet");
-            exit::FAILED
-        }
+        Command::Delete { sessions, cwd } => match here(cwd) {
+            Ok(cwd) => commands::delete::run(&mut out, &data_dir, &cwd, &sessions),
+            Err(err) => {
+                eprintln!("filesnap: cannot resolve the working directory: {err}");
+                exit::USAGE
+            }
+        },
+        Command::Gc => commands::gc::run(&mut out, &data_dir),
+        Command::Doctor { workdir } => match here(workdir) {
+            Ok(workdir) => commands::doctor::run(&mut out, &workdir),
+            Err(err) => {
+                eprintln!("filesnap: cannot resolve the working directory: {err}");
+                exit::USAGE
+            }
+        },
     };
     std::process::ExitCode::from(code)
 }

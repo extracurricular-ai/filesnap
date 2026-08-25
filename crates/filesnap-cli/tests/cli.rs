@@ -729,3 +729,161 @@ fn a_restore_that_cannot_write_everything_reports_per_file_and_exits_nonzero() {
         "the point it can be reversed to is reported even on a partial restore"
     );
 }
+
+// --- delete, gc, doctor ---
+
+/// Delete's promise is unreachability, and it keeps it immediately. Reclaiming
+/// the bytes is the separate half, and belongs to `gc` (D19, VIII.3).
+#[test]
+fn delete_makes_a_session_unreachable_without_freeing_content() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s2", "--turn", "t2", "--cwd", &cwd],
+    );
+
+    let run = filesnap(data.path(), &["delete", "--session", "s1", "--cwd", &cwd]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.find("delete.done")["deleted"], 1);
+
+    // Gone.
+    let gone = filesnap(data.path(), &["log", "--session", "s1", "--cwd", &cwd]);
+    assert_eq!(gone.find("log.done")["turns"], 0);
+    // And the neighbour is untouched.
+    let neighbour = filesnap(data.path(), &["log", "--session", "s2", "--cwd", &cwd]);
+    assert_eq!(neighbour.find("log.done")["turns"], 1);
+}
+
+/// Deleting what was never tracked is not an error — delete is idempotent and
+/// has no preconditions (D9) — but it is reported as absent rather than
+/// deleted, because a caller counting removals should not be told a lie.
+#[test]
+fn deleting_a_session_that_never_existed_is_reported_as_absent() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+
+    let run = filesnap(
+        data.path(),
+        &[
+            "delete",
+            "--session",
+            "s1",
+            "--session",
+            "never-existed",
+            "--cwd",
+            &cwd,
+        ],
+    );
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.find("delete.done")["deleted"], 1);
+    assert_eq!(run.find("delete.done")["absent"], 1);
+    assert_eq!(run.find("delete.absent")["session"], "never-existed");
+
+    // And it is idempotent: doing it again says the same thing.
+    let again = filesnap(data.path(), &["delete", "--session", "s1", "--cwd", &cwd]);
+    assert_eq!(again.code, 0);
+    assert_eq!(again.find("delete.done")["absent"], 1);
+}
+
+/// **Collecting changes nothing anyone can observe.** Every turn still
+/// resolves and every session still rewinds exactly as far; only unreachable
+/// bytes go.
+#[test]
+fn gc_leaves_every_session_able_to_rewind() {
+    let (data, ws) = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    filesnap(
+        data.path(),
+        &["capture", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+    std::fs::write(ws.path().join("a.txt"), "changed").unwrap();
+
+    let run = filesnap(data.path(), &["gc"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(run.find("gc.done")["blobsKept"].as_u64().unwrap() > 0);
+
+    // The proof: the rewind still works after collecting.
+    let restored = filesnap(
+        data.path(),
+        &["restore", "--session", "s1", "--turn", "t1", "--cwd", &cwd],
+    );
+    assert_eq!(restored.code, 0, "{}", restored.stderr);
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("a.txt")).unwrap(),
+        "one"
+    );
+}
+
+/// `gc` spans the whole store, so it takes no workspace at all.
+#[test]
+fn gc_takes_no_workspace() {
+    let (data, _ws) = workspace();
+    let run = filesnap(data.path(), &["gc"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+}
+
+/// `doctor` clears what an interrupted restore left in the user's own
+/// project — the corner the self-healing path never reaches, because it only
+/// cleans directories a later restore writes into (D21).
+#[test]
+fn doctor_clears_settled_restore_residue() {
+    let (_data, ws) = workspace();
+    let stray = ws.path().join("a.txt.filesnap-restore-tmp");
+    std::fs::write(&stray, "half a restore").unwrap();
+    let fresh = ws.path().join("nested/b.txt.filesnap-restore-tmp");
+    std::fs::create_dir_all(ws.path().join("nested")).unwrap();
+    std::fs::write(&fresh, "still being written").unwrap();
+
+    // Age only the first: the second may be a restore that is running now.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stray)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    let run = Run::of(
+        std::process::Command::new(env!("CARGO_BIN_EXE_filesnap"))
+            .args(["doctor", "--workdir", &ws.path().to_string_lossy()])
+            .output()
+            .unwrap(),
+    );
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.find("doctor.done")["removed"], 1);
+    assert!(!stray.exists());
+    assert!(
+        fresh.exists(),
+        "fresh residue may belong to a running restore"
+    );
+    assert!(
+        ws.path().join("a.txt").exists(),
+        "doctor touched a real file"
+    );
+}
+
+/// Nothing to clear is a clean, quiet success.
+#[test]
+fn doctor_on_a_tidy_workspace_reports_nothing() {
+    let (_data, ws) = workspace();
+    let run = Run::of(
+        std::process::Command::new(env!("CARGO_BIN_EXE_filesnap"))
+            .args(["doctor", "--workdir", &ws.path().to_string_lossy()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(run.find("doctor.done")["removed"], 0);
+    assert_eq!(run.kinds(), vec!["doctor.done"]);
+}

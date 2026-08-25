@@ -213,22 +213,13 @@ fn sweep_residue(plan: &RestorePlan) {
 /// The inspectable half of D21: a caller walks a workspace with this and
 /// reports, or removes, what it finds.
 pub fn residue_in(dir: &Path) -> Vec<PathBuf> {
-    let cutoff = SystemTime::now()
-        .checked_sub(RESIDUE_GRACE)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(RESTORE_TMP_SUFFIX))
-                && fs::metadata(path)
-                    .and_then(|meta| meta.modified())
-                    .is_ok_and(|written| written <= cutoff)
-        })
+        .filter(|path| is_settled_residue(path))
         .collect()
 }
 
@@ -255,6 +246,57 @@ fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
         let _ = (path, mode);
     }
     Ok(())
+}
+
+/// Every stray restore temporary under `root`, wherever a restore reached.
+///
+/// The half of D21 that self-healing cannot cover. A restore clears the
+/// directories it is about to write; a workspace nothing restores into again
+/// keeps its stray forever, and the person who finds a
+/// `.filesnap-restore-tmp` in their project is more likely to delete it or
+/// file a bug than to know what it is.
+///
+/// Skips the same directories a scan does, and `.git`. Residue only appears
+/// where a restore wrote, and a restore only writes what a capture recorded,
+/// so a build directory cannot hold any — walking it would be cost for
+/// nothing.
+pub fn residue_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .standard_filters(false)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name();
+            name != ".git"
+                && !crate::scope::RECENT_SKIP_DIRS
+                    .iter()
+                    .any(|skip| name == *skip)
+        })
+        .build();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        if is_settled_residue(&path) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether one path is a stray restore temporary old enough to be nobody's.
+fn is_settled_residue(path: &Path) -> bool {
+    let cutoff = SystemTime::now()
+        .checked_sub(RESIDUE_GRACE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with(RESTORE_TMP_SUFFIX))
+        && fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|written| written <= cutoff)
 }
 
 #[cfg(test)]

@@ -78,6 +78,7 @@ pub use restore::WriteAction;
 pub use restore::apply_plan;
 pub use restore::plan_restore;
 pub use restore::residue_in;
+pub use restore::residue_under;
 pub use scope::Drop;
 pub use scope::DropReason;
 pub use scope::HiddenFiles;

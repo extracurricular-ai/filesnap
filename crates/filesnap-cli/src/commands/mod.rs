@@ -4,6 +4,9 @@
 
 pub mod capture;
 pub mod declare;
+pub mod delete;
+pub mod doctor;
+pub mod gc;
 pub mod log;
 pub mod restore;
 pub mod status;
