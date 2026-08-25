@@ -1,6 +1,13 @@
 [workspace]
 members = ["crates/*"]
-resolver = "2"
+# Edition 2024's own default, stated because the difference matters: resolver
+# 3 is resolver 2 plus **MSRV-aware version selection**, so cargo will not pick
+# a dependency release that requires a newer rustc than `rust-version` allows.
+# Written as "2" this opted back out, and the lockfile shows what that costs —
+# it pinned `kstring 2.0.4`, which declares rust-version 1.96, above both our
+# floor and the toolchain pin. It builds today only because nothing activates
+# the gix feature that pulls it.
+resolver = "3"
 
 [workspace.package]
 version = "0.1.0"

@@ -30,9 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain action: `rust-toolchain.toml` pins the version and lists
+      # the components, and a rustup *file override* beats `rustup default`
+      # anyway — so installing one here would say "stable" and run 1.95.
+      # The pin is the single source, which is what a pin is for.
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       # `--all-targets` so tests and examples are linted too. The workspace
@@ -50,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # See the lint job: `rust-toolchain.toml` governs.
       - uses: Swatinem/rust-cache@v2
       # `git` is read for the tracked-file partition, and a test fixture
       # shells out to it. Present on every runner image, asserted so a
@@ -79,7 +80,20 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+      # `RUSTUP_TOOLCHAIN`, not the installed default. `rust-toolchain.toml`
+      # is a rustup *file override*, and a file override beats
+      # `rustup default` — which is all the action above sets. Without this
+      # the job installed the MSRV toolchain, then silently downloaded the
+      # pinned one and compiled with that instead: a job that could not fail,
+      # holding up nothing, which is the exact shape of defect this whole
+      # audit kept finding.
+      #
+      # Verified locally: `1.89.0` builds the workspace, and with the declared
+      # version lowered to 1.88 the build fails on `std::fs::TryLockError`
+      # being unstable — so 1.89 is the measured floor, not a derived one.
       - run: cargo check --workspace --all-features
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
 
   # What a consumer actually receives. `cargo test` in the workspace says
   # nothing about whether the *packaged* crate is coherent — the engine's
@@ -89,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # See the lint job: `rust-toolchain.toml` governs.
       - uses: Swatinem/rust-cache@v2
       - run: cargo package -p filesnap
       - run: cargo package -p filesnap-cli

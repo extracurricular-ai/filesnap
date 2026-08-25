@@ -79,7 +79,26 @@ pub fn load_ignore(root: &Path) -> Gitignore {
 }
 
 /// Symmetric protection check: is `path` invisible to snapshot operations?
+///
+/// **A path the rules cannot address is not ignored.** `matched_path_or_any_parents`
+/// asserts its argument is under the matcher's root and panics otherwise, and
+/// both callers routinely hand it paths that are not: the edit API carries
+/// paths from anywhere on disk — that is the whole point of the edit-touched
+/// partition — and a restore tests every manifest key, which includes those
+/// same outside-workspace paths.
+///
+/// Answering `false` is not merely the safe response, it is the correct one.
+/// An ignore file scopes a directory; a file somewhere else is not something
+/// it declined to track, it is something it never had an opinion about. The
+/// symmetric rule then leaves such a path alone in both directions, which is
+/// what it would have done anyway.
+///
+/// Without the guard this panicked, and did so on every platform — masked only
+/// because no test combined an ignore file with an out-of-root path.
 pub fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
+    if path.strip_prefix(ignore.path()).is_err() {
+        return false;
+    }
     ignore.matched_path_or_any_parents(path, false).is_ignore()
 }
 
@@ -301,10 +320,23 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
         return Vec::new();
     };
 
+    // **Git index paths always use `/`, on every platform**, so the prefix is
+    // assembled from components rather than from the OS string. On Windows
+    // `to_string_lossy` gives `app\deep`, and `app\deep/` matches no index
+    // entry at all — the git partition would come back silently empty for any
+    // workspace more than one level below the repository root, leaving a whole
+    // repository to the recency budget. A one-level root has no separator in
+    // it, which is why that spelling worked and why the test that covered it
+    // stayed green.
+    //
     // The trailing separator is what stops `app` from also matching
     // `app-extra/…`. An empty prefix means `root` *is* the repository root.
-    let mut prefix = relative.to_string_lossy().into_owned();
-    if !prefix.is_empty() && !prefix.ends_with('/') {
+    let mut prefix = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if !prefix.is_empty() {
         prefix.push('/');
     }
 
@@ -328,7 +360,18 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
                 return None;
             }
             let rel = std::str::from_utf8(entry.path(&index)).ok()?;
-            let path = root.join(rel.strip_prefix(prefix.as_str())?);
+            // Rebuilt component by component, for the same reason. `join` on a
+            // `/`-separated fragment appends it verbatim, so Windows would get
+            // `C:\repo\src/main.rs` — and since manifest keys are compared as
+            // strings, that one file would then have two keys: this spelling
+            // and the pure-backslash one every other producer emits. The stat
+            // cache would never hit for a tracked file, a restore would rewrite
+            // files whose content already matched, and `undo_conflicts` would
+            // fail to warn about a file it was about to overwrite.
+            let path = rel
+                .strip_prefix(prefix.as_str())?
+                .split('/')
+                .fold(root.to_path_buf(), |acc, part| acc.join(part));
             (!is_ignored(ignore, &path)).then_some(path)
         })
         .collect()
@@ -807,6 +850,80 @@ mod tests {
         // From the repository root the same call sees the whole index.
         let ignore = load_ignore(&repo);
         assert_eq!(git_tracked_files(&repo, &ignore).len(), 4);
+    }
+
+    /// A session root **two or more levels** below the repository root.
+    ///
+    /// The prefix handed to the index is built from the relative path, and git
+    /// index paths always use `/` whatever the platform. Built from the OS
+    /// string, a nested root gives `app\deep/` on Windows, which matches no
+    /// entry — so the git partition comes back silently empty and a whole
+    /// repository is left to the recency budget. One level has no separator in
+    /// it, which is why the case above passes on every platform and this one
+    /// is the test that had to exist.
+    #[test]
+    fn the_git_partition_works_from_a_nested_subdirectory() {
+        let Some((repo, _guard)) = git_fixture(&[
+            "app/main.rs",
+            "app/deep/util.rs",
+            "app/deep/deeper/inner.rs",
+            "top.rs",
+        ]) else {
+            return;
+        };
+        let nested = repo.join("app").join("deep");
+        let ignore = load_ignore(&nested);
+        let mut found = git_tracked_files(&nested, &ignore);
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                repo.join("app")
+                    .join("deep")
+                    .join("deeper")
+                    .join("inner.rs"),
+                repo.join("app").join("deep").join("util.rs"),
+            ],
+            "a nested session root sees its own subtree, not nothing"
+        );
+    }
+
+    /// A path outside the matcher's root is not ignored — and asking must not
+    /// panic.
+    ///
+    /// `matched_path_or_any_parents` asserts its argument is under the root.
+    /// Both callers routinely break that: the edit API carries paths from
+    /// anywhere on disk, which is the whole point of the edit-touched
+    /// partition, and a restore tests every manifest key. It panicked on every
+    /// platform, masked only because no test combined an ignore file with an
+    /// out-of-root path.
+    #[test]
+    fn a_path_outside_the_rules_root_is_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        touch(&root.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n");
+        let ignore = load_ignore(&root);
+
+        assert!(
+            is_ignored(&ignore, &root.join("build.log")),
+            "inside, matched"
+        );
+        for outside in [
+            dir.path().join("elsewhere").join("build.log"),
+            // A sibling sharing a textual prefix: on unix `ignore` strips raw
+            // bytes, so this used to strip to `-backup/build.log` and be
+            // reported as ignored.
+            dir.path().join("ws-backup").join("build.log"),
+            PathBuf::from("/tmp").join("build.log"),
+        ] {
+            assert!(
+                !is_ignored(&ignore, &outside),
+                "{} is not something these rules declined to track",
+                outside.display()
+            );
+        }
     }
 
     #[test]
