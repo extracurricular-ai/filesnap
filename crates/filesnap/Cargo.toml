@@ -2,12 +2,24 @@
 name = "filesnap"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 readme = "README.md"
 description = "Git-free file snapshots and rewind: a content-addressed store that puts a directory back the way it was, without a repository and without touching the user's version control."
 repository = "https://github.com/extracurricular-ai/filesnap"
 keywords = ["snapshot", "rewind", "undo", "checkpoint", "restore"]
 categories = ["filesystem", "development-tools"]
+# The integration tests are not shipped, because they cannot run from the
+# published crate. They need this crate's own `test-support` feature, which
+# means a dev-dependency on `filesnap` itself — and that cannot carry a
+# version, since at publish time the version being published does not exist on
+# the registry yet. Cargo therefore strips it, and the tests stop compiling.
+#
+# The *unit* tests do ship and do pass (`cargo test --lib` on the extracted
+# crate: 126 of them), because they reach the fixtures through `cfg(test)`
+# rather than through the feature. Shipping a `tests/` directory nobody can
+# build would only imply a check that is not there.
+exclude = ["tests/"]
 
 [features]
 # Test fixtures, shared between this crate's own tests and its integration

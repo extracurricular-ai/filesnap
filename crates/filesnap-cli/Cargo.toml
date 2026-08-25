@@ -2,7 +2,9 @@
 name = "filesnap-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+readme = "README.md"
 description = "Command-line interface to filesnap: git-free file snapshots and rewind."
 repository = "https://github.com/extracurricular-ai/filesnap"
 keywords = ["snapshot", "rewind", "undo", "checkpoint", "cli"]
@@ -20,7 +22,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-filesnap = { path = "../filesnap", features = ["test-support"] }
+# A version as well as a path: `filesnap` is published *before* this crate, so
+# by the time this manifest reaches the registry the dependency resolves — and
+# the tests therefore ship and run, unlike the engine's own (see its manifest).
+filesnap = { path = "../filesnap", version = "0.1.0", features = ["test-support"] }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 

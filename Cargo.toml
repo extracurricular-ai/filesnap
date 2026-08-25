@@ -6,6 +6,14 @@ resolver = "2"
 version = "0.1.0"
 # Track the edition for all workspace crates in one place.
 edition = "2024"
+# The oldest toolchain that builds this. Set by `std::fs::TryLockError`, which
+# the session lock uses and which stabilized in 1.89 — everything else the
+# crates reach for is older (`StaleNetworkFileHandle` 1.83, edition 2024 1.85,
+# if-let chains 1.88).
+#
+# Declared rather than left implicit so a user on an older toolchain is told
+# which version they need, instead of a compile error inside a private module.
+rust-version = "1.89"
 license = "Apache-2.0"
 
 [workspace.dependencies]
