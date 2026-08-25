@@ -314,6 +314,9 @@ fn thread_marker_and_pre_edit_attach() {
         )
         .unwrap()
         .expect("a created path is recorded as absent");
+    // The literal separator is fine here, unlike in an assertion about a path
+    // the filesystem produced: this key is the string the caller passed and is
+    // stored verbatim, never resolved, so it reads the same on every platform.
     assert!(
         store
             .manifest(&tombstoned)

@@ -537,8 +537,15 @@ mod tests {
         touch(&root.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n");
 
         let ignore = load_ignore(root);
-        let names = |hidden: HiddenFiles| -> Vec<String> {
-            let mut out: Vec<String> = recent_files(
+        // Relative `PathBuf`s rather than strings. A string comparison bakes
+        // in a separator: `sub/keep2.txt` is what unix produces and
+        // `sub\keep2.txt` is what Windows does, so the equality below would
+        // fail there — and, worse, the `.git` check further down would
+        // *pass* on Windows for the wrong reason, never able to fail,
+        // leaving "repository internals are never scanned" unverified on the
+        // one platform nobody runs locally.
+        let relative = |hidden: HiddenFiles| -> Vec<PathBuf> {
+            let mut out: Vec<PathBuf> = recent_files(
                 root,
                 &ignore,
                 hidden,
@@ -547,25 +554,28 @@ mod tests {
             )
             .files
             .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
             .collect();
             out.sort();
             out
         };
 
         assert_eq!(
-            names(HiddenFiles::Skip),
-            vec!["keep.txt".to_string(), "sub/keep2.txt".to_string()],
+            relative(HiddenFiles::Skip),
+            vec![
+                PathBuf::from("keep.txt"),
+                PathBuf::from("sub").join("keep2.txt")
+            ],
             "logs ignored; .git and other dot-entries skipped — including the \
              ignore file itself, which follows the same rule as any other \
              hidden file and is tracked only if the agent edits it"
         );
 
         // Opting in reaches hidden entries, but never `.git`.
-        let with_hidden = names(HiddenFiles::Track);
-        assert!(with_hidden.contains(&SNAPSHOT_IGNORE_FILENAME.to_string()));
+        let with_hidden = relative(HiddenFiles::Track);
+        assert!(with_hidden.contains(&PathBuf::from(SNAPSHOT_IGNORE_FILENAME)));
         assert!(
-            with_hidden.iter().all(|name| !name.starts_with(".git/")),
+            with_hidden.iter().all(|path| !path.starts_with(".git")),
             "repository internals are never scanned: {with_hidden:?}"
         );
     }

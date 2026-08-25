@@ -294,12 +294,26 @@ mod tests {
 
         ctl.checkpoint_turn_start("turn-1", ws.path(), &[]);
         let scanned = ctl.store.tracked_paths("t1").unwrap();
+        // By file name, not by a substring containing a separator. `"/.env"`
+        // can never match on Windows, so the assertion would pass there
+        // without checking anything — and this is the one asserting that a
+        // credentials file stays out of the store.
+        let named = |want: &str| {
+            scanned
+                .iter()
+                .any(|p| Path::new(p).file_name().is_some_and(|n| n == want))
+        };
+        let under = |dir: &str| {
+            scanned
+                .iter()
+                .any(|p| Path::new(p).components().any(|c| c.as_os_str() == dir))
+        };
         assert!(
-            scanned.iter().all(|p| !p.contains("/.env")),
+            !named(".env"),
             "tool state and credentials stay out of snapshots: {scanned:?}"
         );
-        assert!(scanned.iter().all(|p| !p.contains("/.git")));
-        assert!(scanned.iter().any(|p| p.ends_with("src.rs")));
+        assert!(!under(".git"), "{scanned:?}");
+        assert!(named("src.rs"));
 
         // An edited hidden file is a different matter: it is work product,
         // so the edit hook tracks it and a rewind can restore it.

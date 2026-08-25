@@ -1,0 +1,99 @@
+name: release
+
+# Tag-driven, so what gets published is a commit that exists and is named.
+# `workflow_dispatch` is the rehearsal: with `dry_run` left on it does
+# everything except the upload, which is one of only two safety nets there
+# are — **a published version can never be replaced or reused**, and `yank`
+# hides rather than deletes.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Rehearse without uploading"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Nothing is published until the same suite CI runs has passed on the exact
+  # commit being released. CI runs on `main`, and a tag can point anywhere.
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --features filesnap/test-support
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Must match the "Environment name" configured on crates.io for both
+    # crates. Its value here is that a protection rule on the environment —
+    # a required reviewer — stops a publish even if something unwanted has
+    # reached the tag.
+    environment: crates-io
+    permissions:
+      # **A job-level `permissions:` block replaces the workflow-level one
+      # rather than merging with it**, so `contents: read` has to be restated
+      # here. Without it `actions/checkout` fails.
+      contents: read
+      # What the OIDC exchange needs. This is the whole reason there is no
+      # long-lived registry token in this repository.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag that does not name the version in the manifest would publish
+      # something nobody asked for, and there is no taking it back. Checked
+      # before anything is uploaded rather than discovered afterwards.
+      - name: The tag and the manifest agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          echo "manifest=$manifest tag=$tag"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not name version $manifest"
+            exit 1
+          fi
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Published in dependency order: `filesnap-cli` depends on `filesnap`,
+      # and cargo resolves that from the registry, so the engine has to be
+      # there first. `cargo publish` waits for the index to catch up before
+      # it returns, so no sleep is needed between the two.
+      #
+      # Each step skips a version that is already on the registry rather than
+      # failing on it. That is what makes this **resumable**: if the engine
+      # lands and the CLI fails, re-running must not be blocked by the half
+      # that already succeeded — and with no rollback, being unable to
+      # re-run is how a release ends up finished by hand.
+      - name: Publish filesnap
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: .github/publish.sh filesnap
+
+      - name: Publish filesnap-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: .github/publish.sh filesnap-cli

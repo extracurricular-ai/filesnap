@@ -97,6 +97,8 @@ jobs:
         run: |
           set -euo pipefail
           dir=$(mktemp -d)
-          tar xzf target/package/filesnap-*.crate -C "$dir"
-          cd "$dir"/filesnap-*
+          # `filesnap-*` also matches `filesnap-cli-*`, which made tar fail
+          # on the second archive. The digit anchors it to the engine.
+          tar xzf target/package/filesnap-[0-9]*.crate -C "$dir"
+          cd "$dir"/filesnap-[0-9]*
           cargo test
