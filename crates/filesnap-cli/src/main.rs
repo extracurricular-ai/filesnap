@@ -251,7 +251,7 @@ fn main() -> std::process::ExitCode {
         },
         Command::Gc => commands::gc::run(&mut out, &data_dir),
         Command::Doctor { workdir } => match here(workdir) {
-            Ok(workdir) => commands::doctor::run(&mut out, &workdir),
+            Ok(workdir) => commands::doctor::run(&mut out, &data_dir, &workdir),
             Err(err) => {
                 eprintln!("filesnap: cannot resolve the working directory: {err}");
                 exit::USAGE

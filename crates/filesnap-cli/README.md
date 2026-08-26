@@ -37,7 +37,7 @@ $ filesnap restore --session s1 --turn turn-1 --undo-for s1
 | `delete` | end a session's data |
 | `gc` | reclaim what nothing references, across every workspace |
 | `status` | what the state of this workspace is — read-only |
-| `doctor` | clear what an interrupted operation left behind |
+| `doctor` | report whether locking works, and clear what an interrupted operation left behind |
 
 ## Output
 
@@ -81,6 +81,27 @@ it, or an edit declares it. So a file created by a shell command inside a
 build directory, over the size limit, or beyond the recency budget is covered
 only if it also went through the edit API. `filesnap status` tells you which
 files in your project are not protected, and why.
+
+## Locking
+
+Two invocations of one session are held apart by an OS file lock. Some
+filesystems have none — and rather than refuse to work there, filesnap
+proceeds unlocked, which is cargo's precedent and the right call: a race that
+needs two concurrent invocations of one session is not worth breaking a user
+who has no other machine.
+
+But it is a fact about your setup, and the only other way to learn it is a
+race nobody can reproduce on demand. So `doctor` says:
+
+```console
+$ filesnap doctor
+{"v":1,"type":"doctor.locking","enforced":true}
+{"v":1,"type":"doctor.done","removed":0,"failed":0}
+```
+
+The event is **absent**, not `false`, when the store could not be opened at
+all — "we could not ask" and "we asked and the answer is no" are different
+answers.
 
 The engine is [`filesnap`](https://crates.io/crates/filesnap); this crate is
 the command around it.

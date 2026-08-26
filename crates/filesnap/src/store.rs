@@ -178,6 +178,27 @@ impl WorkspaceStore {
         )
     }
 
+    /// Whether this store's filesystem actually enforces the session lock.
+    ///
+    /// A store on a filesystem without locking still works — D18 takes cargo's
+    /// line and proceeds unlocked rather than refusing a user who has no other
+    /// machine. But that is a fact about their setup, and the only way to
+    /// learn it otherwise is a race they cannot reproduce on demand, so
+    /// `doctor` reports it.
+    ///
+    /// Probed under a fixed internal id: one lock file per partition rather
+    /// than one per call, and it cannot collide with a session, because an
+    /// external id may not begin with `_`.
+    pub fn locking_is_enforced(&self) -> Result<bool> {
+        const PROBE: &str = "_lock-probe";
+        match crate::lock::acquire(&self.partition, PROBE, crate::lock::LOCK_BUDGET)? {
+            Some(guard) => Ok(guard.is_enforced()),
+            // Contended: another invocation is holding it, and holding it is
+            // the one thing a filesystem without locks cannot do.
+            None => Ok(true),
+        }
+    }
+
     /// Which workspace's records this reaches.
     pub fn key(&self) -> &WorkspaceKey {
         &self.key

@@ -73,9 +73,14 @@ pub(crate) fn dir_in(partition: &Path) -> PathBuf {
 /// The lock file is **never unlinked.** Unlinking is what reintroduces every
 /// problem the kernel lock avoids: on unix a second process can be holding a
 /// descriptor to a file whose name is gone and think it holds the lock, and on
-/// Windows the unlink can fail outright while another handle is open. An empty
-/// file per session is a rounding error against the manifests beside it, and
-/// collection reclaims one whose session is gone.
+/// Windows the unlink can fail outright while another handle is open.
+///
+/// Nothing reclaims them, and that is deliberate rather than an oversight —
+/// but it does mean the directory grows by one empty file per session id ever
+/// used, and `delete` leaves one behind for a session it has otherwise ended.
+/// The files are empty, so the cost is an inode apiece; the alternative is an
+/// unlink with the race above, on the one path whose whole purpose is to
+/// prevent races.
 #[derive(Debug)]
 pub(crate) struct SessionGuard {
     /// `None` when the filesystem has no locks and we proceeded without one.
@@ -89,11 +94,9 @@ impl SessionGuard {
     /// with no locking, where the operation went ahead unprotected.
     ///
     /// A store on a filesystem that cannot lock is a fact about the user's
-    /// setup, and one they should be able to see rather than infer — so this
-    /// is what `doctor` would report. It does not yet, which is why the
-    /// allow is still here; the only caller is the test that would otherwise
-    /// assert a refusal on a filesystem incapable of producing one.
-    #[allow(dead_code)]
+    /// setup, and one they should be able to see rather than infer — so
+    /// `doctor` reports it, through
+    /// [`WorkspaceStore::locking_is_enforced`](crate::WorkspaceStore::locking_is_enforced).
     pub(crate) fn is_enforced(&self) -> bool {
         self._file.is_some()
     }

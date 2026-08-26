@@ -835,7 +835,7 @@ fn gc_takes_no_workspace() {
 /// cleans directories a later restore writes into (D21).
 #[test]
 fn doctor_clears_settled_restore_residue() {
-    let (_data, ws) = workspace();
+    let (data, ws) = workspace();
     let stray = ws.path().join("a.txt.filesnap-restore-tmp");
     std::fs::write(&stray, "half a restore").unwrap();
     let fresh = ws.path().join("nested/b.txt.filesnap-restore-tmp");
@@ -851,11 +851,12 @@ fn doctor_clears_settled_restore_residue() {
         .set_times(std::fs::FileTimes::new().set_modified(old))
         .unwrap();
 
-    let run = Run::of(
-        std::process::Command::new(env!("CARGO_BIN_EXE_filesnap"))
-            .args(["doctor", "--workdir", &ws.path().to_string_lossy()])
-            .output()
-            .unwrap(),
+    // Through the helper, so `--data-dir` is passed. `doctor` reads the store
+    // now, and a test that let it fall back to the platform default would
+    // reach into whatever the developer running it actually uses.
+    let run = filesnap(
+        data.path(),
+        &["doctor", "--workdir", &ws.path().to_string_lossy()],
     );
 
     assert_eq!(run.code, 0, "{}", run.stderr);
@@ -871,17 +872,28 @@ fn doctor_clears_settled_restore_residue() {
     );
 }
 
-/// Nothing to clear is a clean, quiet success.
+/// Nothing to clear is a clean, quiet success — but never silent about
+/// whether locking works.
+///
+/// That is a property of the user's filesystem rather than a result of this
+/// run, so it is reported even when there was nothing to do. A store on a
+/// filesystem without locks still works (D18 takes cargo's line and proceeds
+/// unlocked); the only other way to find out is a race nobody can reproduce
+/// on demand.
 #[test]
-fn doctor_on_a_tidy_workspace_reports_nothing() {
-    let (_data, ws) = workspace();
-    let run = Run::of(
-        std::process::Command::new(env!("CARGO_BIN_EXE_filesnap"))
-            .args(["doctor", "--workdir", &ws.path().to_string_lossy()])
-            .output()
-            .unwrap(),
+fn doctor_on_a_tidy_workspace_reports_locking_and_nothing_else() {
+    let (data, ws) = workspace();
+    let run = filesnap(
+        data.path(),
+        &["doctor", "--workdir", &ws.path().to_string_lossy()],
     );
     assert_eq!(run.code, 0, "{}", run.stderr);
     assert_eq!(run.find("doctor.done")["removed"], 0);
-    assert_eq!(run.kinds(), vec!["doctor.done"]);
+    assert_eq!(run.kinds(), vec!["doctor.locking", "doctor.done"]);
+    assert_eq!(
+        run.find("doctor.locking")["enforced"],
+        true,
+        "a temp directory that does not lock would make every refusal test \
+         in this suite meaningless too"
+    );
 }

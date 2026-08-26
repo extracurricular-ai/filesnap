@@ -15,10 +15,16 @@
 use std::io::Write;
 use std::path::Path;
 
+use filesnap::WorkspaceStore;
 use serde::Serialize;
 
 use crate::event;
 use crate::exit;
+
+#[derive(Serialize)]
+struct Locking {
+    enforced: bool,
+}
 
 #[derive(Serialize)]
 struct Residue {
@@ -32,7 +38,28 @@ struct Done {
     failed: usize,
 }
 
-pub fn run(out: &mut impl Write, workdir: &Path) -> u8 {
+pub fn run(out: &mut impl Write, data_dir: &Path, workdir: &Path) -> u8 {
+    // Reported before the sweep, because it is a property of the setup rather
+    // than a result of this run.
+    //
+    // A store that will not open is *not* reported as unlocked. Absent and
+    // `false` mean different things — "we could not ask" against "we asked and
+    // the answer is no" — and a consumer that has to tell them apart can, by
+    // the event being missing. The residue sweep does not need the store, so
+    // it still runs.
+    match WorkspaceStore::open(data_dir, workdir).and_then(|s| s.locking_is_enforced()) {
+        Ok(enforced) => {
+            event::emit(out, "doctor.locking", Locking { enforced });
+            if !enforced {
+                eprintln!(
+                    "filesnap: this filesystem does not enforce file locks, so two \
+                     invocations of one session are not held apart"
+                );
+            }
+        }
+        Err(err) => eprintln!("filesnap: cannot determine whether locking works: {err}"),
+    }
+
     let mut removed = 0;
     let mut failed = 0;
     for path in filesnap::residue_under(workdir) {

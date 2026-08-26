@@ -744,3 +744,27 @@ fn deleting_refuses_a_session_another_invocation_is_using() {
         "the wait is meant to be bounded by LOCK_BUDGET, and took {waited:?}"
     );
 }
+
+/// The lock probe answers without inventing a session.
+///
+/// `doctor` asks whether this filesystem enforces locks, and the only way to
+/// find out is to take one. The id it takes it under is internal, so a probe
+/// must never show up as a session the user did not start.
+#[test]
+fn the_lock_probe_reports_enforcement_without_inventing_a_session() {
+    let fx = Fixture::new();
+    fx.write("a.txt", "one");
+    fx.capture("real", "turn-1");
+    let store = fx.store();
+
+    assert!(
+        store.locking_is_enforced().unwrap(),
+        "this filesystem does not lock, which would also silently weaken \
+         every refusal test in this crate"
+    );
+    assert_eq!(
+        store.sessions().unwrap(),
+        vec!["real".to_string()],
+        "the probe left a session behind"
+    );
+}
