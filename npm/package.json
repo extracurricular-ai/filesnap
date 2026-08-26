@@ -1,0 +1,35 @@
+{
+  "name": "filesnap",
+  "private": true,
+  "version": "0.0.0-dev",
+  "description": "Git-free file snapshots and rewind — put a directory back the way it was, without a repository and without touching your version control.",
+  "type": "module",
+  "bin": {
+    "filesnap": "bin/filesnap.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/extracurricular-ai/filesnap.git"
+  },
+  "homepage": "https://github.com/extracurricular-ai/filesnap",
+  "bugs": {
+    "url": "https://github.com/extracurricular-ai/filesnap/issues"
+  },
+  "keywords": [
+    "snapshot",
+    "rewind",
+    "undo",
+    "checkpoint",
+    "restore",
+    "filesystem",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

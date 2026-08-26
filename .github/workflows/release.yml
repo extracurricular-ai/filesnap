@@ -108,3 +108,184 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: .github/publish.sh filesnap-cli
+
+  # Six native runners, plain `cargo build --target`. No `cross`, no zigbuild,
+  # no musl-tools: this dependency graph has no C in it at all — gix 0.81
+  # resolves compression to the pure-Rust `zlib-rs`, and nothing else in the
+  # lockfile carries a `links` key. That is what makes the musl targets free.
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is musl on purpose. A glibc build inherits a symbol-version
+          # floor from whatever runner produced it, which breaks older distros
+          # and containers — the one failure an npm-installed binary cannot
+          # help its user debug. Static musl costs nothing here; it measured
+          # 58 KB *smaller* than the glibc build.
+          - slug: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - slug: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          # macos-15 is arm64; the Xcode SDK carries both slices, so the x64
+          # cell needs no extra tooling beyond the target.
+          - slug: darwin-x64
+            os: macos-15
+            target: x86_64-apple-darwin
+          - slug: darwin-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - slug: win32-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - slug: win32-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `rust-toolchain.toml` is a rustup *file override* and beats whatever
+      # the action installed, so the target has to land on the pinned
+      # toolchain rather than a floating stable. Printed, because the failure
+      # is otherwise a linker error three steps later.
+      - name: Add the target to the toolchain that will build
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.target }}
+
+      # Stripped for distribution only, through the environment rather than
+      # `[profile.release]` in the manifest — a `cargo install filesnap-cli`
+      # user should keep their symbol table, because a panic backtrace made of
+      # bare addresses is not something they can report. The release profile
+      # carries no debug info to begin with, so this is the symbol table and
+      # it is worth about 30% of the download.
+      - run: cargo build --release --locked -p filesnap-cli --target ${{ matrix.target }}
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+
+      - name: Stage the binary under its triple
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=filesnap
+          [ "${{ runner.os }}" = "Windows" ] && exe=filesnap.exe
+          mkdir -p "vendor/${{ matrix.target }}/bin"
+          cp "target/${{ matrix.target }}/release/$exe" "vendor/${{ matrix.target }}/bin/$exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vendor-${{ matrix.slug }}
+          path: vendor/
+          # One binary; compressing an already-compressed ELF buys nothing and
+          # costs a minute across six jobs.
+          compression-level: 0
+          if-no-files-found: error
+
+  npm:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      # Restated, because a job-level block replaces the workflow-level one
+      # rather than merging with it.
+      contents: read
+      # npm trusted publishing authenticates this job by the OIDC token GitHub
+      # mints for it. The claim registered on npmjs.com names this workflow by
+      # **filename** — moving this job into another file revokes publishing.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # Deliberately no `registry-url`. It writes `_authToken=${NODE_AUTH_TOKEN}`
+          # into .npmrc; with no token that is an empty credential which npm
+          # still sends, so the registry rejects it instead of npm falling back
+          # to the OIDC exchange.
+
+      # Node 22 ships npm 10.x, and trusted publishing needs 11.5.1 or later.
+      # Pinned to a major rather than `@latest`: npm 12 changed
+      # `npm pack --json` from a list to an object keyed by package name, and
+      # a release should not be the thing that discovers what npm shipped this
+      # morning.
+      - run: npm install -g "npm@^11.5.1"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vendor-*
+          merge-multiple: true
+          path: vendor
+
+      - name: The tag and the manifest agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not name version $manifest"
+            exit 1
+          fi
+
+      # The very first publish of a name cannot use OIDC: a trusted publisher
+      # is configured on the package's settings page, and that page does not
+      # exist until the package does. Set `NPM_TOKEN` for that one release and
+      # delete it afterwards — with the secret absent this writes nothing and
+      # the OIDC path is used.
+      - name: Bootstrap credential, if one was provided
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
+            echo "::warning::publishing with a token; remove the NPM_TOKEN secret once trusted publishing is configured"
+          else
+            echo "no NPM_TOKEN — using trusted publishing over OIDC"
+          fi
+
+      - name: Publish
+        shell: bash
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          npm --version
+
+          publish() {  # <tarball> [dist-tag]
+            local tarball="$1" tag="${2:-}"
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+              npm publish "$tarball" --dry-run ${tag:+--tag "$tag"}
+            else
+              npm publish "$tarball" ${tag:+--tag "$tag"}
+            fi
+          }
+
+          # Platforms first, launcher last. The launcher's aliases pin exact
+          # versions, so they must all resolve the moment it lands — a
+          # launcher published first is a `latest` that cannot install.
+          #
+          # Each platform build is kept off `latest` by its own dist-tag,
+          # because `latest` is what a bare `npm install filesnap` follows:
+          # point it at one platform and every other platform gets a package
+          # with no binary it can run. The version suffix is a second belt —
+          # `0.2.0-linux-x64` is a semver prerelease, which sorts below 0.2.0
+          # and is excluded from ranges by default.
+          for slug in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+            tarball=$(node npm/build.mjs --package "filesnap-$slug" --version "$version" --vendor-src vendor)
+            publish "$tarball" "$slug"
+          done
+
+          tarball=$(node npm/build.mjs --package filesnap --version "$version")
+          publish "$tarball"
