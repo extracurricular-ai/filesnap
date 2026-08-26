@@ -165,7 +165,28 @@ fn here(cwd: Option<PathBuf>) -> std::io::Result<PathBuf> {
 }
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    // `try_parse`, not `parse`, for the exit code alone. clap exits `2` on a
+    // parse error, and `2` is [`exit::FAILED`] — "the command did not run, or
+    // could not report", which tells a script to go and investigate the store.
+    // A misspelled flag is the opposite of that: it is the case
+    // [`exit::USAGE`] exists for, the one where nothing was attempted and the
+    // fix is to the call.
+    //
+    // `--help` and `--version` are not errors and keep their `0`. clap already
+    // routes them to stdout and everything else to stderr, so `print` puts
+    // each on the stream it belongs on.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            return std::process::ExitCode::from(match err.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    exit::OK
+                }
+                _ => exit::USAGE,
+            });
+        }
+    };
 
     let Some(data_dir) = cli.data_dir.or_else(default_data_dir) else {
         eprintln!("filesnap: no data directory; pass --data-dir");

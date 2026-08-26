@@ -728,6 +728,65 @@ fn a_restore_that_cannot_write_everything_reports_per_file_and_exits_nonzero() {
     );
 }
 
+/// **A wrong argument exits `3`, not `2`.**
+///
+/// clap's own default is `2`, and `2` is `exit::FAILED` — "the command did not
+/// run, or could not report", which tells a script to go and investigate the
+/// store. A misspelled call is the opposite: nothing was attempted, and the
+/// fix is to the call. That distinction is the whole reason there are four
+/// codes rather than three, and until this it did not hold for the most
+/// ordinary way to get an argument wrong.
+#[test]
+fn a_wrong_argument_exits_usage_rather_than_failed() {
+    let (data, _ws) = workspace();
+    let cases: [&[&str]; 4] = [
+        &["log"],                        // a required argument missing
+        &["--nonsense"],                 // a flag that does not exist
+        &["restore", "--session", "s1"], // half a call
+        &[],                             // no subcommand at all
+    ];
+    for args in cases {
+        let run = filesnap(data.path(), args);
+        assert_eq!(
+            run.code,
+            3,
+            "`filesnap {}` did not exit USAGE",
+            args.join(" ")
+        );
+    }
+}
+
+/// `--help` and `--version` are not errors, and they are the one place this
+/// command writes prose to stdout.
+///
+/// Deliberately not through `Run`, which parses every stdout line as JSON and
+/// panics otherwise. That helper is how the JSONL contract is enforced on
+/// every other command in this file, so these two have to step around it —
+/// they are the documented exception, not a hole in it.
+#[test]
+fn help_and_version_succeed_and_are_the_only_prose_on_stdout() {
+    for flag in ["--help", "--version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_filesnap"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{flag} was treated as an error"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "",
+            "{flag} put prose on stderr as well"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("filesnap"),
+            "{flag} printed nothing recognisable on stdout"
+        );
+    }
+}
+
 // --- delete, gc, doctor ---
 
 /// Delete's promise is unreachability, and it keeps it immediately. Reclaiming
