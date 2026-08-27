@@ -105,6 +105,32 @@ jobs:
   # nothing about whether the *packaged* crate is coherent — the engine's
   # integration tests are deliberately excluded from it, and a file left out
   # by accident would only surface here.
+  # The npm launcher and its generator, executed. Nothing in the cargo matrix
+  # reads a JavaScript file, so without this job the wrapper's exit-code
+  # propagation, the two triple tables and every field of a generated manifest
+  # first run during a release — the one place a mistake is not a red build but
+  # a burned version number, because a published version can never be replaced.
+  #
+  # Three platforms because the binary name and the symlink privilege differ.
+  # Node 18 because that is the floor `npm/package.json` declares. Files named
+  # explicitly: `node --test <directory>` is a MODULE_NOT_FOUND on node 24.
+  npm:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+      - run: node --test npm/test/launcher.test.mjs npm/test/build.test.mjs
+
   package:
     runs-on: ubuntu-latest
     # A hung test must cost a red X, not the 360-minute default.
