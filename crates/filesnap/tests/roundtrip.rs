@@ -441,10 +441,18 @@ fn turn_resolution_and_fork_inheritance() {
     assert!(store.session_exists("fork-2"));
 
     // Shared manifests survive a sweep while either session references them.
+    // Aged first: an unsettled manifest is spared for its youth alone, which
+    // would keep all three whatever fork-1 references — and `>= 2` would hold
+    // if nothing were reclaimable at all.
+    filesnap::fixture::age_store(dir.path());
     let outcome = store.delete_sessions(&[THREAD.to_string()]);
-    assert!(
-        outcome.reclaimed.manifests_kept >= 2,
-        "fork-1 still references manifests"
+    assert_eq!(
+        (
+            outcome.reclaimed.manifests_kept,
+            outcome.reclaimed.manifests_removed
+        ),
+        (2, 1),
+        "fork-1's two inherited manifests survive; only turn-2's is reclaimed"
     );
 }
 

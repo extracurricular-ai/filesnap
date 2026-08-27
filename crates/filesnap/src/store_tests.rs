@@ -82,7 +82,15 @@ fn an_unreadable_log_defers_reclamation_without_failing_the_delete() {
     let fx = Fixture::new();
     fx.write("a.txt", "one");
     fx.capture(S, "turn-1");
+    // Different content, or both sessions share one content-addressed
+    // manifest and the survivor's turn entry vouches for it — which keeps it
+    // alive on a *complete* pass too, so nothing here would be about
+    // deferral.
+    fx.write("a.txt", "two");
     fx.capture("healthy", "turn-2");
+    // Past the grace window, or nothing on this store is removable at all and
+    // the count below is guaranteed by age rather than by coverage.
+    fx.age_store();
 
     let store = fx.store();
     std::fs::write(log_path(&store, S), b"not json at all").unwrap();
@@ -90,7 +98,11 @@ fn an_unreadable_log_defers_reclamation_without_failing_the_delete() {
     let outcome = store.delete_sessions(&["healthy".to_string()]);
 
     assert!(!store.session_exists("healthy"), "the promise it can keep");
-    assert_eq!(outcome.reclaimed.manifests_removed, 0);
+    assert_eq!(
+        outcome.reclaimed.manifests_removed, 0,
+        "the doomed manifest is unreferenced and settled: only the incomplete \
+         answer keeps it"
+    );
     assert!(
         outcome.sweep_error.is_none(),
         "deferring is not failing — delete has no preconditions (D9): {:?}",

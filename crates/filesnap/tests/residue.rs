@@ -107,6 +107,13 @@ fn nothing_but_residue_is_removed() {
     // at this instant.
     let fresh = strand(&fx, "b.txt");
 
+    // Settled, and deliberately *not* suffixed. Left young, the grace window
+    // spares it whatever the name rule says — so the name half of
+    // `is_settled_residue` went untested, and deleting it left the whole
+    // suite green while a restore swept every settled file out of every
+    // directory it wrote into.
+    age(&fx.path("keep.txt"));
+
     let store = fx.store();
     let target = store.target_for_turn("turn-1").unwrap().unwrap();
     store
@@ -119,7 +126,11 @@ fn nothing_but_residue_is_removed() {
         )
         .unwrap();
 
-    assert!(fx.exists("keep.txt"));
+    assert!(
+        fx.exists("keep.txt"),
+        "the sweep deleted a settled file of the user's own, for sitting in a \
+         directory the restore wrote to"
+    );
     assert_eq!(fx.read("keep.txt"), "mine");
     assert!(
         fresh.exists(),

@@ -28,6 +28,13 @@ impl Store {
             .join(format!("{}.json", crate::id::record_name(thread_id)))
     }
 
+    fn turn_path(&self, turn_id: &str) -> PathBuf {
+        self.dir
+            .path()
+            .join("turns")
+            .join(crate::refs::turn_file_name(turn_id))
+    }
+
     fn restore_path(&self, thread_id: &str) -> PathBuf {
         self.dir
             .path()
@@ -158,6 +165,10 @@ fn a_prune_keeps_what_a_survivor_still_names() {
         .append("survivor", "turn-b".into(), shared.clone())
         .unwrap();
     s.refs.remove("doomed").unwrap();
+    // Past GC_GRACE, so the grace gate cannot be what spares this. Left
+    // young, the survivor's log entry is never consulted and the liveness
+    // check this test is named for could be deleted outright.
+    age_out(&s.manifests.path_for(&shared).unwrap());
 
     let stats = prune_sessions(
         &s.refs,
@@ -194,6 +205,12 @@ fn an_unreadable_log_defers_reclamation_rather_than_guessing() {
     fs::write(s.log_path("corrupt"), b"{\"version\":1,\"entr").unwrap();
 
     let before = ids(&s);
+    // Same masking, same fix: the age gate alone satisfies the assertions
+    // below, so the corrupt log above was decorative and `Coverage::Partial`
+    // was covered by nothing.
+    for id in &before {
+        age_out(&s.manifests.path_for(id).unwrap());
+    }
     let stats = prune_sessions(
         &s.refs,
         &s.turns,
@@ -220,16 +237,62 @@ fn collection_reclaims_the_orphan_a_prune_cannot_see() {
     let orphan = manifest(&s, "hash-orphan");
     s.refs.append("t", "turn-a".into(), live.clone()).unwrap();
     s.turns.set_turn("turn-a", &live).unwrap();
+    // A capture writes its log entry before its turn file, so a turn entry no
+    // log names may simply be mid-write. `turn-b` stands in for that window,
+    // which is what `retain_turns`' own grace gate exists to survive — and
+    // nothing rebuilds a turn file unlinked by mistake.
+    s.turns.set_turn("turn-b", &orphan).unwrap();
 
     // Young: collection spares what it cannot yet judge.
     let stats = collect_partition(&s.refs, &s.turns, &s.manifests).unwrap();
     assert_eq!(stats.manifests_removed, 0);
+    assert_eq!(
+        s.turns.manifest_for_turn("turn-b").unwrap(),
+        Some(orphan.clone()),
+        "a turn entry younger than the grace window survives even unnamed"
+    );
 
+    age_out(&s.turn_path("turn-b"));
     age_out(&s.manifests.path_for(&orphan).unwrap());
     age_out(&s.manifests.path_for(&live).unwrap());
     let stats = collect_partition(&s.refs, &s.turns, &s.manifests).unwrap();
     assert_eq!((stats.manifests_kept, stats.manifests_removed), (1, 1));
+    assert_eq!(s.turns.manifest_for_turn("turn-b").unwrap(), None);
     assert_eq!(ids(&s), BTreeSet::from([live]));
+}
+
+/// The enumerating sweep is held to the same rule: one unreadable log and it
+/// removes nothing, because what that log named is exactly what it cannot see.
+///
+/// Distinct from the prune above in the way that matters. Nothing scopes this
+/// sweep to a caller-supplied set, so an incomplete live set does not merely
+/// defer a reclamation — it unlinks every manifest the unreadable log named,
+/// for a session nobody asked to delete.
+#[test]
+fn an_unreadable_log_stops_collection_from_removing_what_it_cannot_see() {
+    let s = store();
+    let hidden = manifest(&s, "hash-hidden");
+    s.refs
+        .append("corrupt", "turn-a".into(), hidden.clone())
+        .unwrap();
+    s.refs
+        .append("other", "turn-b".into(), manifest(&s, "hash-other"))
+        .unwrap();
+
+    // Truncated mid-write: the only record naming `hidden` is now unreadable,
+    // so a sweep that trusts its live set will call it dead.
+    fs::write(s.log_path("corrupt"), b"{\"version\":1,\"entr").unwrap();
+
+    let before = ids(&s);
+    for id in &before {
+        age_out(&s.manifests.path_for(id).unwrap());
+    }
+
+    let stats = collect_partition(&s.refs, &s.turns, &s.manifests).unwrap();
+
+    assert_eq!(stats.manifests_removed, 0);
+    assert_eq!(ids(&s), before, "an incomplete live set removes nothing");
+    assert!(s.manifests.load(&hidden).is_ok());
 }
 
 /// **Neither sweep may remove content.** The signature is the guard: there is
