@@ -257,3 +257,47 @@ fn an_unrecognised_failure_is_fatal_rather_than_ignored() {
         Disposition::Fatal
     );
 }
+
+/// `classify` is only as good as the table it is handed, and `CURRENT` is the
+/// one line that picks that table for the machine we are on.
+///
+/// Every other test here passes a `Platform` literal, so both tables are
+/// exercised everywhere and that single binding is referenced by nothing.
+/// Swap its arms and the suite stays green while an ordinary `EPERM` from
+/// `flock` starts reading as "this filesystem has no locks" — `acquire`
+/// returns an unenforced guard, and a log append can be lost with nothing
+/// reporting it.
+#[test]
+fn current_selects_the_table_for_the_machine_running() {
+    // Code 1 is the right probe precisely because it is the colliding number:
+    // `ERROR_INVALID_FUNCTION` on Windows, `EPERM` on unix. The two tables
+    // disagree about it, so it is the one code that can tell them apart.
+    #[cfg(windows)]
+    {
+        assert_eq!(Platform::CURRENT, Platform::Windows);
+        assert_eq!(
+            classify(
+                ErrorKind::PermissionDenied,
+                Some(1),
+                Site::Lock,
+                Platform::CURRENT
+            ),
+            Disposition::Unsupported,
+            "ERROR_INVALID_FUNCTION must read as 'this filesystem has no locks'"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(Platform::CURRENT, Platform::Unix);
+        assert_eq!(
+            classify(
+                ErrorKind::PermissionDenied,
+                Some(1),
+                Site::Lock,
+                Platform::CURRENT
+            ),
+            Disposition::Fatal,
+            "EPERM is a real permission error, not a filesystem without locks"
+        );
+    }
+}

@@ -705,6 +705,50 @@ fn one_file_has_one_key_whichever_spelling_reaches_it() {
         vec![fx.key("real/a.txt")],
         "the key is the real spelling, not the one the caller reached it by"
     );
+
+    // **The second minting site.** `checkpoint` canonicalizes inside
+    // `capture`; `attach_pre_edit` canonicalizes independently, and everything
+    // above leaves that one uncovered — the comment beside it says it "has to
+    // agree with the first", which nothing was checking.
+    //
+    // The dedup is the visible half: this capture already covers the file, so
+    // the link spelling must resolve to the same key or a second entry is
+    // appended for one file.
+    assert_eq!(
+        store
+            .attach_pre_edit(
+                S,
+                "turn-real",
+                &linked.join("a.txt").to_string_lossy(),
+                &PreEditImage::Existed(b"one".to_vec()),
+            )
+            .unwrap(),
+        None,
+        "the capture already covers this file; the link is the same key"
+    );
+
+    // And the tombstone half, which is the worse failure: a tombstone keyed by
+    // a spelling `plan_restore` cannot match is one the restore never acts on,
+    // so the file it licensed removing is silently never removed.
+    let attached = store
+        .attach_pre_edit(
+            S,
+            "turn-attach",
+            &linked.join("b.txt").to_string_lossy(),
+            &PreEditImage::DidNotExist,
+        )
+        .unwrap()
+        .expect("a created path records that it did not exist");
+    assert_eq!(
+        store
+            .manifest(&attached)
+            .unwrap()
+            .absent
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![fx.key("real/b.txt")],
+        "the tombstone is keyed by the real spelling, not the link"
+    );
 }
 
 /// A session another invocation is holding is **refused** — left exactly as

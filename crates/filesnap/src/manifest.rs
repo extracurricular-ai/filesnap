@@ -351,6 +351,44 @@ mod tests {
         fs::write(&file, b"abc").unwrap();
         let meta2 = fs::metadata(&file).unwrap();
         assert!(!e.stat_matches(&meta2));
+
+        // Both terms have to be able to decide alone. The rewrite above moves
+        // size *and* mtime, so either one settles it — and with only that,
+        // the two mtime terms could be deleted with the whole suite green,
+        // while a same-length edit in place (`sed -i`, a flag flipped, one
+        // character) hit the cache, kept the stale hash, and was never
+        // captured.
+        //
+        // The *recorded* stamp is varied against an unchanged file rather
+        // than the file against an unchanged entry: no dependence on the
+        // filesystem's timestamp granularity, and no sleep. Neither variant
+        // collides with the (0, 0) never-trustworthy sentinel, because `secs`
+        // is a real wall-clock timestamp.
+        let stale_secs = FileEntry {
+            mtime_secs: secs - 1,
+            ..e.clone()
+        };
+        assert!(
+            !stale_secs.stat_matches(&meta),
+            "a same-size file whose mtime seconds moved must miss the stat cache"
+        );
+        let stale_nanos = FileEntry {
+            mtime_nanos: nanos ^ 1,
+            ..e.clone()
+        };
+        assert!(
+            !stale_nanos.stat_matches(&meta),
+            "a same-size file whose mtime nanos moved must miss the stat cache"
+        );
+
+        // And the mirror, or size stops being load-bearing the moment mtime
+        // becomes so. A file truncated or extended inside one timestamp tick
+        // is the case this covers.
+        let wrong_size = FileEntry { size: 3, ..e };
+        assert!(
+            !wrong_size.stat_matches(&meta),
+            "a file whose size moved must miss the stat cache whatever its mtime"
+        );
     }
 
     /// A record this build does not understand is refused, not guessed at.
