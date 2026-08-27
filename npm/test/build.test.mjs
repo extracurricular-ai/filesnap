@@ -46,9 +46,12 @@ function generate(pkg, vendor) {
   const tarball = execFileSync("node", [BUILD, ...argv], {
     encoding: "utf8",
   }).trim();
-  // `tar` is on all three runner images; Windows ships bsdtar.
+  // Named by basename with `cwd` set, never by absolute path: the `tar` on a
+  // Windows runner reads `C:\\...` as a *remote host* spec — "Cannot connect
+  // to C" — because a colon means `host:path` to it.
   const manifest = JSON.parse(
-    execFileSync("tar", ["xzOf", tarball, "package/package.json"], {
+    execFileSync("tar", ["xzOf", path.basename(tarball), "package/package.json"], {
+      cwd: path.dirname(tarball),
       encoding: "utf8",
     }),
   );
@@ -142,7 +145,10 @@ test("every slug the launcher believes in resolves to a binary the build packs",
     // The exact path the launcher joins, relative to the package root it
     // resolves, asserted against what is really inside the tarball.
     const wanted = ["package", "vendor", triple, "bin", win ? "filesnap.exe" : "filesnap"].join("/");
-    const listing = execFileSync("tar", ["tzf", tarball], { encoding: "utf8" })
+    const listing = execFileSync("tar", ["tzf", path.basename(tarball)], {
+      cwd: path.dirname(tarball),
+      encoding: "utf8",
+    })
       .split("\n")
       .map((l) => l.replace(/^\.\//, "").trim());
     assert.ok(

@@ -16,7 +16,7 @@
 // A checked-in file carrying a version is a file that is wrong between
 // releases.
 
-import { execFileSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -155,26 +155,31 @@ function pack() {
   // by package name — and took a release down with it. Read the filename off
   // the plain output instead, which has been one line since forever.
   //
-  // `shell` on Windows only. There `npm` is `npm.cmd`, a batch file: without a
-  // shell the spawn is `ENOENT`, and since CVE-2024-27980 node refuses to run
-  // `.cmd` without one anyway. That same fix is what makes it safe — node
-  // escapes the arguments for `cmd.exe` itself, so a staging path with a space
-  // in it survives. On unix the shell would add a quoting layer that escapes
-  // nothing, so it stays off.
-  const windows = process.platform === "win32";
+  // **Nothing is passed as an argument at all.** `npm pack` runs with its cwd
+  // in the staging directory and writes the tarball there; the result is
+  // copied out afterwards.
+  //
+  // That is not fastidiousness. On Windows `npm` is `npm.cmd`, a batch file:
+  // without a shell the spawn is `ENOENT`, and since CVE-2024-27980 node
+  // refuses to run `.cmd` without one anyway. But node does **not** escape
+  // arguments under `shell: true` — it concatenates them, and deprecates
+  // passing any (DEP0190). A `--pack-destination` holding a path with a space
+  // in it would be split by `cmd.exe`. One command, no arguments, nothing to
+  // quote.
   let out;
   try {
-    out = execFileSync("npm", ["pack", "--pack-destination", outDir], {
-      cwd: staging,
-      encoding: "utf8",
-      shell: windows,
-    });
+    out = execSync("npm pack", { cwd: staging, encoding: "utf8" });
   } catch (err) {
     // A raw spawn stack says nothing about which package failed to pack.
     die(`npm pack failed for ${name}: ${err.stderr || err.message}`);
   }
   const file = out.trim().split("\n").pop().trim();
+  const produced = path.join(staging, file);
+  if (!fs.existsSync(produced)) die(`npm pack reported "${file}" but it is not there`);
+
+  // Copy rather than rename: staging is in the system temp directory and the
+  // destination usually is not, and a rename across devices is `EXDEV`.
   const tarball = path.join(outDir, file);
-  if (!fs.existsSync(tarball)) die(`npm pack reported "${file}" but it is not there`);
+  fs.copyFileSync(produced, tarball);
   return tarball;
 }
