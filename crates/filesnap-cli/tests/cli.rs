@@ -964,12 +964,21 @@ fn doctor_on_a_tidy_workspace_reports_locking_and_nothing_else() {
 /// doctor tests sweep everything successfully, so `exit::PARTIAL` and the
 /// `removed: false` event were executed by nothing.
 ///
-/// The blocker differs by platform because the permission that governs
-/// deletion does: on unix it belongs to the parent directory, on Windows to
-/// the file. The portable trick from the restore test — occupy the path with a
-/// directory — is no use here, because `residue_under` filters to `is_file()`
-/// and a directory is never a candidate. The errno is not asserted, only the
-/// degradation.
+/// **Unix only, and the Windows half is a real gap rather than an oversight.**
+/// The first attempt marked the file read-only there, on the assumption that
+/// Windows refuses to delete such a file. It does not: `std`'s `remove_file`
+/// passes `FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE`, deliberately
+/// deleting read-only files (`sys/fs/windows.rs`, `posix_delete`). So the
+/// blocker blocked nothing and the test failed on a count.
+///
+/// The portable trick from the restore test — occupy the path with a
+/// directory — is no use either, because `residue_under` filters to
+/// `is_file()` and a directory is never a candidate. What would work on
+/// Windows is holding the file open without `FILE_SHARE_DELETE`, so `unlink`'s
+/// own open is refused; that is untried, and guessing at Windows behaviour is
+/// what produced this comment. The errno is not asserted here either way, only
+/// the degradation.
+#[cfg(unix)]
 #[test]
 fn doctor_that_cannot_clear_a_stray_reports_it_and_exits_nonzero() {
     let (data, ws) = workspace();
@@ -987,12 +996,12 @@ fn doctor_that_cannot_clear_a_stray_reports_it_and_exits_nonzero() {
         .set_times(std::fs::FileTimes::new().set_modified(old))
         .unwrap();
 
-    deny_deletion(&locked, &stray);
+    deny_deletion(&locked);
     // Root ignores permission bits, and this whole test is a permission bit.
     // Left unsaid it fails on a count instead, which reads as a defect in the
     // sweep rather than a precondition the machine cannot meet.
     assert!(
-        deletion_is_denied(&locked, &stray),
+        deletion_is_denied(&locked),
         "the deletion this test needs to fail would succeed — run it as non-root"
     );
 
@@ -1003,7 +1012,7 @@ fn doctor_that_cannot_clear_a_stray_reports_it_and_exits_nonzero() {
 
     // Before any assertion, so the temp directory can clean itself up whatever
     // failed.
-    allow_deletion(&locked, &stray);
+    allow_deletion(&locked);
 
     assert_eq!(run.code, 1, "a partial sweep read as success");
     assert_eq!(run.find("doctor.done")["removed"], 0);
@@ -1019,38 +1028,23 @@ fn doctor_that_cannot_clear_a_stray_reports_it_and_exits_nonzero() {
 }
 
 #[cfg(unix)]
-fn deny_deletion(parent: &std::path::Path, _file: &std::path::Path) {
+fn deny_deletion(parent: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
 }
 
 #[cfg(unix)]
-fn allow_deletion(parent: &std::path::Path, _file: &std::path::Path) {
+fn allow_deletion(parent: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// Whether the mechanism this test relies on is actually in force.
+/// Whether the mechanism the test relies on is actually in force.
+///
+/// The *effect*, not the setting. An earlier version of this asserted that a
+/// permission bit had been set, which is true even where the bit changes
+/// nothing — and that is how a wrong premise reached CI as a count mismatch.
 #[cfg(unix)]
-fn deletion_is_denied(parent: &std::path::Path, _file: &std::path::Path) -> bool {
+fn deletion_is_denied(parent: &std::path::Path) -> bool {
     std::fs::write(parent.join(".probe"), b"x").is_err()
-}
-
-#[cfg(windows)]
-fn deny_deletion(_parent: &std::path::Path, file: &std::path::Path) {
-    let mut perms = std::fs::metadata(file).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(file, perms).unwrap();
-}
-
-#[cfg(windows)]
-fn allow_deletion(_parent: &std::path::Path, file: &std::path::Path) {
-    let mut perms = std::fs::metadata(file).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(file, perms).unwrap();
-}
-
-#[cfg(windows)]
-fn deletion_is_denied(_parent: &std::path::Path, file: &std::path::Path) -> bool {
-    std::fs::metadata(file).unwrap().permissions().readonly()
 }

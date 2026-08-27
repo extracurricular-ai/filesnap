@@ -6,6 +6,12 @@
 // (D37), named from here through alias specs in `optionalDependencies`, and
 // `os`/`cpu` on each of them is what makes npm unpack exactly one.
 //
+// **`.mjs`, not `.js`.** As `.js` this file is an ES module only because the
+// package.json beside it says `"type": "module"` — a dependency on a sibling
+// that is invisible from here, and one node 18 enforces strictly while node 22
+// and later paper over with ES-module detection. The extension says what the
+// file is, so nothing has to be true elsewhere for it to load.
+//
 // Everything below is either locating that binary or forwarding a signal to
 // it. Nothing here parses arguments or interprets output: the contract is the
 // binary's (JSON Lines on stdout, prose on stderr, exit codes 0/1/2/3), and a

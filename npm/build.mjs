@@ -92,8 +92,8 @@ function stageLauncher() {
   // thing less precisely, and drags in a pile of mode- and link-preservation
   // behaviour this does not want.
   fs.mkdirSync(path.join(staging, "bin"), { recursive: true });
-  const launcher = path.join(staging, "bin", "filesnap.js");
-  fs.copyFileSync(path.join(HERE, "bin", "filesnap.js"), launcher);
+  const launcher = path.join(staging, "bin", "filesnap.mjs");
+  fs.copyFileSync(path.join(HERE, "bin", "filesnap.mjs"), launcher);
   fs.chmodSync(launcher, 0o755);
   fs.copyFileSync(path.join(HERE, "README.md"), path.join(staging, "README.md"));
 

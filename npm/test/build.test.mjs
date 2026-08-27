@@ -4,7 +4,7 @@
 // npm does not reject an unrecognised `os`; it silently installs the package
 // nowhere. A typo there is not a red build, it is a burned version number —
 // a published version can never be replaced (D37). And the two triple tables,
-// `filesnap.js`'s and `build.mjs`'s, are written out separately with nothing
+// `filesnap.mjs`'s and `build.mjs`'s, are written out separately with nothing
 // comparing them: a drift between them is invisible at build and publish time
 // and surfaces only as "the package is missing or has no binary" on a user's
 // machine, for a binary sitting one directory over.
@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BUILD = path.join(HERE, "..", "build.mjs");
-const LAUNCHER = path.join(HERE, "..", "bin", "filesnap.js");
+const LAUNCHER = path.join(HERE, "..", "bin", "filesnap.mjs");
 const BASE = JSON.parse(
   fs.readFileSync(path.join(HERE, "..", "package.json"), "utf8"),
 );

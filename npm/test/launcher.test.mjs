@@ -2,7 +2,7 @@
 //
 // `cargo test` spawns the Rust binary directly, so nothing anywhere proved
 // that the four exit codes in `crates/filesnap-cli/src/exit.rs` survive
-// `bin/filesnap.js` — the wrapper every npm install actually runs. Until this
+// `bin/filesnap.mjs` — the wrapper every npm install actually runs. Until this
 // file existed, the first execution of that script on any commit was on a
 // user's machine, against a published version that can never be replaced.
 //
@@ -18,7 +18,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const LAUNCHER = path.join(HERE, "..", "bin", "filesnap.js");
+const LAUNCHER = path.join(HERE, "..", "bin", "filesnap.mjs");
 
 // All six are staged, so nothing here asserts which triple this machine picks.
 // That mapping is the launcher's to own; duplicating the choice would only let
@@ -35,7 +35,12 @@ const TRIPLES = [
 function stage({ withBinary = true } = {}) {
   const root = fs.mkdtempSync(path.join(tmpdir(), "filesnap-launcher-"));
   fs.mkdirSync(path.join(root, "bin"), { recursive: true });
-  fs.copyFileSync(LAUNCHER, path.join(root, "bin", "filesnap.js"));
+  // Staged with no package.json beside it, deliberately. As `.js` the
+  // launcher was an ES module only because the manifest said so, and this
+  // staging is what caught it: node 18 refused to parse it, while node 22 and
+  // later hide the coupling behind ES-module detection. `.mjs` needs nothing
+  // to be true elsewhere, and staging bare is what keeps that so.
+  fs.copyFileSync(LAUNCHER, path.join(root, "bin", "filesnap.mjs"));
   if (withBinary) {
     const name = process.platform === "win32" ? "filesnap.exe" : "filesnap";
     for (const triple of TRIPLES) {
@@ -55,7 +60,7 @@ function stage({ withBinary = true } = {}) {
       }
     }
   }
-  return path.join(root, "bin", "filesnap.js");
+  return path.join(root, "bin", "filesnap.mjs");
 }
 
 const launcher = stage();
