@@ -1150,6 +1150,73 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     );
 }
 
+/// **An undo reverts a file the rewind wrote outside the scan.**
+///
+/// The safety capture observes the caller's scan *and* every path the target
+/// holds. The second half is easy to lose and hard to notice: a rewind writes
+/// every path its target names, including ones no scan covered — so if the
+/// safety capture did not observe them, the undo has no record to put back
+/// and the write outlives the restore that made it. Deleting that half left
+/// the whole suite green.
+#[test]
+fn an_undo_reverts_a_file_the_rewind_wrote_outside_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let outside = filesnap::canonical_key(dir.path()).join("elsewhere");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let store = WorkspaceStore::open(dir.path(), &ws).unwrap();
+    let scan = || all_files(&ws);
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    let script = outside.join("deploy.sh");
+    fs::write(&script, "old").unwrap();
+
+    // The turn we will rewind to records the outside script as present.
+    let mut files = scan();
+    files.push(script.clone());
+    store.checkpoint(THREAD, "fork-here", files).unwrap();
+
+    // It is then removed by something that leaves no trace in the records.
+    fs::remove_file(&script).unwrap();
+    store.inherit_log(THREAD, BRANCH, "fork-here").unwrap();
+
+    // The caller scans only the workspace, so the script is absent from what
+    // it passes — yet the target holds it, so the plan writes it.
+    store
+        .restore_to(
+            THREAD,
+            &store.target_for_turn("fork-here").unwrap().unwrap(),
+            RestoreKind::Rewind {
+                undo_for: Some(BRANCH),
+            },
+            scan(),
+            &no_rules(),
+        )
+        .unwrap();
+    assert!(
+        script.exists(),
+        "the rewind writes the target's paths whatever the scan covered"
+    );
+
+    // And the undo takes it away again, which it can only do if the safety
+    // capture observed a path the caller never mentioned.
+    let target = store.last_restore_target(BRANCH).unwrap().unwrap();
+    store
+        .restore_to(
+            BRANCH,
+            &target,
+            RestoreKind::Undo { spending: BRANCH },
+            scan(),
+            &no_rules(),
+        )
+        .unwrap();
+    assert!(
+        !script.exists(),
+        "the undo left behind a file the rewind created outside the scan"
+    );
+}
+
 #[test]
 fn a_turn_reports_what_it_cannot_put_back() {
     // Tracking is discovered, not retroactive: a turn from before a path was
