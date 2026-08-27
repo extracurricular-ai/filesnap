@@ -263,10 +263,41 @@ jobs:
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           npm --version
 
-          publish() {  # <tarball> [dist-tag]
-            local tarball="$1" tag="${2:-}"
+          # Already on the registry? Then this is a re-run of a release whose
+          # earlier half landed, and there is nothing to do for this one.
+          #
+          # **Without this the npm half cannot be re-run at all.** An npm
+          # version can never be reused, so a failure at the fourth package
+          # leaves three published — and every retry then dies on the first,
+          # under `set -e`, with the remaining four still missing and no way
+          # out but hand-editing this file. `.github/publish.sh` has carried
+          # the same guard for crates.io since the first release; this half
+          # went without it because the one failure we had happened to land
+          # before anything was published, which proves nothing about the
+          # next one.
+          #
+          # Positive confirmation only. `|| true` on the curl, and a match on
+          # the version rather than on the not-found sentinel: an unreachable
+          # registry must fall through to the publish, which then fails
+          # loudly and correctly if the version really is there. Reading a
+          # network failure as "already published" would silently skip a
+          # package that was never uploaded.
+          published() {  # <version>
+            local version="$1"
+            curl -sS --max-time 30 -A "filesnap-release" \
+              "https://registry.npmjs.org/filesnap/${version}" 2>/dev/null \
+              | grep -q "\"version\":\"${version}\"" || return 1
+          }
+
+          publish() {  # <version> <tarball> [dist-tag]
+            local version="$1" tarball="$2" tag="${3:-}"
             if [ "${DRY_RUN:-false}" = "true" ]; then
+              # No skip in a rehearsal: packing and validating is the whole
+              # point of one, and it is what the published check would rob it
+              # of on a re-rehearsed version.
               npm publish "$tarball" --dry-run ${tag:+--tag "$tag"}
+            elif published "$version"; then
+              echo "    filesnap@${version} is already on the registry — nothing to do"
             else
               npm publish "$tarball" ${tag:+--tag "$tag"}
             fi
@@ -284,8 +315,8 @@ jobs:
           # and is excluded from ranges by default.
           for slug in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
             tarball=$(node npm/build.mjs --package "filesnap-$slug" --version "$version" --vendor-src vendor)
-            publish "$tarball" "$slug"
+            publish "$version-$slug" "$tarball" "$slug"
           done
 
           tarball=$(node npm/build.mjs --package filesnap --version "$version")
-          publish "$tarball"
+          publish "$version" "$tarball"
