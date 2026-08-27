@@ -421,14 +421,39 @@ mod tests {
 
     #[test]
     fn restoring_is_idempotent_for_a_given_target() {
-        // The same target must plan the same way no matter what happened in
-        // between — the property that broke when targets were located by
-        // content and a redo made an older state recur.
+        // Replanning the same target names the same write both times, and
+        // planning never mutates its inputs.
+        //
+        // The larger property — that a target plans the same way whatever
+        // happened in between, which broke when targets were located by
+        // content and a redo made an older state recur — lives in
+        // `target_for_turn` and `TurnIndex`, neither of which this touches.
+        // `tests/roundtrip.rs::rewinding_twice_still_restores` covers it end
+        // to end.
         let target = manifest(&[("/a", "h-old")]);
         let current = manifest(&[("/a", "h-new")]);
 
-        let first = plan_restore(&target, &current, &Gitignore::empty());
-        let after_undo = plan_restore(&target, &current, &Gitignore::empty());
-        assert_eq!(first, after_undo);
+        // Compared against a written-out expectation rather than against each
+        // other: `plan_restore` is pure, so `f(x) == f(x)` holds under every
+        // mutation there is, `return plan;` at the top of the function
+        // included.
+        let expected = RestorePlan {
+            writes: vec![WriteAction {
+                path: "/a".to_string(),
+                hash: "h-old".to_string(),
+                mode: Some(0o644),
+            }],
+            deletes: Vec::new(),
+        };
+        assert_eq!(
+            plan_restore(&target, &current, &Gitignore::empty()),
+            expected,
+            "the target state was not planned"
+        );
+        assert_eq!(
+            plan_restore(&target, &current, &Gitignore::empty()),
+            expected,
+            "replanning the same target drifted"
+        );
     }
 }

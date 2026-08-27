@@ -751,6 +751,39 @@ mod tests {
                 "each entry names the one before it"
             );
         }
+
+        // The link has to *cover* the entry it names, or it is decoration.
+        // Everything above recomputes the expectation with the very function
+        // that produced the stored value, so a `digest` returning a constant
+        // satisfies it — only the `prev_hash: None` assertion above stands on
+        // its own. Altering any field of an earlier entry, its own
+        // `prev_hash` included, must change the digest the next entry pinned.
+        let base = log.entries[0].clone();
+        let digest = SnapshotRef::digest(&base);
+        for tamper in [
+            SnapshotRef {
+                manifest_id: "swapped".into(),
+                ..base.clone()
+            },
+            SnapshotRef {
+                turn_id: "swapped".into(),
+                ..base.clone()
+            },
+            SnapshotRef {
+                at: base.at + 1,
+                ..base.clone()
+            },
+            SnapshotRef {
+                prev_hash: Some("forged".into()),
+                ..base
+            },
+        ] {
+            assert_ne!(
+                SnapshotRef::digest(&tamper),
+                digest,
+                "a field outside the digest is a field the chain does not cover: {tamper:?}"
+            );
+        }
     }
 
     /// A timestamp for display, and nothing decides anything by it.
