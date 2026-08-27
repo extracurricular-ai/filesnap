@@ -14,15 +14,20 @@
 //! The command surface is settled and closed. There is no `rewind` — the
 //! engine has no opinion about conversations (D27) — and scan limits are not
 //! exposed, because a bound a user has to find is not a bound (D14).
+//! `--declared-window` is the one bound that is exposed, for the reason
+//! [`window`] gives: it is a statement about the host's product rather than
+//! about what this tree costs to scan.
 
 mod commands;
 mod event;
 mod exit;
+mod window;
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use clap::Subcommand;
+use filesnap::DeclaredWindow;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +62,19 @@ enum Command {
         /// Extra roots to scan. Repeatable.
         #[arg(long = "root", value_name = "DIR")]
         roots: Vec<PathBuf>,
+        /// How many turns a path the edit API declared keeps being scanned
+        /// after the turn that last declared it, or `unlimited`.
+        ///
+        /// Pass the same value on every capture in a session: it is applied
+        /// when the set is read, so a capture that disagrees changes only
+        /// what that one capture watches.
+        #[arg(
+            long,
+            value_name = "TURNS|unlimited",
+            value_parser = window::parse,
+            default_value_t = DeclaredWindow::default(),
+        )]
+        declared_window: DeclaredWindow,
     },
 
     /// Record what a path holds **before** an edit changes it.
@@ -200,8 +218,17 @@ fn main() -> std::process::ExitCode {
             turn,
             cwd,
             roots,
+            declared_window,
         } => match here(cwd) {
-            Ok(cwd) => commands::capture::run(&mut out, &data_dir, &session, &turn, cwd, roots),
+            Ok(cwd) => commands::capture::run(
+                &mut out,
+                &data_dir,
+                &session,
+                &turn,
+                cwd,
+                roots,
+                declared_window,
+            ),
             Err(err) => {
                 eprintln!("filesnap: cannot resolve the working directory: {err}");
                 exit::USAGE

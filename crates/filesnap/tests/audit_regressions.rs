@@ -103,14 +103,15 @@ fn edit_free_turns_still_advance_the_declared_window() {
     store
         .declare_paths("s", "turn-0", std::slice::from_ref(&early))
         .unwrap();
-    assert!(store.declared_paths("s").unwrap().contains(&early));
+    let default = filesnap::DeclaredWindow::default();
+    assert!(store.declared_paths("s", default).unwrap().contains(&early));
 
-    for i in 1..=filesnap::DECLARED_WINDOW_TURNS {
+    for i in 1..=filesnap::DECLARED_WINDOW_TURNS.get() + 1 {
         store.note_turn("s", &format!("turn-{i}")).unwrap();
     }
 
     assert!(
-        !store.declared_paths("s").unwrap().contains(&early),
+        !store.declared_paths("s", default).unwrap().contains(&early),
         "edit-free turns did not advance the window"
     );
 }

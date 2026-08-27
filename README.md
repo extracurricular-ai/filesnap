@@ -186,7 +186,9 @@ plain subtree walk lacks, and the reason it was abandoned.
 2. **Edit-touched** — paths the host declares in the moment before it writes
    them, which is the last moment the old bytes still exist. Bounded by what
    the agent did rather than by what is on disk: every entry is a file someone
-   deliberately changed, and nothing here grows with the tree.
+   deliberately changed, and nothing here grows with the tree. How long a path
+   stays watched afterwards is yours to set — `--declared-window`, 99 turns by
+   default, or `unlimited`.
 3. **Recently modified** — the residue: what a shell command or the user's own
    editor changed outside the other two. This is the one partition a large tree
    could flood, so it is the one with a hard budget — 100 files per root,

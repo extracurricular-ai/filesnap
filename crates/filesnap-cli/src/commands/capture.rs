@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use filesnap::DeclaredWindow;
 use filesnap::TurnScope;
 use filesnap::WorkspaceStore;
 use serde::Serialize;
@@ -39,6 +40,7 @@ pub fn run(
     turn: &str,
     cwd: PathBuf,
     roots: Vec<PathBuf>,
+    declared: DeclaredWindow,
 ) -> u8 {
     let store = match WorkspaceStore::open(data_dir, &cwd) {
         Ok(store) => store,
@@ -52,6 +54,7 @@ pub fn run(
         roots,
         hidden: filesnap::HiddenFiles::Skip,
         limits: filesnap::ScanLimits::default(),
+        declared,
     };
 
     event::emit(

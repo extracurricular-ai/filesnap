@@ -17,6 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::declared::DeclaredWindow;
 use crate::scope::HiddenFiles;
 use crate::scope::ScanLimits;
 use crate::store::PreEditImage;
@@ -56,6 +57,7 @@ pub struct SnapshotTracker {
     /// change under it mid-conversation (D14).
     hidden: HiddenFiles,
     limits: ScanLimits,
+    declared: DeclaredWindow,
     /// The directory this session is bound to (D4).
     workspace: PathBuf,
 }
@@ -75,6 +77,7 @@ impl SnapshotTracker {
         start: SessionStart,
         hidden: HiddenFiles,
         limits: ScanLimits,
+        declared: DeclaredWindow,
     ) -> Option<Arc<Self>> {
         let store = match WorkspaceStore::open(data_dir, workspace) {
             Ok(store) => store,
@@ -106,6 +109,7 @@ impl SnapshotTracker {
             session_id,
             hidden,
             limits,
+            declared,
             workspace: workspace.to_path_buf(),
         }))
     }
@@ -121,6 +125,7 @@ impl SnapshotTracker {
             },
             hidden: self.hidden,
             limits: self.limits,
+            declared: self.declared,
         }
     }
 
@@ -220,6 +225,7 @@ mod tests {
             start,
             HiddenFiles::Skip,
             ScanLimits::default(),
+            DeclaredWindow::default(),
         )
     }
 
@@ -372,7 +378,7 @@ mod tests {
     fn a_large_directory_cannot_flood_a_capture() {
         // The property a plain subtree walk lacked. Without a bound, a capture
         // costs whatever happens to be on disk — on a real repository that was
-        // 57k files and 100 GB, nearly all of it build output.
+        // 70,609 files and 116 GB, nearly all of it build output.
         let (home, loose) = dirs();
         let ctl = tracking(&home, &loose, "t1");
 
@@ -494,6 +500,7 @@ mod tests {
             },
             HiddenFiles::Skip,
             ScanLimits::default(),
+            DeclaredWindow::default(),
         )
         .expect("tracking enabled");
 
@@ -538,6 +545,7 @@ mod tests {
             },
             HiddenFiles::Skip,
             ScanLimits::default(),
+            DeclaredWindow::default(),
         )
         .expect("tracking enabled");
 
@@ -565,7 +573,7 @@ mod tests {
         assert!(captured(&store), "still inside the window");
 
         // The same process runs out the window without touching that file.
-        for i in 2..=(crate::declared::DECLARED_WINDOW_TURNS + 2) {
+        for i in 2..=(crate::declared::DECLARED_WINDOW_TURNS.get() + 3) {
             tracker.checkpoint_turn_start(
                 &format!("turn-{i}"),
                 ws.path(),

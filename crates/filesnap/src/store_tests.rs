@@ -460,7 +460,12 @@ fn a_declared_path_survives_the_process_that_declared_it() {
         .unwrap();
 
     // A fresh handle is what a resumed session gets.
-    assert!(fx.store().declared_paths(S).unwrap().contains(&outside));
+    assert!(
+        fx.store()
+            .declared_paths(S, DeclaredWindow::default())
+            .unwrap()
+            .contains(&outside)
+    );
 }
 
 /// It is still in the safety scope after ageing out of the window.
@@ -476,14 +481,17 @@ fn a_path_past_the_window_is_still_in_the_safety_scope() {
     store
         .declare_paths(S, "turn-0", std::slice::from_ref(&old))
         .unwrap();
-    for i in 1..=crate::declared::DECLARED_WINDOW_TURNS {
+    for i in 1..=crate::declared::DECLARED_WINDOW_TURNS.get() + 1 {
         store
             .declare_paths(S, &format!("turn-{i}"), &[fx.path("recent.txt")])
             .unwrap();
     }
 
     assert!(
-        !store.declared_paths(S).unwrap().contains(&old),
+        !store
+            .declared_paths(S, DeclaredWindow::default())
+            .unwrap()
+            .contains(&old),
         "no longer watched"
     );
     assert!(
@@ -508,7 +516,10 @@ fn deleting_a_session_drops_its_declared_set() {
         .unwrap();
 
     store.delete_sessions(&[S.to_string()]);
-    assert_eq!(store.declared_paths(S).unwrap(), Default::default());
+    assert_eq!(
+        store.declared_paths(S, DeclaredWindow::default()).unwrap(),
+        Default::default()
+    );
 }
 
 /// **An ordinary rewind-then-undo reports no conflicts.**

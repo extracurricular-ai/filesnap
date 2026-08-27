@@ -3,19 +3,21 @@
 //! Three partitions, unioned. Each answers a different question, and each is
 //! bounded by something other than the size of the directory tree — which is
 //! the property a plain subtree walk lacks, and the reason it was abandoned:
-//! on this repository it enumerated 57k files and 100 GB, almost all of it
-//! build output.
+//! on one working repository it enumerated 70,609 files and 116 GB, almost all
+//! of it build output.
 //!
 //! 1. **Git-tracked** — what the project itself considers its files, read
 //!    from the index. Bounded by the project rather than by what has been
-//!    built into it: the same tree that scanned to 100 GB is 6k files and
-//!    56 MB here, because build output is precisely what is not committed.
+//!    built into it: the same tree that scanned to 116 GB is 6,096 files and
+//!    59 MB here, because build output is precisely what is not committed.
 //!    Empty when there is no repository, which costs nothing — the other two
 //!    partitions carry that case.
 //! 2. **Edit-touched** — paths the agent's own tools have written, carried
-//!    forward for the session. Unbounded on purpose: its size is set by what
-//!    the agent did, not by what is on disk, and every entry is a file
-//!    someone deliberately changed.
+//!    forward across turns. Bounded by what the agent did rather than by what
+//!    is on disk: every entry is a file someone deliberately changed. How far
+//!    forward it is carried is the host's
+//!    [`DeclaredWindow`](crate::DeclaredWindow), which may be `Unlimited`
+//!    (D25).
 //! 3. **Recently modified** — the residue. Catches shell-made changes to
 //!    files outside the other two, where "changed recently" is exactly the
 //!    signal that matters. Capped, since this is the one partition a large

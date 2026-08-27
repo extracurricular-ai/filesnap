@@ -23,6 +23,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::checkpoint::Checkpoint;
+use crate::declared::DeclaredWindow;
 use crate::error::Result;
 use crate::scope::HiddenFiles;
 use crate::scope::ScanLimits;
@@ -46,6 +47,12 @@ pub struct TurnScope {
     pub roots: Vec<PathBuf>,
     pub hidden: HiddenFiles,
     pub limits: ScanLimits,
+    /// How long an edit keeps a path in the scan after declaring it.
+    ///
+    /// Read on every capture rather than when the path is declared, so a
+    /// session that changes it does not have to rewrite anything — and so
+    /// the record on disk carries no policy of its own.
+    pub declared: DeclaredWindow,
 }
 
 impl TurnScope {
@@ -56,6 +63,7 @@ impl TurnScope {
             roots: Vec::new(),
             hidden: HiddenFiles::Skip,
             limits: ScanLimits::default(),
+            declared: DeclaredWindow::default(),
         }
     }
 
@@ -131,7 +139,10 @@ pub fn capture_turn(
     //
     // The persisted set is the only source, and it is the only thing that
     // applies the window.
-    let declared: Vec<PathBuf> = store.declared_paths(session_id)?.into_iter().collect();
+    let declared: Vec<PathBuf> = store
+        .declared_paths(session_id, scope.declared)?
+        .into_iter()
+        .collect();
     let scan = tracked_files(&scope.scan_roots(), declared, scope.hidden, scope.limits);
 
     // What the *scan* passed over is a drop too, and the capture cannot see
@@ -168,9 +179,15 @@ pub fn restore_scope(
     session_id: &str,
     scope: &TurnScope,
 ) -> Result<Vec<PathBuf>> {
+    // **The safety scope never narrows.** The caller's window is deliberately
+    // not consulted: III.2 needs this to cover everything a plan could touch,
+    // and a path that has stopped being *watched* is still a path a restore
+    // can write or delete. `tracked_paths` below would supply them anyway —
+    // asking for them here as well means a change to that union cannot
+    // silently narrow this one.
     let mut files: Vec<PathBuf> = tracked_files(
         &scope.scan_roots(),
-        store.declared_paths(session_id)?,
+        store.declared_paths(session_id, DeclaredWindow::Unlimited)?,
         scope.hidden,
         scope.limits,
     )

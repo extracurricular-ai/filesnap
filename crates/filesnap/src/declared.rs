@@ -15,13 +15,24 @@
 //! caught; one that touches a file the edit tools never saw is invisible.**
 //! Accumulation is what makes the first half true (D25).
 //!
-//! # Why bound it
+//! # Why the window is a parameter and not a rule
 //!
-//! Claude Code pays for accumulation with a snapshot cost that grows with
-//! session length, and it carries no second and third partition on top of it.
-//! A path drops out after [`DECLARED_WINDOW_TURNS`] turns without being
-//! declared again, which keeps the same coverage across the span anyone
-//! actually rewinds while stopping the set growing without limit.
+//! Both answers are defensible, and which one is right is a fact about the
+//! host's product rather than about this engine (D25).
+//!
+//! Keeping a path for the whole session is what the codex fork this engine
+//! came from did, and it buys the asymmetry above for as long as the
+//! conversation lasts: a shell command that touches a file the agent edited
+//! two hundred turns ago is still caught. Dropping it quickly is the better
+//! answer for paths *outside* the workspace, because the window is precisely
+//! what decides whether a rewind performed much later writes to them — a path
+//! in no manifest is one a restore leaves alone. One turn is the smallest
+//! window that is not wrong; [`DeclaredWindow::Turns`] says why.
+//!
+//! Neither setting bounds anything by the size of the tree, which is what
+//! IV.1 asks of the partitions, so [`DeclaredWindow::Unlimited`] is not the
+//! widening IV.4 declines to expose: this partition's size follows what the
+//! agent did under either.
 //!
 //! **The window governs observation, never restorability.** Every manifest
 //! still restores exactly what it recorded; a path that has aged out is still
@@ -39,6 +50,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -48,9 +60,58 @@ use serde::Serialize;
 use crate::error::Result;
 use crate::error::SnapshotError;
 
-/// How many turns a declared path keeps being watched without being declared
-/// again. Matches Claude Code's own cap.
-pub const DECLARED_WINDOW_TURNS: u64 = 100;
+/// The default window, and a default rather than a rule — see
+/// [`DeclaredWindow`].
+///
+/// **99, so that passing no window behaves exactly as 0.3.1 did.** Claude
+/// Code's cap is 100 and this engine's constant said 100, but its arithmetic
+/// reached 99 of them (see [`DeclaredStore::active`]). Fixing that off-by-one
+/// while leaving the constant at 100 would have moved the default by a turn
+/// for every existing caller, to no one's benefit: the number was never the
+/// point, and a release that quietly changes what it captures is.
+pub const DECLARED_WINDOW_TURNS: NonZeroU64 = NonZeroU64::new(99).expect("99 is not zero");
+
+/// How long a declared path keeps being watched after the turn that last
+/// declared it.
+///
+/// A parameter with a correct default, not a user setting (D14): the host
+/// picks it once for a session, and the CLI exposes it because a host that
+/// drives the binary has nowhere else to say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredWindow {
+    /// Watch a path through this many *further* turns after the one that
+    /// declared it. `Turns(1)` reaches the next turn's capture and no more.
+    ///
+    /// **One is the smallest value that is not wrong**, which is why zero is
+    /// unrepresentable here. The capture at the head of the next turn is what
+    /// records what the edit produced; a window shorter than that would leave
+    /// the file out of the very manifest a user rewinding to just after their
+    /// own edit lands on.
+    Turns(NonZeroU64),
+    /// Watch every path the session ever declared.
+    ///
+    /// What the codex fork this engine came from did, and what a host wants
+    /// when an edit outside the workspace has to stay reversible for as long
+    /// as the conversation lasts.
+    Unlimited,
+}
+
+impl Default for DeclaredWindow {
+    fn default() -> Self {
+        Self::Turns(DECLARED_WINDOW_TURNS)
+    }
+}
+
+/// The spelling a CLI over this library reads back, so the two cannot drift
+/// apart: whatever `Display` writes, the parser accepts.
+impl std::fmt::Display for DeclaredWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Turns(turns) => write!(f, "{turns}"),
+            Self::Unlimited => f.write_str("unlimited"),
+        }
+    }
+}
 
 /// One declaration: which turn saw it, and what was declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,14 +208,26 @@ impl DeclaredStore {
         self.save(session_id, &file)
     }
 
-    /// The paths still inside the window, for the next capture's scan.
+    /// The paths still inside `window`, for the next capture's scan.
     ///
     /// A session with no file yields nothing, which is the ordinary case for
     /// one that has never used the edit API.
-    pub fn active(&self, session_id: &str) -> Result<BTreeSet<PathBuf>> {
+    pub fn active(&self, session_id: &str, window: DeclaredWindow) -> Result<BTreeSet<PathBuf>> {
         let file = self.load(session_id)?;
-        let latest = file.turns.len() as u64;
-        let cutoff = latest.saturating_sub(DECLARED_WINDOW_TURNS);
+        let cutoff = match window {
+            // Ordinal zero is the first turn, so a cutoff of zero admits
+            // every entry — the same filter serves both arms rather than one
+            // of them growing a second path nothing exercises.
+            DeclaredWindow::Unlimited => 0,
+            // `+ 1` because the turn being captured is already in `turns`:
+            // `note_turn` runs at the head of the capture that then reads
+            // this. Without it a window of one would reach no capture at all,
+            // and the default would reach 99 turns while saying 100 —
+            // the doc-versus-code gap VII.4 calls a defect.
+            DeclaredWindow::Turns(turns) => {
+                (file.turns.len() as u64).saturating_sub(turns.get().saturating_add(1))
+            }
+        };
         Ok(file
             .entries
             .into_iter()

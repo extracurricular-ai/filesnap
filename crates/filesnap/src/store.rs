@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::blob::BlobStore;
 use crate::checkpoint::Checkpoint;
 use crate::checkpoint::capture;
+use crate::declared::DeclaredWindow;
 use crate::error::Result;
 use crate::error::SnapshotError;
 use crate::manifest::Manifest;
@@ -253,9 +254,9 @@ impl WorkspaceStore {
     /// captures keep watching them.
     ///
     /// Persisted, so a session resuming in a new process picks up what the
-    /// last one declared. A path stays watched for
-    /// [`crate::DECLARED_WINDOW_TURNS`] turns after its last declaration
-    /// (D25); redeclaring renews it.
+    /// last one declared. How long a path stays watched after its last
+    /// declaration is the caller's [`DeclaredWindow`] (D25); redeclaring
+    /// renews it either way.
     pub fn declare_paths(&self, session_id: &str, turn_id: &str, paths: &[PathBuf]) -> Result<()> {
         crate::id::validate_external("session id", session_id)?;
         crate::id::validate_external("turn id", turn_id)?;
@@ -270,10 +271,18 @@ impl WorkspaceStore {
         self.locked(session_id, || self.declared.note_turn(session_id, turn_id))
     }
 
-    /// Paths this session declared that are still inside the window — what a
+    /// Paths this session declared that are still inside `window` — what a
     /// capture unions into its scan.
-    pub fn declared_paths(&self, session_id: &str) -> Result<std::collections::BTreeSet<PathBuf>> {
-        self.declared.active(session_id)
+    ///
+    /// Not to be confused with [`Self::tracked_paths`], which is every path
+    /// ever observed and takes no window: a restore's safety scope has to
+    /// look at paths this one has stopped watching.
+    pub fn declared_paths(
+        &self,
+        session_id: &str,
+        window: DeclaredWindow,
+    ) -> Result<std::collections::BTreeSet<PathBuf>> {
+        self.declared.active(session_id, window)
     }
 
     /// Whether `session_id` has a snapshot log. With session-scoped binding,

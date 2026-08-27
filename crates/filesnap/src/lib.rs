@@ -12,13 +12,16 @@
 //! # What is covered, and what is not
 //!
 //! A file enters the tracked set three ways: the project's git index lists
-//! it, a recency walk finds it, or an edit declares it. Only the third is
-//! unbounded, and the first two have shapes worth knowing:
+//! it, a recency walk finds it, or an edit declares it. Each has a shape
+//! worth knowing:
 //!
 //! - the index cannot see an untracked file;
 //! - the recency walk skips hidden directories and a fixed list of build
 //!   directories, drops files over [`ScanLimits::max_file_bytes`], and keeps
-//!   at most [`ScanLimits::max_files`] paths per root.
+//!   at most [`ScanLimits::max_files`] paths per root;
+//! - a declared path stays watched for as long as [`DeclaredWindow`] says,
+//!   which the host chooses per session and may set to
+//!   [`DeclaredWindow::Unlimited`].
 //!
 //! So a file created by a shell command inside `target/`, inside a dotted
 //! directory, over the size limit, or beyond the recency budget on a busy
@@ -60,6 +63,7 @@ pub use collect::content_disk_usage;
 pub use controller::SessionStart;
 pub use controller::SnapshotTracker;
 pub use declared::DECLARED_WINDOW_TURNS;
+pub use declared::DeclaredWindow;
 pub use error::Result;
 pub use error::SnapshotError;
 pub use manifest::FileEntry;

@@ -82,6 +82,18 @@ build directory, over the size limit, or beyond the recency budget is covered
 only if it also went through the edit API. `filesnap status` tells you which
 files in your project are not protected, and why.
 
+A path an edit declared keeps being scanned for 99 turns after the turn that
+last declared it — the odd number is deliberate: it is what this command
+already did before the window had a name, kept exactly, so passing nothing
+behaves as it always has. `capture --declared-window <TURNS|unlimited>` changes
+that, and it is the one bound this command exposes: how long an edit stays
+reversible is a statement about your product rather than about what this tree
+costs to scan. It decides most for paths *outside* the workspace, which no scan
+reaches — the window is what says whether a rewind performed much later writes
+to them. Pass the same value on every capture in a session: it is applied when
+the set is read, so a capture that disagrees changes only what that capture
+watches.
+
 ## Locking
 
 Two invocations of one session are held apart by an OS file lock. Some

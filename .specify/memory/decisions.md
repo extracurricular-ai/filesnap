@@ -628,11 +628,16 @@ tolerance, C6's fallback) are independent of the format and can follow. The CLI
 follows the format rather than preceding it, so it is written against the layout
 it will ship on.
 
-## D25 · The declared set accumulates, bounded by a rolling window of turns
+## D25 · The declared set accumulates, and for how long is the host's to say
 
 Paths declared through the edit API accumulate for the session, persisted so a
-new process picks them up — and a path drops out of the *tracked set* once it has
-not been declared for the last N turns (N = 100, matching Claude Code's own cap).
+new process picks them up — and how long a path stays in the *tracked set* after
+its last declaration is a parameter, `DeclaredWindow`: `Turns(n)` for a rolling
+window of turns, defaulting to 99, or `Unlimited`.
+
+**Amended 2026-08-27.** The window was a `pub const` of 100, and the reasoning
+under "Why bound it" below was Claude Code's rather than ours. The paragraph
+after it is why that does not transfer, and what replaced it.
 
 **The window governs observation, never restorability.** Every manifest still
 restores exactly what it recorded; a path that has aged out of tracking is still
@@ -650,10 +655,65 @@ asymmetry worth copying: **a shell command that modifies an already-tracked file
 is caught; one that touches a file the edit tools never saw is invisible.**
 Accumulation is what makes the first half of that true.
 
-**Why bound it** — Claude Code pays for accumulation with a snapshot cost that
-grows with session length, and it carries no second and third partition on top.
-The window keeps the same coverage for the span anyone actually rewinds across
-while stopping the set from growing without limit.
+**Why bound it, as originally argued** — Claude Code pays for accumulation with
+a snapshot cost that grows with session length, and it carries no second and
+third partition on top. The window keeps the same coverage for the span anyone
+actually rewinds across while stopping the set from growing without limit.
+
+**Why that argument does not transfer, and the bound is a parameter.** Claude
+Code's edit-tracked set *is* its tracked set, so its growth is its whole cost.
+Here the same set sits on top of the git and recency partitions, which already
+cover everything inside the workspace — an in-workspace file the agent edits
+moves its mtime and recency sees it. So what the window actually governs is
+paths **outside** the workspace, and there the question is not cost but blast
+radius: a path in no manifest is one a restore leaves alone, so the window
+decides whether a rewind performed a hundred turns later writes to a file that
+is not part of the project. Which answer is right is a fact about the host's
+product. The codex fork this engine came from had no window at all — its
+`extras` set was in-memory and accumulate-only — which is exactly `Unlimited`.
+
+Constitution IV.1 asks each partition to be bounded by something other than the
+size of the tree, and this one is bounded by what the agent did under either
+setting. So `Unlimited` is not the widening IV.4 declines to expose: that rule
+is aimed at raising a cap because a tree did not fit, which is a bound that
+needs fixing rather than exposing.
+
+**One turn is the floor, and zero is unrepresentable.** The capture at the head
+of turn N+1 is what records what an edit during turn N produced, so a window
+that did not reach it would leave the file out of the very manifest a user
+rewinding to just after their own edit lands on. `Turns` therefore holds a
+`NonZeroU64`, and `Turns(1)` means "the next capture and no more". Stating that
+exposed an off-by-one in the original implementation: the cutoff was computed
+from `turns.len()` without allowing for the turn being captured already being
+in that list, so the shipped "100 turns" reached 99, and a `Turns(1)` would
+have reached no capture at all while looking like a setting.
+
+**The default is 99, and absorbs that fix rather than passing it on.** Making
+the arithmetic honest and leaving the constant at 100 would have moved every
+existing caller's window by a turn, for a number that was never the point.
+Taking the constant to 99 instead makes `cutoff = turns.len() - 100` again,
+which is exactly what 0.3.1 computed — verified rather than argued: the same
+declare-then-101-captures sequence run by the 0.3.1 binary and this one, over
+the same directory, produces byte-identical JSONL, boundary included.
+`declared_tests::the_default_expires_on_the_turn_0_3_1_expired_on` pins it,
+with 99 and 100 written out rather than derived from the constant — a test
+that recomputed them would agree with a change to it, which is the one thing
+it exists to catch.
+
+**Rules out:** a constant in either direction — 100 for everyone, and
+"unbounded, because the ancestor was". Also rules out `-1` or `0` as sentinels
+for "no window": the Quality Gates ban call sites that read `f(0)`, and an enum
+makes the CLI's `--declared-window unlimited` and the library's
+`DeclaredWindow::Unlimited` the same statement.
+
+**The CLI exposes it, which D14 refuses for scan limits.** The two are not the
+same kind of setting. A scan limit answers "how much of this tree can we afford
+to look at", which is the engine's problem and where "raise the cap" is the
+wrong answer. This answers "how long should a file the agent touched stay
+reversible", which the engine cannot know — and a host that drives the binary
+rather than the library has nowhere else to say it. It is applied when the set
+is read, so a capture passing a different value changes only what that capture
+watches; nothing on disk carries the policy.
 
 **Claude Code's own rebuild trick is not available here.** It reconstructs
 `trackedFiles` from the union of its snapshots' backup-map keys, which works

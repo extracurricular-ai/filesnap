@@ -1048,3 +1048,121 @@ fn allow_deletion(parent: &std::path::Path) {
 fn deletion_is_denied(parent: &std::path::Path) -> bool {
     std::fs::write(parent.join(".probe"), b"x").is_err()
 }
+
+/// `--declared-window` reaches the capture, through argv.
+///
+/// The same three steps under two windows, in two stores, differing only in
+/// the flag: declare a path **outside** the workspace, change it, capture,
+/// change it again, capture. Outside is what makes the declared set the only
+/// thing that can carry it — inside, the recency partition would keep it in
+/// scope whatever the window said, and the two runs would agree.
+#[test]
+fn the_declared_window_decides_what_a_later_capture_still_watches() {
+    let hashed_at_the_second_turn = |window: &str| {
+        // An **empty** workspace, not the shared fixture: a file inside it
+        // would be captured inside its own racy window and re-hashed on the
+        // next turn (V.3), which lands in the same counter this reads.
+        let data = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let outside = data.path().join("edited-once.cfg");
+        std::fs::write(&outside, "before").unwrap();
+        let cwd = ws.path().to_string_lossy().into_owned();
+        let outside_arg = outside.to_string_lossy().into_owned();
+
+        let declared = filesnap(
+            data.path(),
+            &[
+                "declare",
+                "--session",
+                "s1",
+                "--turn",
+                "t0",
+                "--path",
+                &outside_arg,
+                "--cwd",
+                &cwd,
+            ],
+        );
+        assert_eq!(declared.code, 0, "{}", declared.stderr);
+
+        std::fs::write(&outside, "after one").unwrap();
+        let first = filesnap(
+            data.path(),
+            &[
+                "capture",
+                "--session",
+                "s1",
+                "--turn",
+                "t1",
+                "--cwd",
+                &cwd,
+                "--declared-window",
+                window,
+            ],
+        );
+        assert_eq!(first.code, 0, "{}", first.stderr);
+        assert_eq!(
+            first.find("capture.done")["hashed"],
+            1,
+            "the turn after an edit records it under any window"
+        );
+
+        std::fs::write(&outside, "after two").unwrap();
+        let second = filesnap(
+            data.path(),
+            &[
+                "capture",
+                "--session",
+                "s1",
+                "--turn",
+                "t2",
+                "--cwd",
+                &cwd,
+                "--declared-window",
+                window,
+            ],
+        );
+        assert_eq!(second.code, 0, "{}", second.stderr);
+        second.find("capture.done")["hashed"].as_u64().unwrap()
+    };
+
+    assert_eq!(
+        hashed_at_the_second_turn("1"),
+        0,
+        "a window of one turn was still watching a path two turns later"
+    );
+    assert_eq!(
+        hashed_at_the_second_turn("unlimited"),
+        1,
+        "an unlimited window stopped watching a declared path"
+    );
+}
+
+/// A window that cannot be read is a call to fix, not a store to investigate:
+/// nothing was attempted, so it is `3` and stdout stays empty (D32).
+#[test]
+fn an_unreadable_window_is_a_usage_error() {
+    let (data, ws) = workspace();
+    let run = filesnap(
+        data.path(),
+        &[
+            "capture",
+            "--session",
+            "s1",
+            "--turn",
+            "t1",
+            "--cwd",
+            &ws.path().to_string_lossy(),
+            "--declared-window",
+            "0",
+        ],
+    );
+
+    assert_eq!(run.code, 3);
+    assert_eq!(run.kinds(), Vec::<&str>::new());
+    assert!(
+        run.stderr.contains("1 or more"),
+        "the message must say what would have been accepted: {}",
+        run.stderr
+    );
+}
