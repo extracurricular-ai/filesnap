@@ -120,6 +120,13 @@ pub struct RestoreOutcome {
     pub stats: ApplyStats,
 }
 
+/// The session id [`WorkspaceStore::locking_is_enforced`] probes under.
+///
+/// Internal on purpose: it begins with `_`, so [`crate::id::validate_external`]
+/// refuses it from a host, and a probe can never contend with a real session
+/// or be mistaken for one.
+pub(crate) const LOCK_PROBE_ID: &str = "_lock-probe";
+
 impl WorkspaceStore {
     /// Open the partition for `workspace`, creating it if absent.
     ///
@@ -190,8 +197,7 @@ impl WorkspaceStore {
     /// than one per call, and it cannot collide with a session, because an
     /// external id may not begin with `_`.
     pub fn locking_is_enforced(&self) -> Result<bool> {
-        const PROBE: &str = "_lock-probe";
-        match crate::lock::acquire(&self.partition, PROBE, crate::lock::LOCK_BUDGET)? {
+        match crate::lock::acquire(&self.partition, LOCK_PROBE_ID, crate::lock::LOCK_BUDGET)? {
             Some(guard) => Ok(guard.is_enforced()),
             // Contended: another invocation is holding it, and holding it is
             // the one thing a filesystem without locks cannot do.

@@ -956,3 +956,101 @@ fn doctor_on_a_tidy_workspace_reports_locking_and_nothing_else() {
          in this suite meaningless too"
     );
 }
+
+/// **A stray `doctor` cannot clear does not read as success** (D28).
+///
+/// The one command that writes into the user's own project must not report,
+/// by the exit code alone, that it cleared a workspace it did not. Both other
+/// doctor tests sweep everything successfully, so `exit::PARTIAL` and the
+/// `removed: false` event were executed by nothing.
+///
+/// The blocker differs by platform because the permission that governs
+/// deletion does: on unix it belongs to the parent directory, on Windows to
+/// the file. The portable trick from the restore test — occupy the path with a
+/// directory — is no use here, because `residue_under` filters to `is_file()`
+/// and a directory is never a candidate. The errno is not asserted, only the
+/// degradation.
+#[test]
+fn doctor_that_cannot_clear_a_stray_reports_it_and_exits_nonzero() {
+    let (data, ws) = workspace();
+    let locked = ws.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let stray = locked.join("a.txt.filesnap-restore-tmp");
+    std::fs::write(&stray, "half a restore").unwrap();
+
+    // Settled first: aging needs a writable file and a writable parent.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stray)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    deny_deletion(&locked, &stray);
+    // Root ignores permission bits, and this whole test is a permission bit.
+    // Left unsaid it fails on a count instead, which reads as a defect in the
+    // sweep rather than a precondition the machine cannot meet.
+    assert!(
+        deletion_is_denied(&locked, &stray),
+        "the deletion this test needs to fail would succeed — run it as non-root"
+    );
+
+    let run = filesnap(
+        data.path(),
+        &["doctor", "--workdir", &ws.path().to_string_lossy()],
+    );
+
+    // Before any assertion, so the temp directory can clean itself up whatever
+    // failed.
+    allow_deletion(&locked, &stray);
+
+    assert_eq!(run.code, 1, "a partial sweep read as success");
+    assert_eq!(run.find("doctor.done")["removed"], 0);
+    assert_eq!(run.find("doctor.done")["failed"], 1);
+    assert_eq!(run.find("doctor.residue")["removed"], false);
+    assert!(
+        run.find("doctor.residue")["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("a.txt.filesnap-restore-tmp"),
+        "the user is told which stray, because they can act on a name"
+    );
+}
+
+#[cfg(unix)]
+fn deny_deletion(parent: &std::path::Path, _file: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+}
+
+#[cfg(unix)]
+fn allow_deletion(parent: &std::path::Path, _file: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Whether the mechanism this test relies on is actually in force.
+#[cfg(unix)]
+fn deletion_is_denied(parent: &std::path::Path, _file: &std::path::Path) -> bool {
+    std::fs::write(parent.join(".probe"), b"x").is_err()
+}
+
+#[cfg(windows)]
+fn deny_deletion(_parent: &std::path::Path, file: &std::path::Path) {
+    let mut perms = std::fs::metadata(file).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(file, perms).unwrap();
+}
+
+#[cfg(windows)]
+fn allow_deletion(_parent: &std::path::Path, file: &std::path::Path) {
+    let mut perms = std::fs::metadata(file).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(file, perms).unwrap();
+}
+
+#[cfg(windows)]
+fn deletion_is_denied(_parent: &std::path::Path, file: &std::path::Path) -> bool {
+    std::fs::metadata(file).unwrap().permissions().readonly()
+}

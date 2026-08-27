@@ -812,11 +812,29 @@ fn the_lock_probe_reports_enforcement_without_inventing_a_session() {
     fx.write("a.txt", "one");
     fx.capture("real", "turn-1");
     let store = fx.store();
+    let probe_lock = store
+        .partition
+        .join("locks")
+        .join(format!("{}.lock", crate::id::record_name(LOCK_PROBE_ID)));
+    assert!(!probe_lock.exists(), "nothing has probed yet");
 
     assert!(
         store.locking_is_enforced().unwrap(),
         "this filesystem does not lock, which would also silently weaken \
          every refusal test in this crate"
+    );
+    // The answer was measured, not assumed: probing means taking a lock, and
+    // a lock leaves its sentinel behind. Without this the method could simply
+    // `Ok(true)` and every other assertion here would still hold.
+    assert!(
+        probe_lock.exists(),
+        "no lock was taken, so the reported answer was not measured"
+    );
+    // And taken under an id a host can never present, so the probe cannot
+    // serialize against — or be mistaken for — a real session.
+    assert!(
+        crate::id::validate_external("session id", LOCK_PROBE_ID).is_err(),
+        "the probe id is one a caller could pass as their own session"
     );
     assert_eq!(
         store.sessions().unwrap(),
