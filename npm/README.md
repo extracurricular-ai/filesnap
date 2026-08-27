@@ -33,6 +33,21 @@ Nine commands — `capture`, `declare`, `log`, `restore`, `undo`, `delete`,
 deliberately refuses to do are in the
 [documentation](https://github.com/extracurricular-ai/filesnap#readme).
 
+## Adding rewind to a coding agent
+
+There is no JS API here, and that is the design: a subprocess and a line parser
+are the whole integration. What the engine will not decide for you is the other
+half — when a turn is worth capturing, what a rewind point means once a
+conversation can fork, and in which order the transcript and the files move.
+
+[dsh-filesnap](https://github.com/extracurricular-ai/dsh-filesnap), rewind and
+redo for DeepSeek Harness, is the worked example: its whole transport to this
+binary is
+[`src/cli.ts`](https://github.com/extracurricular-ai/dsh-filesnap/blob/main/src/cli.ts)
+— 116 non-comment lines that spawn it, parse the JSON Lines and map the exit
+codes. Nothing in that file knows what a rewind is; its one coupling to its
+host is the call it spawns with.
+
 ## Platforms
 
 Linux, macOS and Windows, on x64 and arm64. The Linux builds are statically
